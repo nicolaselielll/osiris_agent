@@ -18,10 +18,17 @@ import uuid
 class WebBridge(Node):
     def __init__(self):
         super().__init__('bridge_node')
-        # Get base URL and auth token from environment
-        base_url = os.environ.get('ROS_BRIDGE_WS_URL', 'wss://osiris-gateway.fly.dev')
-        auth_token = os.environ.get('ROBOT_AUTH_TOKEN', 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ3b3Jrc3BhY2VfaWQiOiJ4ZnppRkxUUXBwTW1yakp1dzczYiIsInJvYm90X2lkIjoiVkd6VG1qdWk3Rk5CZXJSQ21RRTkiLCJpYXQiOjE3Njc1NTI3NTB9.cXMMaUaXtQAuTuJuZtkuMQYDUIjuu3Q-1V1032w9t7k')
-        self.ws_url = f"{base_url}?robot=true&token={auth_token}"
+        # Fixed gateway URL (must not be overridden)
+        base_url = 'wss://osiris-gateway.fly.dev'
+
+        # Single, canonical way to provide the robot token: environment variable
+        # `OSIRIS_AUTH_TOKEN`. This package will only read that env var.
+        auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
+        if auth_token:
+            self.ws_url = f"{base_url}?robot=true&token={auth_token}"
+        else:
+            # If token is not present the node will attempt to connect without it.
+            self.ws_url = f"{base_url}?robot=true"
         self.ws = None
         self._topic_subs = {}
         self.loop = None
@@ -902,11 +909,15 @@ class WebBridge(Node):
 
 
 def main(args=None):
+    # Initialize rclpy and run the WebBridge. The robot token must be provided
+    # via the ROBOT_AUTH_TOKEN environment variable (single canonical method).
     rclpy.init(args=args)
     node = WebBridge()
-    rclpy.spin(node)
-    node.destroy_node()
-    rclpy.shutdown()
+    try:
+        rclpy.spin(node)
+    finally:
+        node.destroy_node()
+        rclpy.shutdown()
 
 
 if __name__ == '__main__':
