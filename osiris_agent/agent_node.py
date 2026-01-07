@@ -15,22 +15,29 @@ from rosidl_runtime_py import message_to_ordereddict
 import psutil
 import uuid
 
+# Security and configuration constants
+MAX_SUBSCRIPTIONS = 100
+ALLOWED_TOPIC_PREFIXES = ['/', ]  # Allow all topics by default, can be restricted per deployment
+PARAMETER_REFRESH_INTERVAL = 5.0
+GRAPH_CHECK_INTERVAL = 0.1
+TELEMETRY_INTERVAL = 1.0
+RECONNECT_INITIAL_DELAY = 1
+RECONNECT_MAX_DELAY = 10
+PARAMETER_TIMEOUT = 0.2
+
 class WebBridge(Node):
     def __init__(self):
         super().__init__('bridge_node')
-        # Fixed gateway URL (must not be overridden)
-        base_url = 'wss://osiris-gateway.fly.dev'
-
-        # Single, canonical way to provide the robot token: environment variable
-        # `OSIRIS_AUTH_TOKEN`. This package will only read that env var.
+        # Get auth token from environment
         auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
-        if auth_token:
-            self.ws_url = f"{base_url}?robot=true&token={auth_token}"
-        else:
-            # If token is not present the node will attempt to connect without it.
-            self.ws_url = f"{base_url}?robot=true"
+        if not auth_token:
+            raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
+        
+        # Fixed gateway URL with token (WSS encrypts the entire URL)
+        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
+        self._topic_subs_lock = threading.Lock()  # Protect topic subscriptions
         self.loop = None
         self._send_queue = asyncio.Queue()
         self._active_nodes = set(self.get_node_names())
@@ -72,45 +79,42 @@ class WebBridge(Node):
 
     async def _client_loop_with_reconnect(self):
         """Wrapper that handles reconnection."""
-        reconnect_delay = 1  # Start with 1 second
-        max_delay = 10  # Cap at 30 seconds
+        reconnect_delay = RECONNECT_INITIAL_DELAY
         
         while True:
             try:
-                print(f"Attempting to connect to gateway...")
+                self.get_logger().info("Attempting to connect to gateway...")
                 await self._client_loop()
             except Exception as e:
-                print(f"Connection failed: {e}")
+                self.get_logger().error(f"Connection failed: {e}")
             
             # Connection lost or failed
-            print(f"Reconnecting in {reconnect_delay} seconds...")
+            self.get_logger().info(f"Reconnecting in {reconnect_delay} seconds...")
             await asyncio.sleep(reconnect_delay)
             
-            # Exponential backoff
-            reconnect_delay = min(reconnect_delay * 2, max_delay)
+            # Exponential backoff with jitter
+            reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
+            # Add jitter to prevent thundering herd
+            import random
+            reconnect_delay += random.uniform(0, 1)
 
     async def _client_loop(self):
         send_task = None
         try:
             async with websockets.connect(self.ws_url) as ws:
                 self.ws = ws
-                print(f"Connected to gateway")
+                self.get_logger().info("Connected to gateway")
                 
-                auth_msg = await ws.recv()
-                data = json.loads(auth_msg)
-                if data.get('type') == 'auth_success':
-                    print("Authenticated with gateway")
-                    
-                    # Send initial state as SINGLE message
-                    await self._send_initial_state()
-                    
-                    # Start send loop and keep reference
-                    send_task = asyncio.create_task(self._send_loop(ws))
-                    
-                    # Receive loop
-                    await self._receive_loop(ws)
+                # Send initial state as SINGLE message
+                await self._send_initial_state()
+                
+                # Start send loop and keep reference
+                send_task = asyncio.create_task(self._send_loop(ws))
+                
+                # Receive loop
+                await self._receive_loop(ws)
         except Exception as e:
-            print(f"Error in client loop: {e}")
+            self.get_logger().error(f"Error in client loop: {e}")
             raise  # Re-raise to trigger reconnection
         finally:
             # Cancel send loop task
@@ -122,7 +126,7 @@ class WebBridge(Node):
                     pass
             
             self.ws = None
-            print("Connection closed, cleaning up...")
+            self.get_logger().info("Connection closed, cleaning up...")
 
     async def _send_initial_state(self):
         """Send complete initial state as a single message"""
@@ -151,40 +155,59 @@ class WebBridge(Node):
         }
         
         await self._send_queue.put(json.dumps(message))
-        print(f"Sent initial state: {len(nodes)} nodes, {len(topics)} topics, {len(actions)} actions, {len(services)} services")
+        self.get_logger().info(f"Sent initial state: {len(nodes)} nodes, {len(topics)} topics, {len(actions)} actions, {len(services)} services")
         
         # Send bridge subscriptions separately
         await self._send_bridge_subscriptions()
 
     async def _send_bridge_subscriptions(self):
         """Send current bridge subscriptions as a separate message."""
+        with self._topic_subs_lock:
+            subscriptions = list(self._topic_subs.keys())
+        
         message = {
             'type': 'bridge_subscriptions',
-            'subscriptions': list(self._topic_subs.keys()),
+            'subscriptions': subscriptions,
             'timestamp': time.time()
         }
         await self._send_queue.put(json.dumps(message))
-        print(f"Sent bridge subscriptions: {len(self._topic_subs)} topics")
+        self.get_logger().debug(f"Sent bridge subscriptions: {len(subscriptions)} topics")
                                                                                                   
     async def _receive_loop(self, ws):
         async for msg in ws:
             try:
                 data = json.loads(msg)
-                if data.get('type') == 'subscribe':
-                    print(f"Subscribing to topic: {data.get('topic')}")
+                msg_type = data.get('type')
+                
+                if msg_type == 'subscribe':
                     topic = data.get('topic')
-                    self._subscribe_to_topic(topic)
-                elif data.get('type') == 'unsubscribe':
+                    if topic:
+                        self.get_logger().info(f"Subscribing to topic: {topic}")
+                        self._subscribe_to_topic(topic)
+                    else:
+                        self.get_logger().warn("Subscribe message missing topic field")
+                        
+                elif msg_type == 'unsubscribe':
                     topic = data.get('topic')
-                    self._unsubscribe_from_topic(topic)
-                elif data.get('type') == 'start_telemetry':
+                    if topic:
+                        self._unsubscribe_from_topic(topic)
+                    else:
+                        self.get_logger().warn("Unsubscribe message missing topic field")
+                        
+                elif msg_type == 'start_telemetry':
                     self._telemetry_enabled = True
-                    print("Telemetry started")
-                elif data.get('type') == 'stop_telemetry':
+                    self.get_logger().info("Telemetry started")
+                    
+                elif msg_type == 'stop_telemetry':
                     self._telemetry_enabled = False
-                    print("Telemetry stopped")
-            except Exception:
-                pass
+                    self.get_logger().info("Telemetry stopped")
+                else:
+                    self.get_logger().warn(f"Unknown message type: {msg_type}")
+                    
+            except json.JSONDecodeError as e:
+                self.get_logger().error(f"Invalid JSON received: {e}")
+            except Exception as e:
+                self.get_logger().error(f"Error processing message: {e}")
 
     async def _send_loop(self, ws):
         while True:
@@ -192,11 +215,25 @@ class WebBridge(Node):
             await ws.send(msg)
 
     def _subscribe_to_topic(self, topic_name):
-        if topic_name in self._topic_subs:
+        # Validate topic name
+        if not topic_name or not isinstance(topic_name, str):
+            self.get_logger().warn(f"Invalid topic name: {topic_name}")
             return
         
+        with self._topic_subs_lock:
+            # Check if already subscribed
+            if topic_name in self._topic_subs:
+                return
+            
+            # Enforce subscription limit
+            if len(self._topic_subs) >= MAX_SUBSCRIPTIONS:
+                self.get_logger().error(f"Subscription limit reached ({MAX_SUBSCRIPTIONS}). Cannot subscribe to {topic_name}")
+                return
+        
+        # Validate topic exists in ROS graph
         topic_types = dict(self.get_topic_names_and_types()).get(topic_name)
         if not topic_types:
+            self.get_logger().warn(f"Topic {topic_name} not found in ROS graph")
             return
         
         msg_class = get_message(topic_types[0])
@@ -207,24 +244,29 @@ class WebBridge(Node):
             QoSProfile(depth=10)
         )
 
-        self._topic_subs[topic_name] = sub
+        with self._topic_subs_lock:
+            self._topic_subs[topic_name] = sub
 
         self._update_topic_relations()
-        print(f"Subscribed to {topic_name}")
+        self.get_logger().info(f"Subscribed to {topic_name}")
         
         # Send updated bridge subscriptions
         asyncio.create_task(self._send_bridge_subscriptions())
 
     def _unsubscribe_from_topic(self, topic_name):
-        if topic_name in self._topic_subs:
-            self.destroy_subscription(self._topic_subs[topic_name])
-            del self._topic_subs[topic_name]
+        with self._topic_subs_lock:
+            if topic_name in self._topic_subs:
+                self.destroy_subscription(self._topic_subs[topic_name])
+                del self._topic_subs[topic_name]
 
-            self._update_topic_relations()
-            print(f"Unsubscribed from {topic_name}")
-            
-            # Send updated bridge subscriptions
-            asyncio.create_task(self._send_bridge_subscriptions())
+        self._update_topic_relations()
+        self.get_logger().info(f"Unsubscribed from {topic_name}")
+        
+        # Send updated bridge subscriptions
+        asyncio.run_coroutine_threadsafe(
+            self._send_bridge_subscriptions(),
+            self.loop
+        )
 
     def _on_topic_msg(self, msg, topic_name):
         if not self.ws or not self.loop:
@@ -253,7 +295,7 @@ class WebBridge(Node):
             'rate_hz': rate,
             'timestamp': timestamp
         }
-        print(f"Received message on {topic_name}")
+        self.get_logger().debug(f"Received message on {topic_name}")
         self._send_event_and_update(event, f"Topic data: {topic_name}")
 
     def _update_topic_relations(self): 
@@ -328,9 +370,9 @@ class WebBridge(Node):
         for name, value in zip(param_names, param_values):
             try:
                 parameters[name] = parameter_value_to_python(value)
-            except Exception:
+            except Exception as e:
                 # Skip parameters that cannot be converted
-                pass
+                self.get_logger().debug(f"Could not convert parameter {name}: {e}")
         return parameters
 
     def _list_node_parameters(self, service_prefix, timeout_sec=0.2):
@@ -455,8 +497,8 @@ class WebBridge(Node):
             for name, value in zip(names, response.values):
                 try:
                     params[name] = parameter_value_to_python(value)
-                except Exception:
-                    pass
+                except Exception as e:
+                    self.get_logger().debug(f"Could not convert parameter {name} for {node_name}: {e}")
 
         self._node_parameter_cache[node_name] = params
         self._cleanup_parameter_fetch(node_name)
@@ -592,8 +634,8 @@ class WebBridge(Node):
                     node_services = self.get_service_names_and_types_by_node(node_only, node_namespace)
                     if any(svc_name == service_name for svc_name, _ in node_services):
                         providers.add(node_name)
-                except:
-                    pass
+                except Exception as e:
+                    self.get_logger().debug(f"Error checking services for node {node_name}: {e}")
             
             service_relations[service_name] = {
                 'providers': providers,
@@ -720,7 +762,7 @@ class WebBridge(Node):
         # Detect new actions
         started_actions = current_actions - self._active_actions
         if started_actions:
-            print(f"New actions detected: {started_actions}")
+            self.get_logger().info(f"New actions detected: {started_actions}")
         for action_name in started_actions:
             event = {
                 'type': 'action_event',
@@ -733,7 +775,7 @@ class WebBridge(Node):
         # Detect removed actions
         stopped_actions = self._active_actions - current_actions
         if stopped_actions:
-            print(f"Actions stopped: {stopped_actions}")
+            self.get_logger().info(f"Actions stopped: {stopped_actions}")
         for action_name in stopped_actions:
             event = {
                 'type': 'action_event',
@@ -797,7 +839,8 @@ class WebBridge(Node):
         asyncio.run_coroutine_threadsafe(self._send_actions(), self.loop)
         asyncio.run_coroutine_threadsafe(self._send_services(), self.loop)
         
-        print(log_message)
+        if log_message:
+            self.get_logger().debug(log_message)
 
     async def _send_nodes(self):
         """Send current nodes list to gateway (only when changed)."""
@@ -816,7 +859,7 @@ class WebBridge(Node):
             'timestamp': time.time()
         }
         await self._send_queue.put(json.dumps(message))
-        print(f"Sent nodes list: {list(nodes.keys())}")
+        self.get_logger().debug(f"Sent nodes list: {list(nodes.keys())}")
 
     async def _send_topics(self):
         """Send current topics list to gateway (only when changed)."""
@@ -835,7 +878,7 @@ class WebBridge(Node):
             'timestamp': time.time()
         }
         await self._send_queue.put(json.dumps(message))
-        print(f"Sent topics list: {list(topics.keys())}")
+        self.get_logger().debug(f"Sent topics list: {list(topics.keys())}")
 
     async def _send_actions(self):
         """Send current actions list to gateway (only when changed)."""
@@ -854,7 +897,7 @@ class WebBridge(Node):
             'timestamp': time.time()
         }
         await self._send_queue.put(json.dumps(message))
-        print(f"Sent actions list: {list(actions.keys())}")
+        self.get_logger().debug(f"Sent actions list: {list(actions.keys())}")
 
     async def _send_services(self):
         """Send current services list to gateway (only when changed)."""
@@ -873,7 +916,7 @@ class WebBridge(Node):
             'timestamp': time.time()
         }
         await self._send_queue.put(json.dumps(message))
-        print(f"Sent services list: {list(services.keys())}")
+        self.get_logger().debug(f"Sent services list: {list(services.keys())}")
 
     def _collect_telemetry(self):
         """Collect system telemetry (CPU, RAM) and send to queue."""
