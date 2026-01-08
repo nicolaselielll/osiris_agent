@@ -2,7 +2,7 @@ import os
 import asyncio
 import threading
 import time
-import rclpy, subprocess
+import rclpy
 from collections import deque
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
@@ -13,7 +13,6 @@ import json
 from rosidl_runtime_py.utilities import get_message
 from rosidl_runtime_py import message_to_ordereddict
 import psutil
-import uuid
 
 # Security and configuration constants
 MAX_SUBSCRIPTIONS = 100
@@ -23,7 +22,6 @@ GRAPH_CHECK_INTERVAL = 0.1
 TELEMETRY_INTERVAL = 1.0
 RECONNECT_INITIAL_DELAY = 1
 RECONNECT_MAX_DELAY = 10
-PARAMETER_TIMEOUT = 0.2
 
 class WebBridge(Node):
     def __init__(self):
@@ -39,7 +37,7 @@ class WebBridge(Node):
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()  # Protect topic subscriptions
         self.loop = None
-        self._send_queue = asyncio.Queue()
+        self._send_queue = None  # Created in websocket thread
         self._active_nodes = set(self.get_node_names())
         self._active_topics = set(dict(self.get_topic_names_and_types()).keys())
         self._active_actions = set()  # Track action names
@@ -75,6 +73,7 @@ class WebBridge(Node):
     def _run_ws_client(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
+        self._send_queue = asyncio.Queue()  # Create queue on correct event loop
         self.loop.run_until_complete(self._client_loop_with_reconnect())
 
     async def _client_loop_with_reconnect(self):
@@ -953,7 +952,7 @@ class WebBridge(Node):
 
 def main(args=None):
     # Initialize rclpy and run the WebBridge. The robot token must be provided
-    # via the ROBOT_AUTH_TOKEN environment variable (single canonical method).
+    # via the OSIRIS_AUTH_TOKEN environment variable (single canonical method).
     rclpy.init(args=args)
     node = WebBridge()
     try:

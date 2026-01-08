@@ -4,6 +4,7 @@ setup(
     name='osiris_agent',
     version='0.1.0',
     packages=find_packages(),
+    license='Apache-2.0',
     install_requires=[
         'websockets',
         'psutil',

@@ -63,10 +63,16 @@ WebBridge Node (osiris_agent)
 
 **Key Components:**
 - **Graph Monitor**: Polls ROS2 graph for changes (nodes, topics, actions, services)
-- **Subscription Manager**: Handles dynamic topic subscriptions with thread-safe locking
+- **Subscription Manager**: Handles dynamic topic subscriptions with `threading.Lock()` for thread-safe access to the subscription dictionary
 - **Telemetry Collector**: Gathers CPU, RAM, and disk metrics using `psutil`
 - **WebSocket Client**: Maintains persistent connection with automatic reconnection
-- **Message Queue**: Asynchronous queue for outgoing WebSocket messages
+- **Message Queue**: `asyncio.Queue` created on the websocket event loop for serializing all outgoing messages
+
+**Threading Model:**
+- Main thread runs ROS2 executor (`rclpy.spin`) with timers and callbacks
+- Daemon thread runs asyncio event loop with websocket client (send/receive coroutines)
+- Shared data (`_topic_subs`) protected by `threading.Lock` to prevent race conditions
+- Cross-thread communication via `asyncio.run_coroutine_threadsafe()` to schedule coroutines from ROS thread onto websocket loop
 
 ## Installation
 
@@ -117,35 +123,6 @@ You should see:
 [INFO] [bridge_node]: Attempting to connect to gateway...
 [INFO] [bridge_node]: Connected to gateway
 [INFO] [bridge_node]: Sent initial state: 5 nodes, 12 topics, 0 actions, 8 services
-```
-
-### Run on Startup (systemd)
-
-Create `/etc/systemd/system/osiris-agent.service`:
-
-```ini
-[Unit]
-Description=OSIRIS Agent
-After=network.target
-
-[Service]
-Type=simple
-User=your-username
-Environment="OSIRIS_AUTH_TOKEN=your-token"
-ExecStartPre=/bin/bash -c 'source /opt/ros/humble/setup.bash'
-ExecStart=/home/your-username/.local/bin/agent_node
-Restart=always
-RestartSec=10
-
-[Install]
-WantedBy=multi-user.target
-```
-
-Enable and start:
-```bash
-sudo systemctl enable osiris-agent
-sudo systemctl start osiris-agent
-sudo systemctl status osiris-agent
 ```
 
 ## Updating
@@ -278,10 +255,11 @@ ALLOWED_TOPIC_PREFIXES = ['/robot/', '/sensors/']
 
 ## Security
 
-- Auth token sent via WSS (encrypted)
-- Set `ALLOWED_TOPIC_PREFIXES` to restrict remote access
-- `MAX_SUBSCRIPTIONS` prevents resource exhaustion
-- Ensure gateway scrubs tokens from logs
+- Auth token sent via WSS (encrypted in transit)
+- **Never log `self.ws_url`** - it contains the authentication token in the query parameter
+- Set `ALLOWED_TOPIC_PREFIXES` to restrict which topics can be remotely subscribed
+- `MAX_SUBSCRIPTIONS` prevents resource exhaustion from excessive subscriptions
+- Ensure gateway scrubs tokens from access logs
 
 ## License
 
