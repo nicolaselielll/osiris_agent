@@ -32,6 +32,7 @@ class WebBridge(Node):
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
         
         self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -98,13 +99,30 @@ class WebBridge(Node):
             async with websockets.connect(self.ws_url) as ws:
                 self.ws = ws
                 self.get_logger().info("Connected to gateway")
-                
-                await self._send_initial_state()
-                
-                # Start send loop
+                # Wait for gateway auth response before sending initial state
+                try:
+                    auth_msg = await ws.recv()
+                except Exception as e:
+                    self.get_logger().error(f"Failed to receive auth message: {e}")
+                    return
+
+                try:
+                    auth_data = json.loads(auth_msg)
+                except Exception:
+                    auth_data = None
+
+                self.get_logger().debug(f"Gateway auth message received: {auth_msg}")
+
+                if not auth_data or auth_data.get('type') != 'auth_success':
+                    self.get_logger().error(f"Gateway did not authenticate: parsed={auth_data}")
+                    return
+
+                self.get_logger().info("Authenticated with gateway")
+
                 send_task = asyncio.create_task(self._send_loop(ws))
-                
-                # Receive loop
+
+                await self._send_initial_state()
+
                 await self._receive_loop(ws)
         except Exception as e:
             self.get_logger().error(f"Error in client loop: {e}")
@@ -205,7 +223,15 @@ class WebBridge(Node):
     async def _send_loop(self, ws):
         while True:
             msg = await self._send_queue.get()
-            await ws.send(msg)
+            try:
+                await ws.send(msg)
+                self.get_logger().debug("_send_loop: message sent")
+            except Exception as e:
+                self.get_logger().error(f"_send_loop: failed to send message: {e}")
+                try:
+                    await asyncio.sleep(0.1)
+                except Exception:
+                    pass
 
     # Create ROS subscription for topic with validation and limits
     def _subscribe_to_topic(self, topic_name):
