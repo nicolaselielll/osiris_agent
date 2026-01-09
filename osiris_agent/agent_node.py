@@ -938,7 +938,10 @@ class WebBridge(Node):
     def _get_telemetry_snapshot(self):
         """Return a snapshot of system telemetry (CPU, RAM, disk)."""
         return {
-            'cpu': psutil.cpu_percent(interval=None),
+            'cpu': {
+                'percent': psutil.cpu_percent(interval=None),
+                'cores': psutil.cpu_count(logical=False),
+            },
             'ram': {
                 'percent': psutil.virtual_memory().percent,
                 'used_mb': psutil.virtual_memory().used / (1024 * 1024),
