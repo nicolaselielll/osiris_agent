@@ -32,7 +32,6 @@ class WebBridge(Node):
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
         
         self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -97,8 +96,7 @@ class WebBridge(Node):
         send_task = None
         try:
             async with websockets.connect(self.ws_url) as ws:
-                self.ws = ws
-                self.get_logger().info("Connected to gateway")
+                self.get_logger().info("Connected to gateway (socket opened)")
                 # Wait for gateway auth response before sending initial state
                 try:
                     auth_msg = await ws.recv()
@@ -118,6 +116,8 @@ class WebBridge(Node):
                     return
 
                 self.get_logger().info("Authenticated with gateway")
+
+                self.ws = ws
 
                 send_task = asyncio.create_task(self._send_loop(ws))
 
@@ -224,11 +224,15 @@ class WebBridge(Node):
         while True:
             msg = await self._send_queue.get()
             try:
+                # Log truncated message for debugging
+                self.get_logger().debug(f"_send_loop: sending message (len={len(msg)}): {msg[:200]}")
                 await ws.send(msg)
                 self.get_logger().debug("_send_loop: message sent")
             except Exception as e:
                 self.get_logger().error(f"_send_loop: failed to send message: {e}")
+                # If sending fails, log and continue (do not drop the loop)
                 try:
+                    # small delay to avoid busy loop on persistent error
                     await asyncio.sleep(0.1)
                 except Exception:
                     pass
