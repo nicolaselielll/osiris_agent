@@ -27,6 +27,7 @@ setup(
     install_requires=[
         'websockets',
         'psutil',
+        'pyzmq',
     ],
     extras_require={
         'ros': ['rclpy'],
