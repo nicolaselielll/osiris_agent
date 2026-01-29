@@ -14,6 +14,8 @@ from rosidl_runtime_py.utilities import get_message
 from rosidl_runtime_py import message_to_ordereddict
 import psutil
 
+from .bt_collector import BTCollector
+
 # Security and configuration constants
 MAX_SUBSCRIPTIONS = 100
 ALLOWED_TOPIC_PREFIXES = ['/', ]
@@ -64,6 +66,14 @@ class WebBridge(Node):
         self.create_timer(1.0, self._collect_telemetry)
 
         threading.Thread(target=self._run_ws_client, daemon=True).start()
+        
+        # Initialize BT Collector for Groot2 events
+        self._bt_collector = BTCollector(
+            event_callback=self._on_bt_event,
+            logger=self.get_logger()
+        )
+        self._bt_collector.start()
+        self.get_logger().info("BT Collector started")
 
     # Create event loop and queue, run websocket client
     def _run_ws_client(self):
@@ -953,6 +963,31 @@ class WebBridge(Node):
                 'total_gb': psutil.disk_usage('/').total / (1024 * 1024 * 1024),
             }
         }
+
+    # Handle BT events from BTCollector
+    def _on_bt_event(self, event):
+        """Handle behavior tree events from BTCollector and forward to websocket."""
+        if not self.ws or not self.loop:
+            return
+        
+        self.get_logger().debug(f"BT event: {event.get('type')}")
+        
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_queue.put(json.dumps(event)),
+                self.loop
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to queue BT event: {e}")
+
+    def destroy_node(self):
+        """Clean up resources before destroying the node."""
+        # Stop BT collector
+        if hasattr(self, '_bt_collector') and self._bt_collector:
+            self._bt_collector.stop()
+            self.get_logger().info("BT Collector stopped")
+        
+        super().destroy_node()
 
 
 # Initialize ROS, create node, and run until shutdown
