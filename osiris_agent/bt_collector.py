@@ -9,7 +9,6 @@ Connects to the Groot2 ZMQ publisher from BT.CPP and collects:
 Events are forwarded to the WebBridge for transmission over WebSocket.
 """
 
-import asyncio
 import json
 import struct
 import threading
