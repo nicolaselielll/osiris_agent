@@ -10,6 +10,7 @@ Events are forwarded to the WebBridge for transmission over WebSocket.
 """
 
 import json
+import random
 import struct
 import threading
 import time
@@ -210,9 +211,15 @@ class BTCollector:
     def _request_tree_structure(self, socket: zmq.Socket):
         """Request and parse tree structure from Groot2 server."""
         try:
-            # Groot2 protocol: send empty request to get tree
+            # Groot2 protocol requires proper binary header
+            # Header: protocol(uint8)=2, type(uint8)='T', unique_id(uint32)
+            protocol = 2
+            req_type = ord('T')  # 'T' = FULLTREE request
+            unique_id = random.getrandbits(32)
+            header = struct.pack('<BBI', protocol, req_type, unique_id)
+            
             self._log_debug("Requesting tree structure...")
-            socket.send(b"")
+            socket.send(header)
             
             response = socket.recv()
             self._parse_tree_response(response)
