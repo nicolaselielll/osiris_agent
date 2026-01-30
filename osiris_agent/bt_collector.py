@@ -10,7 +10,6 @@ Events are forwarded to the WebBridge for transmission over WebSocket.
 """
 
 import json
-import random
 import struct
 import threading
 import time
@@ -19,24 +18,30 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 
 import zmq
+import random  # added to support unique_id generation in requests
 
 # Hardcoded ports for now (Groot2 default)
-GROOT_SERVER_PORT = 1666  # REQ/REP for tree structure
-GROOT_PUBLISHER_PORT = 1667  # PUB/SUB for status updates
+GROOT_SERVER_PORT = 1667  # REQ/REP for tree structure and status polling
+GROOT_PUBLISHER_PORT = 1668  # PUB/SUB for breakpoint notifications only
 GROOT_HOST = "127.0.0.1"
 
 # ZMQ timeouts
-ZMQ_RECV_TIMEOUT_MS = 1000
+ZMQ_RECV_TIMEOUT_MS = 2000
 ZMQ_RECONNECT_INTERVAL = 2.0
+STATUS_POLL_INTERVAL = 0.1  # Poll for status every 100ms
 
 
 class NodeStatus(IntEnum):
-    """BT.CPP NodeStatus enum values"""
+    """BT.CPP NodeStatus enum values (includes extended states)"""
     IDLE = 0
     RUNNING = 1
     SUCCESS = 2
     FAILURE = 3
     SKIPPED = 4
+    # Extended states (BT.CPP internal)
+    IDLE_WAS_RUNNING = 11
+    IDLE_WAS_SUCCESS = 12
+    IDLE_WAS_FAILURE = 13
 
     @classmethod
     def to_string(cls, value: int) -> str:
@@ -166,129 +171,158 @@ class BTCollector:
             self._context = None
 
     def _collect_loop(self):
-        """Single collection session - connects, gets tree, subscribes to updates."""
-        # Create sockets
+        """Single collection session - connects, gets tree, polls for status updates."""
+        # Create REQ socket for tree structure AND status polling
         req_socket = self._context.socket(zmq.REQ)
         req_socket.setsockopt(zmq.RCVTIMEO, ZMQ_RECV_TIMEOUT_MS)
         req_socket.setsockopt(zmq.LINGER, 0)
         
-        sub_socket = self._context.socket(zmq.SUB)
-        sub_socket.setsockopt(zmq.RCVTIMEO, ZMQ_RECV_TIMEOUT_MS)
-        sub_socket.setsockopt(zmq.LINGER, 0)
-        sub_socket.setsockopt(zmq.SUBSCRIBE, b"")  # Subscribe to all messages
-        
         try:
-            # Connect to server for tree structure
+            # Connect to server for tree structure and status polling
             server_addr = f"tcp://{self._host}:{self._server_port}"
             self._log_info(f"Connecting to Groot2 server: {server_addr}")
             req_socket.connect(server_addr)
             
-            # Connect to publisher for status updates
-            pub_addr = f"tcp://{self._host}:{self._publisher_port}"
-            self._log_info(f"Connecting to Groot2 publisher: {pub_addr}")
-            sub_socket.connect(pub_addr)
+            # Main loop - request tree first, then poll for status
+            self._log_info("Starting BT collection loop...")
+            tree_received = False
             
-            # Request tree structure
-            self._request_tree_structure(req_socket)
-            
-            # Main status update loop
-            self._log_info("Listening for BT status updates...")
             while self._running:
                 try:
-                    msg = sub_socket.recv(zmq.NOBLOCK)
-                    self._handle_status_message(msg)
+                    # Request tree structure if we don't have it yet
+                    if not tree_received:
+                        tree_received = self._request_tree_structure(req_socket)
+                        if not tree_received:
+                            # No tree yet, wait and retry
+                            time.sleep(1.0)
+                            continue
+                    
+                    # Poll for status updates
+                    self._poll_status(req_socket)
+                    time.sleep(STATUS_POLL_INTERVAL)
+                    
                 except zmq.Again:
-                    # No message available, continue
-                    time.sleep(0.01)
+                    # Timeout - need to recreate socket because REQ is in bad state
+                    self._log_warn("Timeout - recreating socket...")
+                    req_socket.close()
+                    req_socket = self._context.socket(zmq.REQ)
+                    req_socket.setsockopt(zmq.RCVTIMEO, ZMQ_RECV_TIMEOUT_MS)
+                    req_socket.setsockopt(zmq.LINGER, 0)
+                    req_socket.connect(server_addr)
+                    tree_received = False  # Need to re-request tree after reconnect
+                    time.sleep(1.0)
+                    
+                except zmq.ZMQError as e:
+                    if "current state" in str(e):
+                        # Socket in bad state, recreate it
+                        self._log_warn(f"Socket in bad state, recreating: {e}")
+                        req_socket.close()
+                        req_socket = self._context.socket(zmq.REQ)
+                        req_socket.setsockopt(zmq.RCVTIMEO, ZMQ_RECV_TIMEOUT_MS)
+                        req_socket.setsockopt(zmq.LINGER, 0)
+                        req_socket.connect(server_addr)
+                        tree_received = False
+                        time.sleep(1.0)
+                    else:
+                        self._log_error(f"ZMQ error: {e}")
+                        time.sleep(0.5)
+                        
                 except Exception as e:
-                    self._log_error(f"Error receiving status: {e}")
-                    break
+                    self._log_error(f"Error in collection loop: {e}")
+                    time.sleep(0.5)
                     
         finally:
             req_socket.close()
-            sub_socket.close()
 
-    def _request_tree_structure(self, socket: zmq.Socket):
-        """Request and parse tree structure from Groot2 server."""
-        try:
-            # Groot2 protocol requires proper binary header
-            # Header: protocol(uint8)=2, type(uint8)='T', unique_id(uint32)
-            protocol = 2
-            req_type = ord('T')  # 'T' = FULLTREE request
-            unique_id = random.getrandbits(32)
-            header = struct.pack('<BBI', protocol, req_type, unique_id)
-            
-            self._log_debug("Requesting tree structure...")
-            socket.send(header)
-            
-            response = socket.recv()
-            self._parse_tree_response(response)
-            
-        except zmq.Again:
-            self._log_warn("Timeout waiting for tree structure")
-        except Exception as e:
-            self._log_error(f"Error requesting tree: {e}")
+    def _poll_status(self, socket: zmq.Socket):
+        """Poll for status update via REQ/REP."""
+        # Send STATUS request: protocol=2, type='S'
+        protocol = 2
+        req_type = ord('S')  # 'S' = STATUS request
+        unique_id = random.getrandbits(32)
+        header = struct.pack('<BBI', protocol, req_type, unique_id)
+        
+        socket.send(header, zmq.SNDMORE)
+        socket.send(b"")
+        
+        parts = socket.recv_multipart()
+        if parts and len(parts) >= 2:
+            self._handle_status_message(parts)
 
-    def _parse_tree_response(self, data: bytes):
+    def _request_tree_structure(self, socket: zmq.Socket) -> bool:
+        """Request and parse tree structure from Groot2 server. Returns True if successful."""
+        # Groot2 protocol: multipart message with binary header
+        # Header: protocol(uint8)=2, type(uint8)='T', unique_id(uint32)
+        protocol = 2
+        req_type = ord('T')  # 'T' = FULLTREE request
+        unique_id = random.getrandbits(32)
+        header = struct.pack('<BBI', protocol, req_type, unique_id)
+        
+        self._log_info(f"Requesting tree structure...")
+        socket.send(header, zmq.SNDMORE)
+        socket.send(b"")  # Empty body
+        
+        # Receive multipart response
+        parts = socket.recv_multipart()
+        self._log_info(f"Tree response: {len(parts)} parts")
+        
+        if parts and len(parts) >= 2:
+            return self._parse_tree_response(parts)
+        else:
+            self._log_warn("Invalid tree response (expected 2+ parts)")
+            return False
+
+    def _parse_tree_response(self, parts: list) -> bool:
         """
         Parse tree structure response from Groot2.
+        Returns True if successful.
         
-        The Groot2 protocol sends:
-        - First 4 bytes: number of nodes (uint32)
-        - Then for each node: uid (uint16), instance_name (null-terminated), registration_name (null-terminated)
-        - Finally: XML string of the tree
+        Response format (multipart):
+        - Part 0: Header (22 bytes): protocol(1), type(1), unique_id(4), tree_id(16)
+        - Part 1: XML string of the tree
         """
-        if len(data) < 4:
-            self._log_warn(f"Tree response too short: {len(data)} bytes")
-            return
+        if not parts:
+            self._log_warn("Empty tree response")
+            return False
+        
+        self._log_info(f"Parsing tree response: {len(parts)} parts")
         
         try:
-            offset = 0
+            # Part 0: Header
+            hdr = parts[0]
+            tree_id = None
+            if len(hdr) >= 22:
+                resp_protocol, resp_type, resp_id = struct.unpack('<BBI', hdr[:6])
+                tree_id = hdr[6:22].hex()
+                self._log_info(f"Tree header: protocol={resp_protocol}, type={chr(resp_type)}, tree_id={tree_id[:16]}...")
+            elif len(hdr) >= 6:
+                # Check if error response
+                try:
+                    err = hdr.decode('utf-8')
+                    self._log_error(f"Error response: {err}")
+                    if len(parts) > 1:
+                        self._log_error(f"Detail: {parts[1].decode('utf-8')}")
+                    return False
+                except:
+                    self._log_warn(f"Short header: {len(hdr)} bytes")
             
-            # Read number of nodes
-            num_nodes = struct.unpack('<I', data[offset:offset+4])[0]
-            offset += 4
-            self._log_debug(f"Tree has {num_nodes} nodes")
+            # Part 1: XML
+            if len(parts) < 2:
+                self._log_warn("No XML part in response")
+                return False
             
+            xml = parts[1].decode('utf-8', errors='replace')
+            self._log_info(f"Received tree XML: {len(xml)} chars")
+            
+            # Parse XML to extract nodes
             tree = BTTree()
-            nodes_list = []
+            tree.tree_id = tree_id  # Set the tree_id from header
+            tree.xml = xml
+            nodes_list = self._parse_xml_tree(xml, tree)
             
-            # Parse each node
-            for _ in range(num_nodes):
-                if offset + 2 > len(data):
-                    break
-                    
-                # Read UID (uint16)
-                uid = struct.unpack('<H', data[offset:offset+2])[0]
-                offset += 2
-                
-                # Read instance name (null-terminated string)
-                name_end = data.find(b'\x00', offset)
-                if name_end == -1:
-                    break
-                instance_name = data[offset:name_end].decode('utf-8', errors='replace')
-                offset = name_end + 1
-                
-                # Read registration name / tag (null-terminated string)
-                tag_end = data.find(b'\x00', offset)
-                if tag_end == -1:
-                    break
-                registration_name = data[offset:tag_end].decode('utf-8', errors='replace')
-                offset = tag_end + 1
-                
-                node = BTNode(uid=uid, name=instance_name, tag=registration_name)
-                tree.nodes[uid] = node
-                nodes_list.append({
-                    'uid': uid,
-                    'name': instance_name,
-                    'tag': registration_name
-                })
-                
-                self._log_debug(f"  Node {uid}: {instance_name} ({registration_name})")
-            
-            # Remaining data is XML
-            if offset < len(data):
-                tree.xml = data[offset:].decode('utf-8', errors='replace').rstrip('\x00')
+            if not nodes_list:
+                self._log_warn("No nodes extracted from tree XML")
+                return False
             
             self._current_tree = tree
             self._last_statuses.clear()
@@ -298,44 +332,123 @@ class BTCollector:
                 'type': 'bt_tree',
                 'timestamp': time.time(),
                 'tree_id': tree.tree_id,
-                'tree': {},  # Could add hierarchical structure here
+                'tree': tree.structure,  # Hierarchical tree structure
                 'nodes': nodes_list,
                 'xml': tree.xml
             }
             
-            self._log_info(f"Received tree structure: {len(nodes_list)} nodes")
+            self._log_info(f"Tree structure received: {len(nodes_list)} nodes")
+            self._log_info(f"Sending tree event: {json.dumps(event, indent=2)}")
             self._event_callback(event)
+            return True
             
         except Exception as e:
-            self._log_error(f"Error parsing tree response: {e}")
+            import traceback
+            self._log_error(f"Error parsing tree response: {e}\n{traceback.format_exc()}")
+            return False
 
-    def _handle_status_message(self, data: bytes):
-        """
-        Parse status update message from Groot2 publisher.
+    def _parse_xml_tree(self, xml: str, tree: BTTree) -> list:
+        """Parse XML tree and extract nodes with UIDs."""
+        import xml.etree.ElementTree as ET
         
-        The Groot2 protocol sends:
-        - Sequence of (uid: uint16, status: uint8) pairs
-        - Can also be prefixed with a message type byte
+        nodes_list = []
+        try:
+            root = ET.fromstring(xml)
+            self._extract_nodes_from_xml(root, tree, nodes_list)
+            
+            # Also build hierarchical tree structure
+            tree.structure = self._build_tree_structure(root)
+            
+            self._log_info(f"Extracted {len(nodes_list)} nodes from XML")
+        except ET.ParseError as e:
+            self._log_error(f"XML parse error: {e}")
+        
+        return nodes_list
+    
+    def _build_tree_structure(self, elem) -> dict:
+        """Recursively build hierarchical tree structure from XML."""
+        # Find the BehaviorTree element
+        behavior_tree = elem.find('.//BehaviorTree')
+        if behavior_tree is None:
+            return {}
+        
+        # Build from the first child of BehaviorTree (the root node)
+        children = list(behavior_tree)
+        if not children:
+            return {}
+        
+        return self._element_to_tree_node(children[0])
+    
+    def _element_to_tree_node(self, elem) -> dict:
+        """Convert an XML element to a tree node dict with children."""
+        node = {
+            'tag': elem.tag,
+            'name': elem.attrib.get('name', elem.attrib.get('ID', elem.tag)),
+            'attributes': dict(elem.attrib),
+        }
+        
+        # Add uid if present
+        uid_str = elem.attrib.get('_uid')
+        if uid_str:
+            try:
+                node['uid'] = int(uid_str)
+            except ValueError:
+                pass
+        
+        # Recursively add children
+        children = []
+        for child in elem:
+            children.append(self._element_to_tree_node(child))
+        
+        if children:
+            node['children'] = children
+        
+        return node
+    
+    def _extract_nodes_from_xml(self, elem, tree: BTTree, nodes_list: list):
+        """Recursively extract nodes from XML element."""
+        # Check if this element has a _uid attribute
+        uid_str = elem.attrib.get('_uid')
+        if uid_str:
+            try:
+                uid = int(uid_str)
+                name = elem.attrib.get('name', elem.attrib.get('ID', elem.tag))
+                tag = elem.tag
+                
+                node = BTNode(uid=uid, name=name, tag=tag)
+                tree.nodes[uid] = node
+                nodes_list.append({
+                    'uid': uid,
+                    'name': name,
+                    'tag': tag
+                })
+                self._log_info(f"  Parsed node {uid}: {name} ({tag})")
+            except ValueError:
+                pass
+        
+        # Recurse into children
+        for child in elem:
+            self._extract_nodes_from_xml(child, tree, nodes_list)
+
+    def _handle_status_message(self, parts: list):
         """
-        if len(data) < 1:
+        Parse status update message from Groot2 REQ/REP response.
+        
+        Response format (multipart):
+        - Part 0: Header (22 bytes): protocol(1), type(1), unique_id(4), tree_id(16)
+        - Part 1: Status data: repeated (uid: uint16, status: uint8) tuples
+        """
+        if not parts or len(parts) < 2:
+            return
+        
+        # Part 1 contains the status data
+        data = parts[1]
+        if len(data) < 3:
             return
         
         try:
             offset = 0
             changes = []
-            
-            # Check if first byte is a message type indicator
-            # Groot2 may send different message types
-            first_byte = data[0]
-            
-            # If it looks like a status message (small number indicating type)
-            if first_byte <= 10 and len(data) > 1:
-                msg_type = first_byte
-                offset = 1
-                
-                if msg_type == 2:  # Breakpoint message type in some versions
-                    self._handle_breakpoint_message(data[offset:])
-                    return
             
             # Parse status updates: (uid: uint16, status: uint8) pairs
             while offset + 3 <= len(data):
@@ -357,6 +470,8 @@ class BTCollector:
                         node_name = node.name
                         node_tag = node.tag
                     
+                    self._log_info(f"  Node {uid} ({node_name}): -> {status_str}")
+                    
                     changes.append({
                         'uid': uid,
                         'name': node_name,
@@ -372,7 +487,8 @@ class BTCollector:
                     'changes': changes
                 }
                 
-                self._log_debug(f"Status update: {len(changes)} changes")
+                self._log_info(f"Status update: {len(changes)} changes")
+                self._log_info(f"Sending status event: {json.dumps(event, indent=2)}")
                 self._event_callback(event)
                 
         except Exception as e:

@@ -59,6 +59,7 @@ class WebBridge(Node):
         self._last_sent_topics = None
         self._last_sent_actions = None
         self._last_sent_services = None
+        self._cached_bt_tree_event = None  # Cache tree event until WS connects
         
         self._check_graph_changes()
         self.create_timer(0.1, self._check_graph_changes)
@@ -175,6 +176,12 @@ class WebBridge(Node):
         
         await self._send_queue.put(json.dumps(message))
         self.get_logger().info(f"Sent initial state: {len(nodes)} nodes, {len(topics)} topics, {len(actions)} actions, {len(services)} services")
+        
+        # Send cached BT tree event if we have one
+        if self._cached_bt_tree_event:
+            self.get_logger().info("Sending cached BT tree event")
+            await self._send_queue.put(json.dumps(self._cached_bt_tree_event))
+            self._cached_bt_tree_event = None
         
         await self._send_bridge_subscriptions()
 
@@ -967,16 +974,24 @@ class WebBridge(Node):
     # Handle BT events from BTCollector
     def _on_bt_event(self, event):
         """Handle behavior tree events from BTCollector and forward to websocket."""
-        if not self.ws or not self.loop:
-            return
+        event_type = event.get('type')
+        self.get_logger().info(f"BT event received: {event_type}")
         
-        self.get_logger().debug(f"BT event: {event.get('type')}")
+        # Cache tree events if WS not connected yet
+        if not self.ws or not self.loop:
+            if event_type == 'bt_tree':
+                self._cached_bt_tree_event = event
+                self.get_logger().info("BT tree event cached (WS not connected yet)")
+            else:
+                self.get_logger().warn(f"Dropping BT event {event_type} (WS not connected)")
+            return
         
         try:
             asyncio.run_coroutine_threadsafe(
                 self._send_queue.put(json.dumps(event)),
                 self.loop
             )
+            self.get_logger().info(f"BT event {event_type} queued for sending")
         except Exception as e:
             self.get_logger().error(f"Failed to queue BT event: {e}")
 
