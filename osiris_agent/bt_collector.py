@@ -333,8 +333,7 @@ class BTCollector:
                 'timestamp': time.time(),
                 'tree_id': tree.tree_id,
                 'tree': tree.structure,  # Hierarchical tree structure
-                'nodes': nodes_list,
-                'xml': tree.xml
+                'nodes': nodes_list
             }
             
             self._log_info(f"Tree structure received: {len(nodes_list)} nodes")
