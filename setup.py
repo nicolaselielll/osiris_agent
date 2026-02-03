@@ -6,7 +6,7 @@ long_description = (HERE / "README.md").read_text(encoding="utf-8")
 
 setup(
     name='osiris_agent',
-    version='0.1.4',
+    version='0.1.5',
     description='OSIRIS agent for ROS2/Humble',
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -34,7 +34,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'agent_node = osiris_agent.agent_node:main',
+            'osiris_node = osiris_agent.agent_node:main',
         ],
     },
 )

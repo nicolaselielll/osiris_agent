@@ -9,45 +9,63 @@ A ROS2 Humble node that bridges your robot to the OSIRIS remote monitoring platf
 
 ## Install
 
-From PyPI:
+Install the OSIRIS agent on your robot:
 ```bash
-python -m pip install --upgrade pip
-python -m pip install osiris_agent
-```
-
-Editable / development install:
-```bash
-git clone https://github.com/nicolaselielll/osiris_agent.git
-cd osiris_agent
-python -m pip install -e .
+pip3 install osiris-agent
 ```
 
 ## Quick Start
 
-Set the auth token and run the agent:
+### 1. Add token to your environment
+
 ```bash
-export OSIRIS_AUTH_TOKEN="your-robot-token-here"
-agent_node
+export OSIRIS_AUTH_TOKEN=your-token-here
 ```
 
-Verify installation:
+### 2. (Optional) Enable behaviour tree collector
+
+If you're using BT.CPP with Groot2 monitoring:
+
 ```bash
-python -c "import importlib.metadata as m; print(m.version('osiris_agent'))"
+export OSIRIS_BT_COLLECTOR_ENABLED=true
+```
+
+Default host is `127.0.0.1`. Default port for server is `1667` and for publisher `1668`. To change these:
+
+```bash
+export OSIRIS_BT_HOST=127.0.0.1
+export OSIRIS_BT_SERVER_PORT=1667
+export OSIRIS_BT_PUBLISHER_PORT=1668
+```
+
+### 3. Start agent
+
+```bash
+osiris_node
 ```
 
 ## Usage & Configuration
 
-- Environment: OSIRIS_AUTH_TOKEN — your robot token.
-- Editable install reflects code changes immediately.
-- Common constants are in `osiris_agent/agent_node.py`:
-  - MAX_SUBSCRIPTIONS, ALLOWED_TOPIC_PREFIXES, GRAPH_CHECK_INTERVAL, PARAMETER_REFRESH_INTERVAL, TELEMETRY_INTERVAL
+### Required Environment Variables
 
-## Badge suggestions
+- `OSIRIS_AUTH_TOKEN` — Your robot authentication token from the OSIRIS platform
 
-- PyPI: https://img.shields.io/pypi/v/osiris_agent.svg
-- Python versions: https://img.shields.io/pypi/pyversions/osiris_agent.svg
-- License: https://img.shields.io/pypi/l/osiris_agent.svg
-- GitHub Actions CI: https://github.com/<user>/osiris_agent/actions
+### Optional Environment Variables
+
+**Behaviour Tree Monitoring (BT.CPP + Groot2):**
+- `OSIRIS_BT_COLLECTOR_ENABLED` — Set to `true` to enable BT.CPP tree monitoring (default: `false`)
+- `OSIRIS_BT_HOST` — Groot2 ZMQ host address (default: `127.0.0.1`)
+- `OSIRIS_BT_SERVER_PORT` — Groot2 REQ/REP server port (default: `1667`)
+- `OSIRIS_BT_PUBLISHER_PORT` — Groot2 PUB/SUB publisher port (default: `1668`)
+
+## BT.CPP Integration
+
+The agent automatically collects behaviour tree events from BT.CPP when `OSIRIS_BT_COLLECTOR_ENABLED=true`. Your BT.CPP application must:
+
+1. Enable Groot2 monitoring in your code
+2. Use the standard Groot2 ZMQ ports (1667/1668) or configure custom ports via environment variables
+
+The collector uses BT.CPP's standardized Groot2 protocol, so it works with any behaviour tree without custom configuration.
 
 ## Contributing
 
