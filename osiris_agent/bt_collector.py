@@ -10,6 +10,7 @@ Events are forwarded to the WebBridge for transmission over WebSocket.
 """
 
 import json
+import os
 import struct
 import threading
 import time
@@ -20,10 +21,10 @@ from enum import IntEnum
 import zmq
 import random  # added to support unique_id generation in requests
 
-# Hardcoded ports for now (Groot2 default)
-GROOT_SERVER_PORT = 1667  # REQ/REP for tree structure and status polling
-GROOT_PUBLISHER_PORT = 1668  # PUB/SUB for breakpoint notifications only
-GROOT_HOST = "127.0.0.1"
+# Default Groot2 configuration (industry standard)
+DEFAULT_GROOT_SERVER_PORT = 1667  # REQ/REP for tree structure and status polling
+DEFAULT_GROOT_PUBLISHER_PORT = 1668  # PUB/SUB for breakpoint notifications only
+DEFAULT_GROOT_HOST = "127.0.0.1"
 
 # ZMQ timeouts
 ZMQ_RECV_TIMEOUT_MS = 2000
@@ -83,9 +84,9 @@ class BTCollector:
     def __init__(
         self,
         event_callback: Callable[[Dict[str, Any]], None],
-        host: str = GROOT_HOST,
-        server_port: int = GROOT_SERVER_PORT,
-        publisher_port: int = GROOT_PUBLISHER_PORT,
+        host: Optional[str] = None,
+        server_port: Optional[int] = None,
+        publisher_port: Optional[int] = None,
         logger=None
     ):
         """
@@ -93,15 +94,16 @@ class BTCollector:
         
         Args:
             event_callback: Function to call with parsed events (dict)
-            host: Groot2 host address
-            server_port: Groot2 server port (for tree structure requests)
-            publisher_port: Groot2 publisher port (for status updates)
+            host: Groot2 host address (default: from BT_GROOT_HOST env or 127.0.0.1)
+            server_port: Groot2 server port (default: from BT_GROOT_SERVER_PORT env or 1667)
+            publisher_port: Groot2 publisher port (default: from BT_GROOT_PUBLISHER_PORT env or 1668)
             logger: Optional logger (uses print if None)
         """
         self._event_callback = event_callback
-        self._host = host
-        self._server_port = server_port
-        self._publisher_port = publisher_port
+        # Read from environment variables with fallback to defaults
+        self._host = host or os.environ.get('OSIRIS_BT_GROOT_HOST', DEFAULT_GROOT_HOST)
+        self._server_port = server_port or int(os.environ.get('OSIRIS_BT_GROOT_SERVER_PORT', str(DEFAULT_GROOT_SERVER_PORT)))
+        self._publisher_port = publisher_port or int(os.environ.get('OSIRIS_BT_GROOT_PUBLISHER_PORT', str(DEFAULT_GROOT_PUBLISHER_PORT)))
         self._logger = logger
         
         self._running = False
