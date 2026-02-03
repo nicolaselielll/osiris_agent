@@ -34,6 +34,7 @@ class WebBridge(Node):
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
         self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -76,10 +77,10 @@ class WebBridge(Node):
                 logger=self.get_logger()
             )
             self._bt_collector.start()
-            self.get_logger().info("BT Collector started")
         else:
             self._bt_collector = None
-            self.get_logger().info("BT Collector disabled (OSIRIS_BT_COLLECTOR_ENABLED not set)")
+        
+        self.get_logger().info("🚀 Osiris agent running")
 
     # Create event loop and queue, run websocket client
     def _run_ws_client(self):
@@ -95,12 +96,10 @@ class WebBridge(Node):
         
         while True:
             try:
-                self.get_logger().info("Attempting to connect to gateway...")
                 await self._client_loop()
             except Exception as e:
-                self.get_logger().error(f"Connection failed: {e}")
+                pass  # Silent retry
             
-            self.get_logger().info(f"Reconnecting in {reconnect_delay} seconds...")
             await asyncio.sleep(reconnect_delay)
             
             reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
@@ -112,12 +111,10 @@ class WebBridge(Node):
         send_task = None
         try:
             async with websockets.connect(self.ws_url) as ws:
-                self.get_logger().info("Connected to gateway (socket opened)")
                 # Wait for gateway auth response before sending initial state
                 try:
                     auth_msg = await ws.recv()
                 except Exception as e:
-                    self.get_logger().error(f"Failed to receive auth message: {e}")
                     return
 
                 try:
@@ -125,13 +122,8 @@ class WebBridge(Node):
                 except Exception:
                     auth_data = None
 
-                self.get_logger().debug(f"Gateway auth message received: {auth_msg}")
-
                 if not auth_data or auth_data.get('type') != 'auth_success':
-                    self.get_logger().error(f"Gateway did not authenticate: parsed={auth_data}")
                     return
-
-                self.get_logger().info("Authenticated with gateway")
 
                 self.ws = ws
 
@@ -141,7 +133,6 @@ class WebBridge(Node):
 
                 await self._receive_loop(ws)
         except Exception as e:
-            self.get_logger().error(f"Error in client loop: {e}")
             raise
         finally:
             if send_task and not send_task.done():
@@ -980,15 +971,11 @@ class WebBridge(Node):
     def _on_bt_event(self, event):
         """Handle behavior tree events from BTCollector and forward to websocket."""
         event_type = event.get('type')
-        self.get_logger().info(f"BT event received: {event_type}")
         
         # Cache tree events if WS not connected yet
         if not self.ws or not self.loop:
             if event_type == 'bt_tree':
                 self._cached_bt_tree_event = event
-                self.get_logger().info("BT tree event cached (WS not connected yet)")
-            else:
-                self.get_logger().warn(f"Dropping BT event {event_type} (WS not connected)")
             return
         
         try:
@@ -996,7 +983,6 @@ class WebBridge(Node):
                 self._send_queue.put(json.dumps(event)),
                 self.loop
             )
-            self.get_logger().info(f"BT event {event_type} queued for sending")
         except Exception as e:
             self.get_logger().error(f"Failed to queue BT event: {e}")
 
@@ -1005,7 +991,6 @@ class WebBridge(Node):
         # Stop BT collector
         if self._bt_collector:
             self._bt_collector.stop()
-            self.get_logger().info("BT Collector stopped")
         
         super().destroy_node()
 

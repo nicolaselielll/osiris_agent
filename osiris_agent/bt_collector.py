@@ -22,9 +22,9 @@ import zmq
 import random  # added to support unique_id generation in requests
 
 # Default Groot2 configuration (industry standard)
-DEFAULT_GROOT_SERVER_PORT = 1667  # REQ/REP for tree structure and status polling
-DEFAULT_GROOT_PUBLISHER_PORT = 1668  # PUB/SUB for breakpoint notifications only
-DEFAULT_GROOT_HOST = "127.0.0.1"
+DEFAULT_SERVER_PORT = 1667  # REQ/REP for tree structure and status polling
+DEFAULT_PUBLISHER_PORT = 1668  # PUB/SUB for breakpoint notifications only
+DEFAULT_HOST = "127.0.0.1"
 
 # ZMQ timeouts
 ZMQ_RECV_TIMEOUT_MS = 2000
@@ -94,16 +94,16 @@ class BTCollector:
         
         Args:
             event_callback: Function to call with parsed events (dict)
-            host: Groot2 host address (default: from BT_GROOT_HOST env or 127.0.0.1)
-            server_port: Groot2 server port (default: from BT_GROOT_SERVER_PORT env or 1667)
-            publisher_port: Groot2 publisher port (default: from BT_GROOT_PUBLISHER_PORT env or 1668)
+            host: Groot2 host address (default: from BT_HOST env or 127.0.0.1)
+            server_port: Groot2 server port (default: from BT_SERVER_PORT env or 1667)
+            publisher_port: Groot2 publisher port (default: from BT_PUBLISHER_PORT env or 1668)
             logger: Optional logger (uses print if None)
         """
         self._event_callback = event_callback
         # Read from environment variables with fallback to defaults
-        self._host = host or os.environ.get('OSIRIS_BT_GROOT_HOST', DEFAULT_GROOT_HOST)
-        self._server_port = server_port or int(os.environ.get('OSIRIS_BT_GROOT_SERVER_PORT', str(DEFAULT_GROOT_SERVER_PORT)))
-        self._publisher_port = publisher_port or int(os.environ.get('OSIRIS_BT_GROOT_PUBLISHER_PORT', str(DEFAULT_GROOT_PUBLISHER_PORT)))
+        self._host = host or os.environ.get('OSIRIS_BT_HOST', DEFAULT_HOST)
+        self._server_port = server_port or int(os.environ.get('OSIRIS_BT_SERVER_PORT', str(DEFAULT_SERVER_PORT)))
+        self._publisher_port = publisher_port or int(os.environ.get('OSIRIS_BT_PUBLISHER_PORT', str(DEFAULT_PUBLISHER_PORT)))
         self._logger = logger
         
         self._running = False
@@ -114,14 +114,10 @@ class BTCollector:
         self._last_statuses: Dict[int, str] = {}
 
     def _log_info(self, msg: str):
-        if self._logger:
-            self._logger.info(msg)
-        else:
-            print(f"[BTCollector INFO] {msg}")
+        pass  # Logging disabled
 
     def _log_debug(self, msg: str):
-        if self._logger:
-            self._logger.debug(msg)
+        pass  # Logging disabled
 
     def _log_error(self, msg: str):
         if self._logger:
@@ -130,10 +126,7 @@ class BTCollector:
             print(f"[BTCollector ERROR] {msg}")
 
     def _log_warn(self, msg: str):
-        if self._logger:
-            self._logger.warn(msg)
-        else:
-            print(f"[BTCollector WARN] {msg}")
+        pass  # Logging disabled
 
     def start(self):
         """Start the collector in a background thread."""
