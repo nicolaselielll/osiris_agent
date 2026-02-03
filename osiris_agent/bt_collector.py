@@ -196,6 +196,16 @@ class BTCollector:
                             # No tree yet, wait and retry
                             time.sleep(1.0)
                             continue
+                        # Immediately try to fetch current statuses so the initial tree event can include them
+                        try:
+                            self._poll_status(req_socket)
+                        except Exception:
+                            # ignore timeout/errors here; we'll keep trying in the main loop
+                            pass
+                        # emit bt_tree now with status merged into nodes (if available)
+                        if self._current_tree:
+                            self._log_info("Sending initial tree event with statuses")
+                            self._emit_current_tree_event()
                     
                     # Poll for status updates
                     self._poll_status(req_socket)
@@ -247,7 +257,43 @@ class BTCollector:
         
         parts = socket.recv_multipart()
         if parts and len(parts) >= 2:
-            self._handle_status_message(parts)
+            resp_tree_id = self._extract_tree_id_from_header(parts[0])
+            if resp_tree_id and (not self._current_tree or self._current_tree.tree_id != resp_tree_id):
+                self._log_warn(
+                    f"Tree changed behind endpoint: {self._current_tree.tree_id if self._current_tree else None} -> {resp_tree_id}. Refreshing FULLTREE..."
+                )
+                if self._request_tree_structure(socket):
+                    self._emit_current_tree_event()
+            self._handle_status_message(parts, resp_tree_id)
+
+    def _extract_tree_id_from_header(self, hdr: bytes) -> Optional[str]:
+        """
+        Groot2 multipart header (22 bytes):
+          protocol(1), type(1), unique_id(4), tree_id(16)
+        Returns tree_id as hex string or None.
+        """
+        if not hdr or len(hdr) < 22:
+            return None
+        return hdr[6:22].hex()
+
+    def _emit_current_tree_event(self):
+        if not self._current_tree:
+            return
+        nodes_with_status = []
+        for nd in getattr(self._current_tree, "nodes_list", []):
+            uid = nd.get("uid")
+            nd_copy = dict(nd)
+            nd_copy["status"] = self._last_statuses.get(uid, NodeStatus.IDLE.name)
+            nodes_with_status.append(nd_copy)
+        event = {
+            "type": "bt_tree",
+            "timestamp": time.time(),
+            "tree_id": self._current_tree.tree_id,
+            "tree": self._current_tree.structure,
+            "nodes": nodes_with_status,
+        }
+        self._log_info(f"Sending tree event ({len(nodes_with_status)} nodes)")
+        self._event_callback(event)
 
     def _request_tree_structure(self, socket: zmq.Socket) -> bool:
         """Request and parse tree structure from Groot2 server. Returns True if successful."""
@@ -319,26 +365,16 @@ class BTCollector:
             tree.tree_id = tree_id  # Set the tree_id from header
             tree.xml = xml
             nodes_list = self._parse_xml_tree(xml, tree)
-            
+
             if not nodes_list:
                 self._log_warn("No nodes extracted from tree XML")
                 return False
-            
+
+            # store parsed tree and node list; do not emit tree event here
+            tree.nodes_list = nodes_list
             self._current_tree = tree
             self._last_statuses.clear()
-            
-            # Send tree event
-            event = {
-                'type': 'bt_tree',
-                'timestamp': time.time(),
-                'tree_id': tree.tree_id,
-                'tree': tree.structure,  # Hierarchical tree structure
-                'nodes': nodes_list
-            }
-            
             self._log_info(f"Tree structure received: {len(nodes_list)} nodes")
-            self._log_info(f"Sending tree event: {json.dumps(event, indent=2)}")
-            self._event_callback(event)
             return True
             
         except Exception as e:
@@ -429,7 +465,7 @@ class BTCollector:
         for child in elem:
             self._extract_nodes_from_xml(child, tree, nodes_list)
 
-    def _handle_status_message(self, parts: list):
+    def _handle_status_message(self, parts: list, tree_id: Optional[str] = None):
         """
         Parse status update message from Groot2 REQ/REP response.
         
@@ -482,7 +518,7 @@ class BTCollector:
                 event = {
                     'type': 'bt_status',
                     'timestamp': time.time(),
-                    'tree_id': self._current_tree.tree_id if self._current_tree else None,
+                    'tree_id': tree_id or (self._current_tree.tree_id if self._current_tree else None),
                     'changes': changes
                 }
                 

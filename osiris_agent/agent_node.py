@@ -32,7 +32,7 @@ class WebBridge(Node):
         auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
-        
+    
         self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
@@ -68,13 +68,18 @@ class WebBridge(Node):
 
         threading.Thread(target=self._run_ws_client, daemon=True).start()
         
-        # Initialize BT Collector for Groot2 events
-        self._bt_collector = BTCollector(
-            event_callback=self._on_bt_event,
-            logger=self.get_logger()
-        )
-        self._bt_collector.start()
-        self.get_logger().info("BT Collector started")
+        # Initialize BT Collector for Groot2 events (optional)
+        bt_enabled = os.environ.get('OSIRIS_BT_COLLECTOR_ENABLED', '').lower() in ('true', '1', 'yes')
+        if bt_enabled:
+            self._bt_collector = BTCollector(
+                event_callback=self._on_bt_event,
+                logger=self.get_logger()
+            )
+            self._bt_collector.start()
+            self.get_logger().info("BT Collector started")
+        else:
+            self._bt_collector = None
+            self.get_logger().info("BT Collector disabled (OSIRIS_BT_COLLECTOR_ENABLED not set)")
 
     # Create event loop and queue, run websocket client
     def _run_ws_client(self):
@@ -998,7 +1003,7 @@ class WebBridge(Node):
     def destroy_node(self):
         """Clean up resources before destroying the node."""
         # Stop BT collector
-        if hasattr(self, '_bt_collector') and self._bt_collector:
+        if self._bt_collector:
             self._bt_collector.stop()
             self.get_logger().info("BT Collector stopped")
         
