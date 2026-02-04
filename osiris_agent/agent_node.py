@@ -28,7 +28,7 @@ RECONNECT_MAX_DELAY = 10
 class WebBridge(Node):
     # Initialize node, validate token, setup timers and start websocket thread
     def __init__(self):
-        super().__init__('bridge_node')
+        super().__init__('osiris_node')
         auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
