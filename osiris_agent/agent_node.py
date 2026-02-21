@@ -172,6 +172,9 @@ class WebBridge(Node):
         
         await self._send_queue.put(json.dumps(message))
         self.get_logger().info(f"Sent initial state: {len(nodes)} nodes, {len(topics)} topics, {len(actions)} actions, {len(services)} services")
+
+        await self._send_queue.put(json.dumps(self._build_startup_bt_state_event()))
+        self.get_logger().info("Sent startup bt_state event")
         
         # Send cached BT tree event if we have one
         if self._cached_bt_tree_event:
@@ -180,6 +183,26 @@ class WebBridge(Node):
             self._cached_bt_tree_event = None
         
         await self._send_bridge_subscriptions()
+
+    # Build bt_state event for startup regardless of BT collector state
+    def _build_startup_bt_state_event(self):
+        source = self._cached_bt_tree_event
+        if source:
+            return {
+                'type': 'bt_state',
+                'timestamp': source.get('timestamp', time.time()),
+                'tree_id': source.get('tree_id'),
+                'tree': source.get('tree'),
+                'nodes': source.get('nodes', []),
+            }
+
+        return {
+            'type': 'bt_state',
+            'timestamp': time.time(),
+            'tree_id': None,
+            'tree': None,
+            'nodes': [],
+        }
 
     # Send list of currently subscribed topics to gateway
     async def _send_bridge_subscriptions(self):
