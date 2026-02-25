@@ -15,6 +15,7 @@ from rosidl_runtime_py import message_to_ordereddict
 import psutil
 
 from .bt_collector import BTCollector
+from .ros2_control_collector import Ros2ControlCollector
 
 # Security and configuration constants
 MAX_SUBSCRIPTIONS = 100
@@ -61,6 +62,13 @@ class WebBridge(Node):
         self._last_sent_actions = None
         self._last_sent_services = None
         self._cached_bt_tree_event = None  # Cache tree event until WS connects
+
+        # ros2_control collector (controllers + hardware panels)
+        self._ros2_control = Ros2ControlCollector(
+            node=self,
+            event_callback=self._on_ros2_control_event,
+            logger=self.get_logger(),
+        )
         
         self._check_graph_changes()
         self.create_timer(0.1, self._check_graph_changes)
@@ -167,6 +175,8 @@ class WebBridge(Node):
                 'actions': actions,
                 'services': services,
                 'telemetry': self._get_telemetry_snapshot(),
+                'controllers': self._ros2_control.get_controllers_snapshot(),
+                'hardware': self._ros2_control.get_hardware_snapshot(),
             }
         }
         
@@ -864,6 +874,9 @@ class WebBridge(Node):
         self._active_services = current_services
         self._topic_relations = current_topic_relations
 
+        # Poll ros2_control state (internally throttled to 2 s)
+        self._ros2_control.poll()
+
     # Send event to gateway and trigger graph updates
     def _send_event_and_update(self, event, log_message):
         """Send event and trigger update of all graph data."""
@@ -1009,8 +1022,24 @@ class WebBridge(Node):
         except Exception as e:
             self.get_logger().error(f"Failed to queue BT event: {e}")
 
+    # Handle ros2_control events (controllers_state / hardware_state)
+    def _on_ros2_control_event(self, event):
+        """Forward ros2_control collector events to the websocket."""
+        if not self.ws or not self.loop:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_queue.put(json.dumps(event)),
+                self.loop,
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to queue ros2_control event: {e}")
+
     def destroy_node(self):
         """Clean up resources before destroying the node."""
+        # Stop ros2_control collector
+        self._ros2_control.destroy()
+
         # Stop BT collector
         if self._bt_collector:
             self._bt_collector.stop()

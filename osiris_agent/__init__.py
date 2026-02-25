@@ -2,4 +2,5 @@
 
 __all__ = [
     "agent_node",
+    "ros2_control_collector",
 ]
