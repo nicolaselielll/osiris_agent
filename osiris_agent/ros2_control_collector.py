@@ -116,7 +116,7 @@ class Ros2ControlCollector:
         if controllers != self._last_sent_controllers:
             self._last_sent_controllers = controllers
             self._event_callback({
-                'type': 'controllers_state',
+                'type': 'controllers',
                 'data': controllers,
                 'timestamp': time.time(),
             })
@@ -195,7 +195,7 @@ class Ros2ControlCollector:
         if hardware != self._last_sent_hardware:
             self._last_sent_hardware = hardware
             self._event_callback({
-                'type': 'hardware_state',
+                'type': 'hardware',
                 'data': hardware,
                 'timestamp': time.time(),
             })

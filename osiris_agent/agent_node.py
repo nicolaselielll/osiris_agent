@@ -257,8 +257,13 @@ class WebBridge(Node):
                 elif msg_type == 'stop_telemetry':
                     self._telemetry_enabled = False
                     self.get_logger().info("Telemetry stopped")
+                    
+                elif msg_type == 'error':
+                    error_msg = data.get('message', 'Unknown error')
+                    self.get_logger().warn(f"Server error: {error_msg}")
+                    
                 else:
-                    self.get_logger().warn(f"Unknown message type: {msg_type}")
+                    self.get_logger().debug(f"Unhandled message type: {msg_type}")
                     
             except json.JSONDecodeError as e:
                 self.get_logger().error(f"Invalid JSON received: {e}")
