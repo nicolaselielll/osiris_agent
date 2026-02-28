@@ -34,8 +34,8 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -73,7 +73,7 @@ class WebBridge(Node):
         self._check_graph_changes()
         self.create_timer(0.1, self._check_graph_changes)
         self.create_timer(5.0, self._refresh_all_parameters)
-        self.create_timer(1.0, self._collect_telemetry)
+        # self.create_timer(1.0, self._collect_telemetry)
 
         threading.Thread(target=self._run_ws_client, daemon=True).start()
         
@@ -721,8 +721,14 @@ class WebBridge(Node):
         
         services_with_relations = {}
         for service_name, relations in self._service_relations.items():
+            providers = list(relations['providers'])
+            # Skip services with no live provider — DDS can lag behind and
+            # keep reporting service endpoints for a few seconds after the
+            # providing node has shut down.
+            if not providers:
+                continue
             services_with_relations[service_name] = {
-                'providers': list(relations['providers']),
+                'providers': providers,
                 'type': relations['type']
             }
         
@@ -848,7 +854,15 @@ class WebBridge(Node):
                 del self._active_goals[action_name]
         
         current_services = {service_name for service_name, _ in self.get_service_names_and_types()}
-        
+
+        # Eagerly evict services whose only provider was a node that just stopped.
+        # get_service_names_and_types() can lag behind DDS, so without this those
+        # services would linger in the services list until DDS catches up.
+        for node_name in stopped_nodes:
+            for service_name, rel in self._service_relations.items():
+                if rel['providers'] == {node_name}:
+                    current_services.discard(service_name)
+
         started_services = current_services - self._active_services
         for service_name in started_services:
             if service_name.startswith('/ros2cli_daemon'):

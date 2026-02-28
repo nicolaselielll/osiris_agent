@@ -45,7 +45,26 @@ class Ros2ControlCollector:
             return  # controller_manager_msgs not installed
 
         if not self._controller_manager_available():
-            return  # no controller_manager node running
+            # controller_manager has gone away — clear cached state so that
+            # when it comes back the data is re-sent, and emit empty lists if
+            # we previously had data.
+            if self._last_sent_controllers is not None:
+                self._last_sent_controllers = None
+                self._controller_prev_states.clear()
+                self._controller_switch_times.clear()
+                self._event_callback({
+                    'type': 'controllers',
+                    'data': [],
+                    'timestamp': time.time(),
+                })
+            if self._last_sent_hardware is not None:
+                self._last_sent_hardware = None
+                self._event_callback({
+                    'type': 'hardware',
+                    'data': [],
+                    'timestamp': time.time(),
+                })
+            return
 
         self._poll_controllers()
         self._poll_hardware()
@@ -100,26 +119,12 @@ class Ros2ControlCollector:
                 '/controller_manager/list_controllers',
             )
 
-        if not self._list_controllers_client.wait_for_service(timeout_sec=0.2):
+        if not self._list_controllers_client.service_is_ready():
             return
 
-        import rclpy
         request = ListControllers.Request()
         future = self._list_controllers_client.call_async(request)
-        rclpy.spin_until_future_complete(self._node, future, timeout_sec=0.5)
-        response = future.result()
-
-        if response is None:
-            return
-
-        controllers = self._parse_controllers(response)
-        if controllers != self._last_sent_controllers:
-            self._last_sent_controllers = controllers
-            self._event_callback({
-                'type': 'controllers',
-                'data': controllers,
-                'timestamp': time.time(),
-            })
+        future.add_done_callback(self._on_controllers_response)
 
     def _parse_controllers(self, response):
         """Convert ListControllers.Response → list[dict]."""
@@ -168,6 +173,22 @@ class Ros2ControlCollector:
         result.sort(key=lambda x: x['name'])
         return result
 
+    def _on_controllers_response(self, future):
+        try:
+            response = future.result()
+        except Exception:
+            return
+        if response is None:
+            return
+        controllers = self._parse_controllers(response)
+        if controllers != self._last_sent_controllers:
+            self._last_sent_controllers = controllers
+            self._event_callback({
+                'type': 'controllers',
+                'data': controllers,
+                'timestamp': time.time(),
+            })
+
     # -- Hardware (Panel B) --------------------------------------------
 
     def _poll_hardware(self):
@@ -179,26 +200,12 @@ class Ros2ControlCollector:
                 '/controller_manager/list_hardware_components',
             )
 
-        if not self._list_hardware_client.wait_for_service(timeout_sec=0.2):
+        if not self._list_hardware_client.service_is_ready():
             return
 
-        import rclpy
         request = ListHardwareComponents.Request()
         future = self._list_hardware_client.call_async(request)
-        rclpy.spin_until_future_complete(self._node, future, timeout_sec=0.5)
-        response = future.result()
-
-        if response is None:
-            return
-
-        hardware = self._parse_hardware(response)
-        if hardware != self._last_sent_hardware:
-            self._last_sent_hardware = hardware
-            self._event_callback({
-                'type': 'hardware',
-                'data': hardware,
-                'timestamp': time.time(),
-            })
+        future.add_done_callback(self._on_hardware_response)
 
     def _parse_hardware(self, response):
         """Convert ListHardwareComponents.Response → list[dict]."""
@@ -245,6 +252,22 @@ class Ros2ControlCollector:
 
         result.sort(key=lambda x: x['name'])
         return result
+
+    def _on_hardware_response(self, future):
+        try:
+            response = future.result()
+        except Exception:
+            return
+        if response is None:
+            return
+        hardware = self._parse_hardware(response)
+        if hardware != self._last_sent_hardware:
+            self._last_sent_hardware = hardware
+            self._event_callback({
+                'type': 'hardware',
+                'data': hardware,
+                'timestamp': time.time(),
+            })
 
     # -- Cleanup -------------------------------------------------------
 
