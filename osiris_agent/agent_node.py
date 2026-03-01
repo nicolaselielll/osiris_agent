@@ -73,7 +73,7 @@ class WebBridge(Node):
         self._check_graph_changes()
         self.create_timer(0.1, self._check_graph_changes)
         self.create_timer(5.0, self._refresh_all_parameters)
-        # self.create_timer(1.0, self._collect_telemetry)
+        self.create_timer(1.0, self._collect_telemetry)
 
         threading.Thread(target=self._run_ws_client, daemon=True).start()
         
