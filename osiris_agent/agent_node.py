@@ -43,13 +43,26 @@ class WebBridge(Node):
         self._send_queue = None
         self._active_nodes = set(self.get_node_names())
         self._active_topics = set(dict(self.get_topic_names_and_types()).keys())
-        self._active_actions = set()
-        self._active_services = set()
+        self._active_actions = {
+            t.replace('/_action/status', '')
+            for t in self._active_topics
+            if t.endswith('/_action/status')
+        }
+        self._active_services = {
+            service_name
+            for service_name, _ in self.get_service_names_and_types()
+        }
         self._action_status_subs = {}
         self._active_goals = {}
         self._topic_relations = {}
         self._action_relations = {}
         self._service_relations = {}
+        # Pre-populate subscriber tracking so first tick doesn't emit spurious
+        # 'subscribed' events for nodes that were already running before osiris.
+        self._last_topic_subscribers = {
+            topic: {sub.node_name for sub in self.get_subscriptions_info_by_topic(topic)}
+            for topic in self._active_topics
+        }
         self._telemetry_enabled = True
         self._topic_last_timestamp = {}
         self._topic_rate_history = {}
