@@ -62,6 +62,7 @@ class WebBridge(Node):
         self._last_sent_actions = None
         self._last_sent_services = None
         self._cached_bt_tree_event = None  # Cache tree event until WS connects
+        self._graph_dirty = False  # Debounce flag for graph snapshot sends
 
         # ros2_control collector (controllers + hardware panels)
         self._ros2_control = Ros2ControlCollector(
@@ -893,22 +894,27 @@ class WebBridge(Node):
         self._active_services = current_services
         self._topic_relations = current_topic_relations
 
+        # Flush graph snapshots once per tick if anything changed
+        if self._graph_dirty and self.ws and self.loop:
+            self._graph_dirty = False
+            asyncio.run_coroutine_threadsafe(self._send_nodes(), self.loop)
+            asyncio.run_coroutine_threadsafe(self._send_topics(), self.loop)
+            asyncio.run_coroutine_threadsafe(self._send_actions(), self.loop)
+            asyncio.run_coroutine_threadsafe(self._send_services(), self.loop)
+
         # Poll ros2_control state (internally throttled to 2 s)
         self._ros2_control.poll()
 
-    # Send event to gateway and trigger graph updates
+    # Send event to gateway and mark graph dirty for end-of-tick flush
     def _send_event_and_update(self, event, log_message):
-        """Send event and trigger update of all graph data."""
+        """Send event and mark graph as dirty (snapshot sent at end of tick)."""
         if not self.ws or not self.loop:
             return
 
         if event:
             asyncio.run_coroutine_threadsafe(self._send_queue.put(json.dumps(event)), self.loop)
         
-        asyncio.run_coroutine_threadsafe(self._send_topics(), self.loop)
-        asyncio.run_coroutine_threadsafe(self._send_nodes(), self.loop)
-        asyncio.run_coroutine_threadsafe(self._send_actions(), self.loop)
-        asyncio.run_coroutine_threadsafe(self._send_services(), self.loop)
+        self._graph_dirty = True
         
         if log_message:
             self.get_logger().debug(log_message)
