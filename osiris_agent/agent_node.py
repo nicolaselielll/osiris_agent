@@ -593,6 +593,7 @@ class WebBridge(Node):
                     self.get_logger().debug(f"Could not convert parameter {name} for {node_name}: {e}")
 
         self._node_parameter_cache[node_name] = params
+        self._graph_dirty = True  # Push updated params to WS on next tick
         self._cleanup_parameter_fetch(node_name)
 
     # Clean up parameter fetch clients and state
