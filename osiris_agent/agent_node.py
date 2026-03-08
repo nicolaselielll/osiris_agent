@@ -35,8 +35,8 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -452,10 +452,54 @@ class WebBridge(Node):
     def _on_parameter_event(self, msg):
         node_name = msg.node if msg.node.startswith('/') else f"/{msg.node}"
         if node_name in self._active_nodes:
-            self._node_parameter_cache[node_name] = self._get_node_parameters(node_name)
-            self._graph_dirty = True
+            # Async fetch: avoids re-entrant spin_until_future_complete inside subscription callback
+            self._fetch_node_parameters_async(node_name)
 
-    # Get all parameters for a node using ROS services
+    # Non-blocking async parameter fetch (safe to call from timer/subscription callbacks)
+    def _fetch_node_parameters_async(self, node_name):
+        """Fetch parameters for node_name without blocking the executor."""
+        service_prefix = node_name if node_name.startswith('/') else f"/{node_name}"
+
+        list_client = self.create_client(ListParameters, f"{service_prefix}/list_parameters")
+        if not list_client.service_is_ready():
+            self.destroy_client(list_client)
+            return
+
+        req = ListParameters.Request()
+        req.depth = 10
+        future = list_client.call_async(req)
+
+        def _on_list(fut):
+            self.destroy_client(list_client)
+            response = fut.result()
+            if response is None or not response.result.names:
+                return
+
+            param_names = list(response.result.names)
+            get_client = self.create_client(GetParameters, f"{service_prefix}/get_parameters")
+            get_req = GetParameters.Request()
+            get_req.names = param_names
+            get_future = get_client.call_async(get_req)
+
+            def _on_get(gfut):
+                self.destroy_client(get_client)
+                get_resp = gfut.result()
+                if get_resp is None:
+                    return
+                params = {}
+                for name, value in zip(param_names, get_resp.values):
+                    try:
+                        params[name] = parameter_value_to_python(value)
+                    except Exception as e:
+                        self.get_logger().debug(f"Could not convert parameter {name}: {e}")
+                self._node_parameter_cache[node_name] = params
+                self._graph_dirty = True
+
+            get_future.add_done_callback(_on_get)
+
+        future.add_done_callback(_on_list)
+
+    # Get all parameters for a node using ROS services (sync – only safe before executor starts)
     def _get_node_parameters(self, node_name):
         """Get parameters for a specific node using the ROS parameter services."""
         service_prefix = node_name if node_name.startswith('/') else f"/{node_name}"
@@ -705,8 +749,8 @@ class WebBridge(Node):
 
         started_nodes = current_nodes - self._active_nodes
         for node_name in started_nodes:
-            # Fetch params on the ROS thread now so they're ready for the snapshot
-            self._node_parameter_cache[node_name] = self._get_node_parameters(node_name)
+            # Async fetch: avoids re-entrant spin_until_future_complete inside timer callback
+            self._fetch_node_parameters_async(node_name)
             event = {
                 'type': 'node_event',
                 'node': node_name,
