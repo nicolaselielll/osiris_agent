@@ -4,6 +4,7 @@ import threading
 import time
 import rclpy
 from collections import deque
+from rcl_interfaces.msg import ParameterEvent
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from rclpy.qos import QoSProfile
@@ -67,8 +68,12 @@ class WebBridge(Node):
         self._topic_last_timestamp = {}
         self._topic_rate_history = {}
         self._rate_history_depth = 8
-        self._node_parameter_cache = {}
-        self._parameter_fetch_inflight = {}
+        # Fetch params synchronously so initial_state includes them on first connect
+        self._node_parameter_cache = {
+            node_name: self._get_node_parameters(node_name)
+            for node_name in self._active_nodes
+        }
+        self.create_subscription(ParameterEvent, '/parameter_events', self._on_parameter_event, 10)
         
         self._last_sent_nodes = None
         self._last_sent_topics = None
@@ -86,7 +91,6 @@ class WebBridge(Node):
         
         self._check_graph_changes()
         self.create_timer(0.1, self._check_graph_changes)
-        self.create_timer(5.0, self._refresh_all_parameters)
         self.create_timer(1.0, self._collect_telemetry)
 
         threading.Thread(target=self._run_ws_client, daemon=True).start()
@@ -444,6 +448,13 @@ class WebBridge(Node):
             'liveliness': qos_profile.liveliness.name if hasattr(qos_profile.liveliness, 'name') else str(qos_profile.liveliness),
         }
 
+    # Handle runtime parameter changes from any node
+    def _on_parameter_event(self, msg):
+        node_name = msg.node if msg.node.startswith('/') else f"/{msg.node}"
+        if node_name in self._active_nodes:
+            self._node_parameter_cache[node_name] = self._get_node_parameters(node_name)
+            self._graph_dirty = True
+
     # Get all parameters for a node using ROS services
     def _get_node_parameters(self, node_name):
         """Get parameters for a specific node using the ROS parameter services."""
@@ -498,114 +509,6 @@ class WebBridge(Node):
         if response is None:
             return []
         return list(response.values)
-
-    # Trigger async parameter fetch for all nodes
-    def _refresh_all_parameters(self):
-        for node_name in self.get_node_names():
-            if node_name in self._parameter_fetch_inflight:
-                continue
-            self._start_parameter_fetch(node_name)
-
-    # Begin async parameter fetch for a node
-    def _start_parameter_fetch(self, node_name):
-        service_prefix = node_name if node_name.startswith('/') else f"/{node_name}"
-        service_name = f"{service_prefix}/list_parameters"
-        client = self.create_client(ListParameters, service_name)
-        if not client.wait_for_service(timeout_sec=0.2):
-            self.destroy_client(client)
-            return
-
-        request = ListParameters.Request()
-        request.depth = 10
-        future = client.call_async(request)
-        self._parameter_fetch_inflight[node_name] = {
-            'list_client': client,
-            'get_client': None,
-            'get_names': None,
-        }
-        future.add_done_callback(
-            lambda fut, node=node_name, client=client: self._on_list_parameters(node, fut, client)
-        )
-
-    # Handle list_parameters response, start get_parameters request
-    def _on_list_parameters(self, node_name, future, client):
-        inflight = self._parameter_fetch_inflight.get(node_name)
-        if not inflight:
-            self.destroy_client(client)
-            return
-
-        self.destroy_client(client)
-        inflight['list_client'] = None
-
-        response = None
-        try:
-            response = future.result()
-        except Exception:
-            pass
-
-        if not response or not response.result.names:
-            self._node_parameter_cache[node_name] = {}
-            self._cleanup_parameter_fetch(node_name)
-            return
-
-        names = response.result.names
-        inflight['get_names'] = names
-
-        service_prefix = node_name if node_name.startswith('/') else f"/{node_name}"
-        service_name = f"{service_prefix}/get_parameters"
-        get_client = self.create_client(GetParameters, service_name)
-        if not get_client.wait_for_service(timeout_sec=0.2):
-            self.destroy_client(get_client)
-            self._cleanup_parameter_fetch(node_name)
-            return
-
-        request = GetParameters.Request()
-        request.names = names
-        future = get_client.call_async(request)
-        inflight['get_client'] = get_client
-        future.add_done_callback(
-            lambda fut, node=node_name, client=get_client: self._on_get_parameters(node, fut, client)
-        )
-
-    # Handle get_parameters response, update cache
-    def _on_get_parameters(self, node_name, future, client):
-        inflight = self._parameter_fetch_inflight.get(node_name)
-        if not inflight:
-            self.destroy_client(client)
-            return
-
-        self.destroy_client(client)
-        inflight['get_client'] = None
-
-        response = None
-        try:
-            response = future.result()
-        except Exception:
-            pass
-
-        params = {}
-        names = inflight.get('get_names') or []
-        if response:
-            for name, value in zip(names, response.values):
-                try:
-                    params[name] = parameter_value_to_python(value)
-                except Exception as e:
-                    self.get_logger().debug(f"Could not convert parameter {name} for {node_name}: {e}")
-
-        self._node_parameter_cache[node_name] = params
-        self._graph_dirty = True  # Push updated params to WS on next tick
-        self._cleanup_parameter_fetch(node_name)
-
-    # Clean up parameter fetch clients and state
-    def _cleanup_parameter_fetch(self, node_name):
-        inflight = self._parameter_fetch_inflight.pop(node_name, None)
-        if not inflight:
-            return
-
-        for key in ('list_client', 'get_client'):
-            client = inflight.get(key)
-            if client:
-                self.destroy_client(client)
 
     # Get nodes with their topics, actions, services, and parameters
     def _get_nodes_with_relations(self):
@@ -802,6 +705,8 @@ class WebBridge(Node):
 
         started_nodes = current_nodes - self._active_nodes
         for node_name in started_nodes:
+            # Fetch params on the ROS thread now so they're ready for the snapshot
+            self._node_parameter_cache[node_name] = self._get_node_parameters(node_name)
             event = {
                 'type': 'node_event',
                 'node': node_name,
@@ -812,6 +717,7 @@ class WebBridge(Node):
         
         stopped_nodes = self._active_nodes - current_nodes
         for node_name in stopped_nodes:
+            self._node_parameter_cache.pop(node_name, None)
             event = {
                 'type': 'node_event',
                 'node': node_name,
