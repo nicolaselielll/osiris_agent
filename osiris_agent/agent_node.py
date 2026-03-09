@@ -35,14 +35,17 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
         self.loop = None
         self._send_queue = None
-        self._active_nodes = set(self.get_node_names())
+        self._active_nodes = {
+            self._node_full_name(name, ns)
+            for name, ns in self.get_node_names_and_namespaces()
+        }
         self._active_topics = set(dict(self.get_topic_names_and_types()).keys())
         self._active_actions = {
             t.replace('/_action/status', '')
@@ -61,7 +64,10 @@ class WebBridge(Node):
         # Pre-populate subscriber tracking so first tick doesn't emit spurious
         # 'subscribed' events for nodes that were already running before osiris.
         self._last_topic_subscribers = {
-            topic: {sub.node_name for sub in self.get_subscriptions_info_by_topic(topic)}
+            topic: {
+                self._node_full_name(sub.node_name, sub.node_namespace)
+                for sub in self.get_subscriptions_info_by_topic(topic)
+            }
             for topic in self._active_topics
         }
         self._telemetry_enabled = True
@@ -92,6 +98,7 @@ class WebBridge(Node):
         self._check_graph_changes()
         self.create_timer(0.1, self._check_graph_changes)
         self.create_timer(1.0, self._collect_telemetry)
+        self.create_timer(5.0, self._refresh_empty_param_caches)
 
         threading.Thread(target=self._run_ws_client, daemon=True).start()
         
@@ -105,7 +112,10 @@ class WebBridge(Node):
             self._bt_collector.start()
         else:
             self._bt_collector = None
-        
+
+        # Initialize nav2 BT monitoring via /behavior_tree_log ROS topic
+        self._init_nav2_bt_monitor()
+
         self.get_logger().info("🚀 Osiris agent running")
 
     # Create event loop and queue, run websocket client
@@ -394,8 +404,14 @@ class WebBridge(Node):
         current_topic_relations = {}
         
         for topic_name in current_topics:
-            publishers = {pub.node_name for pub in self.get_publishers_info_by_topic(topic_name)}
-            subscribers = {sub.node_name for sub in self.get_subscriptions_info_by_topic(topic_name)}
+            publishers = {
+                self._node_full_name(pub.node_name, pub.node_namespace)
+                for pub in self.get_publishers_info_by_topic(topic_name)
+            }
+            subscribers = {
+                self._node_full_name(sub.node_name, sub.node_namespace)
+                for sub in self.get_subscriptions_info_by_topic(topic_name)
+            }
             current_topic_relations[topic_name] = {
                 'publishers': publishers,
                 'subscribers': subscribers
@@ -415,7 +431,7 @@ class WebBridge(Node):
             pub_info_list = self.get_publishers_info_by_topic(topic_name)
             for pub_info in pub_info_list:
                 publishers_list.append({
-                    'node': pub_info.node_name,
+                    'node': self._node_full_name(pub_info.node_name, pub_info.node_namespace),
                     'qos': self._qos_profile_to_dict(pub_info.qos_profile)
                 })
             
@@ -423,7 +439,7 @@ class WebBridge(Node):
             sub_info_list = self.get_subscriptions_info_by_topic(topic_name)
             for sub_info in sub_info_list:
                 subscribers_list.append({
-                    'node': sub_info.node_name,
+                    'node': self._node_full_name(sub_info.node_name, sub_info.node_namespace),
                     'qos': self._qos_profile_to_dict(sub_info.qos_profile)
                 })
             
@@ -433,6 +449,13 @@ class WebBridge(Node):
                 'subscribers': subscribers_list,
             }
         return topics_with_relations
+
+    # Build fully-qualified node name from short name and namespace
+    @staticmethod
+    def _node_full_name(name, namespace):
+        """Return the fully-qualified node path, e.g. /ns/node or /node."""
+        ns = namespace if namespace.endswith('/') else namespace + '/'
+        return ns + name
 
     # Convert ROS QoS profile to dictionary
     def _qos_profile_to_dict(self, qos_profile):
@@ -447,6 +470,12 @@ class WebBridge(Node):
             'depth': qos_profile.depth,
             'liveliness': qos_profile.liveliness.name if hasattr(qos_profile.liveliness, 'name') else str(qos_profile.liveliness),
         }
+
+    # Retry fetching parameters for nodes whose cache is still empty
+    def _refresh_empty_param_caches(self):
+        for node_name in list(self._active_nodes):
+            if not self._node_parameter_cache.get(node_name):
+                self._fetch_node_parameters_async(node_name)
 
     # Handle runtime parameter changes from any node
     def _on_parameter_event(self, msg):
@@ -577,7 +606,7 @@ class WebBridge(Node):
                     pub_info_list = self.get_publishers_info_by_topic(topic_name)
                     qos_profile = None
                     for pub_info in pub_info_list:
-                        if pub_info.node_name == node_name:
+                        if self._node_full_name(pub_info.node_name, pub_info.node_namespace) == node_name:
                             qos_profile = self._qos_profile_to_dict(pub_info.qos_profile)
                             break
                     
@@ -591,7 +620,7 @@ class WebBridge(Node):
                     sub_info_list = self.get_subscriptions_info_by_topic(topic_name)
                     qos_profile = None
                     for sub_info in sub_info_list:
-                        if sub_info.node_name == node_name:
+                        if self._node_full_name(sub_info.node_name, sub_info.node_namespace) == node_name:
                             qos_profile = self._qos_profile_to_dict(sub_info.qos_profile)
                             break
                     
@@ -623,7 +652,10 @@ class WebBridge(Node):
         for topic_name in self.get_topic_names_and_types():
             if topic_name[0].endswith('/_action/status'):
                 action_name = topic_name[0].replace('/_action/status', '')
-                providers = [info.node_name for info in self.get_publishers_info_by_topic(topic_name[0])]
+                providers = [
+                    self._node_full_name(info.node_name, info.node_namespace)
+                    for info in self.get_publishers_info_by_topic(topic_name[0])
+                ]
                 action_relations[action_name] = {
                     'providers': set(providers),
                 }
@@ -652,18 +684,10 @@ class WebBridge(Node):
         
         for service_name, service_types in all_services:
             providers = set()
-            for node_name in self.get_node_names():
+            for node_short_name, node_namespace in self.get_node_names_and_namespaces():
+                node_name = self._node_full_name(node_short_name, node_namespace)
                 try:
-                    # Extract namespace from node name (format: /namespace/node_name or /node_name)
-                    node_namespace = '/'
-                    if '/' in node_name[1:]:  # Has namespace
-                        parts = node_name[1:].split('/', 1)
-                        node_namespace = '/' + parts[0]
-                        node_only = parts[1]
-                    else:  # No namespace
-                        node_only = node_name[1:] if node_name.startswith('/') else node_name
-                    
-                    node_services = self.get_service_names_and_types_by_node(node_only, node_namespace)
+                    node_services = self.get_service_names_and_types_by_node(node_short_name, node_namespace)
                     if any(svc_name == service_name for svc_name, _ in node_services):
                         providers.add(node_name)
                 except Exception as e:
@@ -699,7 +723,10 @@ class WebBridge(Node):
     # Poll ROS graph for changes and send events
     def _check_graph_changes(self):
         """Check for node, topic, action, and publisher/subscriber changes."""
-        current_nodes = set(self.get_node_names())
+        current_nodes = {
+            self._node_full_name(name, ns)
+            for name, ns in self.get_node_names_and_namespaces()
+        }
         current_topics = set(dict(self.get_topic_names_and_types()).keys())
 
         current_actions = {t.replace('/_action/status', '') for t in current_topics if t.endswith('/_action/status')}
@@ -710,8 +737,14 @@ class WebBridge(Node):
             self._last_topic_subscribers = {}
 
         for topic_name in current_topics:
-            publishers = {pub.node_name for pub in self.get_publishers_info_by_topic(topic_name)}
-            subscribers = {sub.node_name for sub in self.get_subscriptions_info_by_topic(topic_name)}
+            publishers = {
+                self._node_full_name(pub.node_name, pub.node_namespace)
+                for pub in self.get_publishers_info_by_topic(topic_name)
+            }
+            subscribers = {
+                self._node_full_name(sub.node_name, sub.node_namespace)
+                for sub in self.get_subscriptions_info_by_topic(topic_name)
+            }
             current_topic_relations[topic_name] = {
                 'publishers': publishers,
                 'subscribers': subscribers
@@ -1010,6 +1043,137 @@ class WebBridge(Node):
             )
         except Exception as e:
             self.get_logger().error(f"Failed to queue BT event: {e}")
+
+    # Nav2 BT monitoring via /behavior_tree_log ROS topic
+    def _init_nav2_bt_monitor(self):
+        """Subscribe to nav2's /behavior_tree_log topic for BT state monitoring."""
+        try:
+            from nav2_msgs.msg import BehaviorTreeLog
+            self._nav2_bt_statuses = {}       # node_name -> current status string
+            self._nav2_bt_session_active = False
+            self._nav2_bt_tree_id = None      # set once XML is parsed
+            self._nav2_bt_tree_structure = None
+            self._nav2_bt_nodes_list = []
+            self._nav2_bt_name_to_uid = {}
+            self.create_subscription(
+                BehaviorTreeLog,
+                '/behavior_tree_log',
+                self._on_nav2_bt_log,
+                10
+            )
+        except Exception as e:
+            self.get_logger().debug(f"Nav2 BT monitoring unavailable: {e}")
+
+    def _load_and_parse_bt_xml(self) -> bool:
+        """Parse the BT XML file (once) and populate nav2 BT state fields. Returns True on success."""
+        if self._nav2_bt_tree_id is not None:
+            return True  # Already done
+
+        import hashlib
+        import xml.etree.ElementTree as ET
+
+        # Determine XML file path: prefer bt_navigator parameter, fall back to nav2 default
+        xml_path = self._node_parameter_cache.get('/bt_navigator', {}).get('default_nav_to_pose_bt_xml', '')
+        if not xml_path:
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                nav2_share = get_package_share_directory('nav2_bt_navigator')
+                xml_path = os.path.join(
+                    nav2_share, 'behavior_trees',
+                    'navigate_to_pose_w_replanning_and_recovery.xml'
+                )
+            except Exception:
+                return False
+
+        try:
+            with open(xml_path, 'r') as f:
+                xml_content = f.read()
+        except Exception as e:
+            self.get_logger().error(f"Cannot read BT XML '{xml_path}': {e}")
+            return False
+
+        try:
+            root_elem = ET.fromstring(xml_content)
+            bt_elem = root_elem.find('.//BehaviorTree')
+            if bt_elem is None:
+                return False
+
+            nodes_list = []
+            name_to_uid = {}
+            uid_counter = [1]
+
+            def elem_to_node(elem):
+                name = elem.attrib.get('name', elem.attrib.get('ID', elem.tag))
+                uid = uid_counter[0]; uid_counter[0] += 1
+                name_to_uid[name] = uid
+                nodes_list.append({'uid': uid, 'name': name, 'tag': elem.tag})
+                node = {'tag': elem.tag, 'name': name, 'uid': uid, 'attributes': dict(elem.attrib)}
+                kids = [elem_to_node(c) for c in elem]
+                if kids:
+                    node['children'] = kids
+                return node
+
+            bt_children = list(bt_elem)
+            tree_structure = elem_to_node(bt_children[0]) if bt_children else {}
+
+            self._nav2_bt_tree_structure = tree_structure
+            self._nav2_bt_nodes_list = nodes_list
+            self._nav2_bt_name_to_uid = name_to_uid
+            self._nav2_bt_tree_id = hashlib.sha1(xml_content.encode()).hexdigest()[:16]
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse BT XML: {e}")
+            return False
+
+    def _on_nav2_bt_log(self, msg):
+        """Handle nav2 BehaviorTreeLog messages and emit bt_tree / bt_status events."""
+        if not self._load_and_parse_bt_xml():
+            return
+
+        # Build changes list and update local status tracking
+        changes = []
+        has_running = False
+        for change in msg.event_log:
+            self._nav2_bt_statuses[change.node_name] = change.current_status
+            uid = self._nav2_bt_name_to_uid.get(change.node_name)
+            if uid is not None:
+                changes.append({
+                    'uid': uid,
+                    'name': change.node_name,
+                    'tag': '',
+                    'previous_status': change.previous_status,
+                    'status': change.current_status,
+                })
+            if change.current_status == 'RUNNING':
+                has_running = True
+
+        # Detect navigation session start: emit bt_tree event once per session
+        if has_running and not self._nav2_bt_session_active:
+            self._nav2_bt_session_active = True
+            nodes_with_status = [
+                {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
+                for nd in self._nav2_bt_nodes_list
+            ]
+            self._on_bt_event({
+                'type': 'bt_tree',
+                'timestamp': time.time(),
+                'tree_id': self._nav2_bt_tree_id,
+                'tree': self._nav2_bt_tree_structure,
+                'nodes': nodes_with_status,
+            })
+
+        # Emit status changes
+        if changes:
+            self._on_bt_event({
+                'type': 'bt_status',
+                'timestamp': time.time(),
+                'tree_id': self._nav2_bt_tree_id,
+                'changes': changes,
+            })
+
+        # Detect session end: reset when no nodes are RUNNING
+        if not any(s == 'RUNNING' for s in self._nav2_bt_statuses.values()):
+            self._nav2_bt_session_active = False
 
     # Handle ros2_control events (controllers_state / hardware_state)
     def _on_ros2_control_event(self, event):
