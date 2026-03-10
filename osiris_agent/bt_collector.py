@@ -215,6 +215,10 @@ class BTCollector:
                     req_socket.setsockopt(zmq.LINGER, 0)
                     req_socket.connect(server_addr)
                     tree_received = False  # Need to re-request tree after reconnect
+                    if self._current_tree:
+                        self._emit_bt_gone_event()
+                        self._current_tree = None
+                        self._last_statuses.clear()
                     time.sleep(1.0)
                     
                 except zmq.ZMQError as e:
@@ -227,6 +231,10 @@ class BTCollector:
                         req_socket.setsockopt(zmq.LINGER, 0)
                         req_socket.connect(server_addr)
                         tree_received = False
+                        if self._current_tree:
+                            self._emit_bt_gone_event()
+                            self._current_tree = None
+                            self._last_statuses.clear()
                         time.sleep(1.0)
                     else:
                         self._log_error(f"ZMQ error: {e}")
@@ -270,6 +278,16 @@ class BTCollector:
         if not hdr or len(hdr) < 22:
             return None
         return hdr[6:22].hex()
+
+    def _emit_bt_gone_event(self):
+        """Emit a bt_tree event with empty values to signal the BT is no longer available."""
+        self._event_callback({
+            "type": "bt_tree",
+            "timestamp": time.time(),
+            "tree_id": None,
+            "tree": None,
+            "nodes": [],
+        })
 
     def _emit_current_tree_event(self):
         if not self._current_tree:

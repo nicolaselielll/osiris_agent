@@ -35,8 +35,8 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -224,6 +224,7 @@ class WebBridge(Node):
 
     # Build bt_state event for startup regardless of BT collector state
     def _build_startup_bt_state_event(self):
+        # BT.CPP: use cached tree event if available
         source = self._cached_bt_tree_event
         if source:
             return {
@@ -232,6 +233,20 @@ class WebBridge(Node):
                 'tree_id': source.get('tree_id'),
                 'tree': source.get('tree'),
                 'nodes': source.get('nodes', []),
+            }
+
+        # Nav2 BT: if bt_navigator is running, build state from parsed XML + known statuses
+        if hasattr(self, '_nav2_bt_tree_id') and self._nav2_bt_tree_id and self._nav2_bt_tree_structure:
+            nodes_with_status = [
+                {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
+                for nd in self._nav2_bt_nodes_list
+            ]
+            return {
+                'type': 'bt_state',
+                'timestamp': time.time(),
+                'tree_id': self._nav2_bt_tree_id,
+                'tree': self._nav2_bt_tree_structure,
+                'nodes': nodes_with_status,
             }
 
         return {
@@ -729,8 +744,6 @@ class WebBridge(Node):
         }
         current_topics = set(dict(self.get_topic_names_and_types()).keys())
 
-        current_actions = {t.replace('/_action/status', '') for t in current_topics if t.endswith('/_action/status')}
-
         current_topic_relations = {}
 
         if not hasattr(self, '_last_topic_subscribers'):
@@ -777,8 +790,22 @@ class WebBridge(Node):
                 old_pubs = self._topic_relations[topic_name]['publishers']
                 if publishers != old_pubs:
                     self._send_event_and_update(None, f"Topic publishers changed: {topic_name}")
+                    if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                        if not publishers and old_pubs:
+                            self._on_nav2_bt_gone()
+                        elif publishers and not old_pubs:
+                            self._load_and_parse_bt_xml()
 
         self._last_topic_subscribers = {topic: set(rel['subscribers']) for topic, rel in current_topic_relations.items()}
+
+        # Only count actions whose /_action/status topic has at least one publisher.
+        # A bare subscriber (like our own) must not prevent actions from being detected
+        # as gone when the providing node stops.
+        current_actions = {
+            topic_name.replace('/_action/status', '')
+            for topic_name, rel in current_topic_relations.items()
+            if topic_name.endswith('/_action/status') and rel['publishers']
+        }
 
         started_nodes = current_nodes - self._active_nodes
         for node_name in started_nodes:
@@ -1030,10 +1057,12 @@ class WebBridge(Node):
         """Handle behavior tree events from BTCollector and forward to websocket."""
         event_type = event.get('type')
         
+        # Update cache: store new tree, or clear it when BT is gone (tree_id is None)
+        if event_type == 'bt_tree':
+            self._cached_bt_tree_event = event if event.get('tree_id') else None
+
         # Cache tree events if WS not connected yet
         if not self.ws or not self.loop:
-            if event_type == 'bt_tree':
-                self._cached_bt_tree_event = event
             return
         
         try:
@@ -1049,6 +1078,7 @@ class WebBridge(Node):
         """Subscribe to nav2's /behavior_tree_log topic for BT state monitoring."""
         try:
             from nav2_msgs.msg import BehaviorTreeLog
+            from action_msgs.msg import GoalStatusArray
             self._nav2_bt_statuses = {}       # node_name -> current status string
             self._nav2_bt_session_active = False
             self._nav2_bt_tree_id = None      # set once XML is parsed
@@ -1061,6 +1091,17 @@ class WebBridge(Node):
                 self._on_nav2_bt_log,
                 10
             )
+            self.create_subscription(
+                GoalStatusArray,
+                '/navigate_to_pose/_action/status',
+                self._on_nav2_goal_status,
+                10
+            )
+            # If bt_navigator is already publishing when the agent starts, pre-parse
+            # the XML so the startup bt_state event can include the nav2 tree structure.
+            bt_log_publishers = self.get_publishers_info_by_topic('/behavior_tree_log')
+            if bt_log_publishers:
+                self._load_and_parse_bt_xml()
         except Exception as e:
             self.get_logger().debug(f"Nav2 BT monitoring unavailable: {e}")
 
@@ -1130,7 +1171,7 @@ class WebBridge(Node):
         if not self._load_and_parse_bt_xml():
             return
 
-        # Build changes list and update local status tracking
+        # Build changes list and update local status tracking.
         changes = []
         has_running = False
         for change in msg.event_log:
@@ -1147,7 +1188,8 @@ class WebBridge(Node):
             if change.current_status == 'RUNNING':
                 has_running = True
 
-        # Detect navigation session start: emit bt_tree event once per session
+        # Detect navigation session start: emit bt_tree once per session so
+        # the UI receives the full tree structure.
         if has_running and not self._nav2_bt_session_active:
             self._nav2_bt_session_active = True
             nodes_with_status = [
@@ -1171,9 +1213,45 @@ class WebBridge(Node):
                 'changes': changes,
             })
 
-        # Detect session end: reset when no nodes are RUNNING
-        if not any(s == 'RUNNING' for s in self._nav2_bt_statuses.values()):
+    def _on_nav2_goal_status(self, msg):
+        """Detect nav2 goal completion/cancellation via action status."""
+        # action_msgs GoalStatus: ACCEPTED=1, EXECUTING=2, CANCELING=3
+        has_active = any(s.status in (1, 2, 3) for s in msg.status_list)
+
+        if self._nav2_bt_session_active and not has_active:
             self._nav2_bt_session_active = False
+            self._nav2_bt_statuses.clear()
+            if self._nav2_bt_tree_id:
+                nodes_idle = [
+                    {**nd, 'status': 'IDLE'}
+                    for nd in self._nav2_bt_nodes_list
+                ]
+                self._on_bt_event({
+                    'type': 'bt_tree',
+                    'timestamp': time.time(),
+                    'tree_id': self._nav2_bt_tree_id,
+                    'tree': self._nav2_bt_tree_structure,
+                    'nodes': nodes_idle,
+                })
+
+    def _on_nav2_bt_gone(self):
+        """Called when the /behavior_tree_log topic disappears from the ROS graph."""
+        if self._nav2_bt_tree_id is None:
+            return  # Nothing was active, nothing to clear
+        self.get_logger().info("Nav2 BT disappeared from ROS graph — clearing BT state")
+        self._nav2_bt_session_active = False
+        self._nav2_bt_statuses.clear()
+        self._nav2_bt_tree_id = None
+        self._nav2_bt_tree_structure = None
+        self._nav2_bt_nodes_list = []
+        self._nav2_bt_name_to_uid = {}
+        self._on_bt_event({
+            'type': 'bt_tree',
+            'timestamp': time.time(),
+            'tree_id': None,
+            'tree': None,
+            'nodes': [],
+        })
 
     # Handle ros2_control events (controllers_state / hardware_state)
     def _on_ros2_control_event(self, event):
@@ -1206,10 +1284,12 @@ def main(args=None):
     node = WebBridge()
     try:
         rclpy.spin(node)
+    except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
+        pass
     finally:
         node.destroy_node()
-        rclpy.shutdown()
-
+        if rclpy.ok():
+            rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
