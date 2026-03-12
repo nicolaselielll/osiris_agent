@@ -863,8 +863,6 @@ class WebBridge(Node):
             self._send_event_and_update(event, f"Topic destroyed: {topic_name}")
         
         started_actions = current_actions - self._active_actions
-        if started_actions:
-            self.get_logger().info(f"New actions detected: {started_actions}")
         for action_name in started_actions:
             event = {
                 'type': 'action_event',
