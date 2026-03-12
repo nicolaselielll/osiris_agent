@@ -187,7 +187,8 @@ class WebBridge(Node):
                     pass
             
             self.ws = None
-            self.get_logger().info("Connection closed, cleaning up...")
+            if self.context.ok():
+                self.get_logger().info("Connection closed, cleaning up...")
 
     # Collect and send complete ROS graph state on connection
     async def _send_initial_state(self):
