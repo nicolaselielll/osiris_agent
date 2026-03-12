@@ -17,6 +17,7 @@ import psutil
 
 from .bt_collector import BTCollector
 from .ros2_control_collector import Ros2ControlCollector
+from .tf_tree_collector import TfTreeCollector
 
 # Security and configuration constants
 MAX_SUBSCRIPTIONS = 100
@@ -35,8 +36,8 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -92,6 +93,13 @@ class WebBridge(Node):
         self._ros2_control = Ros2ControlCollector(
             node=self,
             event_callback=self._on_ros2_control_event,
+            logger=self.get_logger(),
+        )
+
+        # TF tree collector
+        self._tf_tree = TfTreeCollector(
+            node=self,
+            event_callback=self._on_tf_tree_event,
             logger=self.get_logger(),
         )
         
@@ -188,6 +196,9 @@ class WebBridge(Node):
         actions = self._get_actions_with_relations()
         services = self._get_services_with_relations()
         topics = self._get_topics_with_relations()
+
+        # Force a tf_tree poll so the snapshot is current when sent
+        self._tf_tree.poll(force=True)
         
         self._last_sent_nodes = nodes.copy()
         self._last_sent_actions = actions.copy()
@@ -205,6 +216,7 @@ class WebBridge(Node):
                 'telemetry': self._get_telemetry_snapshot(),
                 'controllers': self._ros2_control.get_controllers_snapshot(),
                 'hardware': self._ros2_control.get_hardware_snapshot(),
+                'tf_tree': self._tf_tree.get_snapshot(),
             }
         }
         
@@ -929,6 +941,9 @@ class WebBridge(Node):
         # Poll ros2_control state (internally throttled to 2 s)
         self._ros2_control.poll()
 
+        # Poll TF tree state (internally throttled to 0.1 s)
+        self._tf_tree.poll()
+
     # Send event to gateway and mark graph dirty for end-of-tick flush
     def _send_event_and_update(self, event, log_message):
         """Send event and mark graph as dirty (snapshot sent at end of tick)."""
@@ -1253,6 +1268,19 @@ class WebBridge(Node):
             'nodes': [],
         })
 
+    # Handle TF tree events
+    def _on_tf_tree_event(self, event):
+        """Forward tf_tree collector events to the websocket."""
+        if not self.ws or not self.loop:
+            return
+        try:
+            asyncio.run_coroutine_threadsafe(
+                self._send_queue.put(json.dumps(event)),
+                self.loop,
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to queue tf_tree event: {e}")
+
     # Handle ros2_control events (controllers_state / hardware_state)
     def _on_ros2_control_event(self, event):
         """Forward ros2_control collector events to the websocket."""
@@ -1270,6 +1298,9 @@ class WebBridge(Node):
         """Clean up resources before destroying the node."""
         # Stop ros2_control collector
         self._ros2_control.destroy()
+
+        # Stop TF tree collector
+        self._tf_tree.destroy()
 
         # Stop BT collector
         if self._bt_collector:

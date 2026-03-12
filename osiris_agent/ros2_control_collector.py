@@ -279,3 +279,4 @@ class Ros2ControlCollector:
         if self._list_hardware_client is not None:
             self._node.destroy_client(self._list_hardware_client)
             self._list_hardware_client = None
+            
