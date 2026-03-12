@@ -3,6 +3,7 @@ import asyncio
 import threading
 import time
 import rclpy
+from osiris_agent import __version__ as AGENT_VERSION
 from collections import deque
 from rcl_interfaces.msg import ParameterEvent
 from rcl_interfaces.srv import GetParameters, ListParameters
@@ -206,6 +207,11 @@ class WebBridge(Node):
         self._last_sent_services = services.copy()
         self._last_sent_topics = topics.copy()
         
+        await self._send_queue.put(json.dumps({
+            'type': 'agent_version',
+            'version': AGENT_VERSION,
+        }))
+
         message = {
             'type': 'initial_state',
             'timestamp': time.time(),
