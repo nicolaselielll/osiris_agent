@@ -811,7 +811,14 @@ class WebBridge(Node):
                         if not publishers and old_pubs:
                             self._on_nav2_bt_gone()
                         elif publishers and not old_pubs:
-                            self._load_and_parse_bt_xml()
+                            if self._load_and_parse_bt_xml():
+                                self._on_bt_event({
+                                    'type': 'bt_tree',
+                                    'timestamp': time.time(),
+                                    'tree_id': self._nav2_bt_tree_id,
+                                    'tree': self._nav2_bt_tree_structure,
+                                    'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                                })
 
         self._last_topic_subscribers = {topic: set(rel['subscribers']) for topic, rel in current_topic_relations.items()}
 
@@ -846,6 +853,14 @@ class WebBridge(Node):
                 'timestamp': time.time()
             }
             self._send_event_and_update(event, f"Node stopped: {node_name}")
+            # If this node was publishing /behavior_tree_log, trigger BT cleanup
+            # immediately rather than waiting for the slower DDS topic removal.
+            # self._topic_relations still holds the previous tick's data here.
+            if hasattr(self, '_nav2_bt_tree_id'):
+                bt_pubs = self._topic_relations.get('/behavior_tree_log', {}).get('publishers', set())
+                if node_name in bt_pubs:
+                    self.get_logger().info(f"BT publisher node {node_name} stopped — clearing BT state")
+                    self._on_nav2_bt_gone()
         
         started_topics = current_topics - self._active_topics
         for topic_name in started_topics:
@@ -856,6 +871,19 @@ class WebBridge(Node):
                 'timestamp': time.time()
             }
             self._send_event_and_update(event, f"Topic created: {topic_name}")
+            # When /behavior_tree_log appears as a brand-new topic (nav2 just started),
+            # the publisher-change path below won't fire because the topic isn't in
+            # self._topic_relations yet. Handle it here instead.
+            if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                if current_topic_relations.get(topic_name, {}).get('publishers'):
+                    if self._load_and_parse_bt_xml():
+                        self._on_bt_event({
+                            'type': 'bt_tree',
+                            'timestamp': time.time(),
+                            'tree_id': self._nav2_bt_tree_id,
+                            'tree': self._nav2_bt_tree_structure,
+                            'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                        })
         
         stopped_topics = self._active_topics - current_topics
         for topic_name in stopped_topics:
@@ -866,6 +894,8 @@ class WebBridge(Node):
                 'timestamp': time.time()
             }
             self._send_event_and_update(event, f"Topic destroyed: {topic_name}")
+            if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                self._on_nav2_bt_gone()
         
         started_actions = current_actions - self._active_actions
         for action_name in started_actions:
@@ -933,13 +963,55 @@ class WebBridge(Node):
         self._active_services = current_services
         self._topic_relations = current_topic_relations
 
-        # Flush graph snapshots once per tick if anything changed
+        # Flush graph snapshots once per tick if anything changed.
+        # All computation runs here on the ROS executor thread so the asyncio
+        # send loop only ever does I/O (ws.send), never blocks on ROS API calls.
         if self._graph_dirty and self.ws and self.loop:
             self._graph_dirty = False
-            asyncio.run_coroutine_threadsafe(self._send_nodes(), self.loop)
-            asyncio.run_coroutine_threadsafe(self._send_topics(), self.loop)
-            asyncio.run_coroutine_threadsafe(self._send_actions(), self.loop)
-            asyncio.run_coroutine_threadsafe(self._send_services(), self.loop)
+
+            nodes = self._get_nodes_with_relations()
+            if nodes != self._last_sent_nodes:
+                self._last_sent_nodes = nodes.copy()
+                asyncio.run_coroutine_threadsafe(
+                    self._send_queue.put(json.dumps(
+                        {'type': 'nodes', 'data': nodes, 'timestamp': time.time()}
+                    )),
+                    self.loop
+                )
+                self.get_logger().debug(f"Sent nodes list: {list(nodes.keys())}")
+
+            topics = self._get_topics_with_relations()
+            if topics != self._last_sent_topics:
+                self._last_sent_topics = topics.copy()
+                asyncio.run_coroutine_threadsafe(
+                    self._send_queue.put(json.dumps(
+                        {'type': 'topics', 'data': topics, 'timestamp': time.time()}
+                    )),
+                    self.loop
+                )
+                self.get_logger().debug(f"Sent topics list: {list(topics.keys())}")
+
+            actions = self._get_actions_with_relations()
+            if actions != self._last_sent_actions:
+                self._last_sent_actions = actions.copy()
+                asyncio.run_coroutine_threadsafe(
+                    self._send_queue.put(json.dumps(
+                        {'type': 'actions', 'data': actions, 'timestamp': time.time()}
+                    )),
+                    self.loop
+                )
+                self.get_logger().debug(f"Sent actions list: {list(actions.keys())}")
+
+            services = self._get_services_with_relations()
+            if services != self._last_sent_services:
+                self._last_sent_services = services.copy()
+                asyncio.run_coroutine_threadsafe(
+                    self._send_queue.put(json.dumps(
+                        {'type': 'services', 'data': services, 'timestamp': time.time()}
+                    )),
+                    self.loop
+                )
+                self.get_logger().debug(f"Sent services list: {list(services.keys())}")
 
         # Poll ros2_control state (internally throttled to 2 s)
         self._ros2_control.poll()
@@ -960,78 +1032,6 @@ class WebBridge(Node):
         
         if log_message:
             self.get_logger().debug(log_message)
-
-    # Send nodes to gateway if changed
-    async def _send_nodes(self):
-        """Send current nodes list to gateway (only when changed)."""
-        nodes = self._get_nodes_with_relations()
-        
-        if self._last_sent_nodes == nodes:
-            return
-        
-        self._last_sent_nodes = nodes.copy()
-        
-        message = {
-            'type': 'nodes',
-            'data': nodes,
-            'timestamp': time.time()
-        }
-        await self._send_queue.put(json.dumps(message))
-        self.get_logger().debug(f"Sent nodes list: {list(nodes.keys())}")
-
-    # Send topics to gateway if changed
-    async def _send_topics(self):
-        """Send current topics list to gateway (only when changed)."""
-        topics = self._get_topics_with_relations()
-        
-        if self._last_sent_topics == topics:
-            return
-        
-        self._last_sent_topics = topics.copy()
-        
-        message = {
-            'type': 'topics',
-            'data': topics,
-            'timestamp': time.time()
-        }
-        await self._send_queue.put(json.dumps(message))
-        self.get_logger().debug(f"Sent topics list: {list(topics.keys())}")
-
-    # Send actions to gateway if changed
-    async def _send_actions(self):
-        """Send current actions list to gateway (only when changed)."""
-        actions = self._get_actions_with_relations()
-        
-        if self._last_sent_actions == actions:
-            return
-        
-        self._last_sent_actions = actions.copy()
-        
-        message = {
-            'type': 'actions',
-            'data': actions,
-            'timestamp': time.time()
-        }
-        await self._send_queue.put(json.dumps(message))
-        self.get_logger().debug(f"Sent actions list: {list(actions.keys())}")
-
-    # Send services to gateway if changed
-    async def _send_services(self):
-        """Send current services list to gateway (only when changed)."""
-        services = self._get_services_with_relations()
-        
-        if self._last_sent_services == services:
-            return
-        
-        self._last_sent_services = services.copy()
-        
-        message = {
-            'type': 'services',
-            'data': services,
-            'timestamp': time.time()
-        }
-        await self._send_queue.put(json.dumps(message))
-        self.get_logger().debug(f"Sent services list: {list(services.keys())}")
 
     # Collect and send system telemetry to gateway
     def _collect_telemetry(self):
