@@ -143,7 +143,8 @@ class WebBridge(Node):
             try:
                 await self._client_loop()
             except Exception as e:
-                pass  # Silent retry
+                if self.context.ok():
+                    self.get_logger().warning(f"WebSocket connection failed: {e}, retrying in {reconnect_delay:.1f}s")
             
             await asyncio.sleep(reconnect_delay)
             
