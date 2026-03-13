@@ -139,7 +139,7 @@ class WebBridge(Node):
         """Wrapper that handles reconnection."""
         reconnect_delay = RECONNECT_INITIAL_DELAY
         
-        while True:
+        while self.context.ok():
             try:
                 await self._client_loop()
             except Exception as e:
@@ -184,7 +184,7 @@ class WebBridge(Node):
                 send_task.cancel()
                 try:
                     await send_task
-                except asyncio.CancelledError:
+                except (asyncio.CancelledError, Exception):
                     pass
             
             self.ws = None
@@ -293,6 +293,8 @@ class WebBridge(Node):
     # Receive and handle commands from gateway
     async def _receive_loop(self, ws):
         async for msg in ws:
+            if not self.context.ok():
+                break
             try:
                 data = json.loads(msg)
                 msg_type = data.get('type')
@@ -343,12 +345,7 @@ class WebBridge(Node):
                 self.get_logger().debug("_send_loop: message sent")
             except Exception as e:
                 self.get_logger().error(f"_send_loop: failed to send message: {e}")
-                # If sending fails, log and continue (do not drop the loop)
-                try:
-                    # small delay to avoid busy loop on persistent error
-                    await asyncio.sleep(0.1)
-                except Exception:
-                    pass
+                raise
 
     # Create ROS subscription for topic with validation and limits
     def _subscribe_to_topic(self, topic_name):
