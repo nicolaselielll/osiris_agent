@@ -823,6 +823,30 @@ class WebBridge(Node):
 
         self._last_topic_subscribers = {topic: set(rel['subscribers']) for topic, rel in current_topic_relations.items()}
 
+        # Track /behavior_tree_log publisher liveness via the node graph, which updates
+        # faster than DDS publisher endpoint info (avoids both false positives and
+        # missed transitions when DDS skips the zero-publisher intermediate state).
+        if hasattr(self, '_nav2_bt_publisher_active'):
+            bt_pubs = current_topic_relations.get('/behavior_tree_log', {}).get('publishers', set())
+            live_bt_pubs = bt_pubs & current_nodes
+            if self._nav2_bt_publisher_active and not live_bt_pubs:
+                # Publisher node confirmed gone — clear BT state.
+                self.get_logger().info(f"BT publisher nodes gone from graph (pubs={bt_pubs}) — clearing BT state")
+                self._on_nav2_bt_gone()
+            elif not self._nav2_bt_publisher_active and live_bt_pubs:
+                # Publisher node is back but the flag was left False (DDS kept showing the
+                # old endpoint so the publisher-change delta above never fired).
+                self.get_logger().info(f"BT publisher {live_bt_pubs} back in graph — re-arming")
+                self._nav2_bt_publisher_active = True
+                if self._load_and_parse_bt_xml():
+                    self._on_bt_event({
+                        'type': 'bt_tree',
+                        'timestamp': time.time(),
+                        'tree_id': self._nav2_bt_tree_id,
+                        'tree': self._nav2_bt_tree_structure,
+                        'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                    })
+
         # Only count actions whose /_action/status topic has at least one publisher.
         # A bare subscriber (like our own) must not prevent actions from being detected
         # as gone when the providing node stops.
