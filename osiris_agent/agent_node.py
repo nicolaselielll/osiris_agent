@@ -37,8 +37,8 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -811,6 +811,7 @@ class WebBridge(Node):
                         if not publishers and old_pubs:
                             self._on_nav2_bt_gone()
                         elif publishers and not old_pubs:
+                            self._nav2_bt_publisher_active = True
                             if self._load_and_parse_bt_xml():
                                 self._on_bt_event({
                                     'type': 'bt_tree',
@@ -876,6 +877,7 @@ class WebBridge(Node):
             # self._topic_relations yet. Handle it here instead.
             if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
                 if current_topic_relations.get(topic_name, {}).get('publishers'):
+                    self._nav2_bt_publisher_active = True
                     if self._load_and_parse_bt_xml():
                         self._on_bt_event({
                             'type': 'bt_tree',
@@ -1099,6 +1101,7 @@ class WebBridge(Node):
             from action_msgs.msg import GoalStatusArray
             self._nav2_bt_statuses = {}       # node_name -> current status string
             self._nav2_bt_session_active = False
+            self._nav2_bt_publisher_active = False  # True only while a publisher exists
             self._nav2_bt_tree_id = None      # set once XML is parsed
             self._nav2_bt_tree_structure = None
             self._nav2_bt_nodes_list = []
@@ -1119,6 +1122,7 @@ class WebBridge(Node):
             # the XML so the startup bt_state event can include the nav2 tree structure.
             bt_log_publishers = self.get_publishers_info_by_topic('/behavior_tree_log')
             if bt_log_publishers:
+                self._nav2_bt_publisher_active = True
                 self._load_and_parse_bt_xml()
         except Exception as e:
             self.get_logger().debug(f"Nav2 BT monitoring unavailable: {e}")
@@ -1186,6 +1190,9 @@ class WebBridge(Node):
 
     def _on_nav2_bt_log(self, msg):
         """Handle nav2 BehaviorTreeLog messages and emit bt_tree / bt_status events."""
+        # Discard messages buffered by DDS after the publisher has gone away.
+        if not self._nav2_bt_publisher_active:
+            return
         if not self._load_and_parse_bt_xml():
             return
 
@@ -1254,9 +1261,10 @@ class WebBridge(Node):
 
     def _on_nav2_bt_gone(self):
         """Called when the /behavior_tree_log topic disappears from the ROS graph."""
-        if self._nav2_bt_tree_id is None:
+        if self._nav2_bt_tree_id is None and not self._nav2_bt_publisher_active:
             return  # Nothing was active, nothing to clear
         self.get_logger().info("Nav2 BT disappeared from ROS graph — clearing BT state")
+        self._nav2_bt_publisher_active = False  # Gate out any DDS-buffered callbacks
         self._nav2_bt_session_active = False
         self._nav2_bt_statuses.clear()
         self._nav2_bt_tree_id = None
