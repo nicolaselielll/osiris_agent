@@ -854,14 +854,6 @@ class WebBridge(Node):
                 'timestamp': time.time()
             }
             self._send_event_and_update(event, f"Node stopped: {node_name}")
-            # If this node was publishing /behavior_tree_log, trigger BT cleanup
-            # immediately rather than waiting for the slower DDS topic removal.
-            # self._topic_relations still holds the previous tick's data here.
-            if hasattr(self, '_nav2_bt_tree_id'):
-                bt_pubs = self._topic_relations.get('/behavior_tree_log', {}).get('publishers', set())
-                if node_name in bt_pubs:
-                    self.get_logger().info(f"BT publisher node {node_name} stopped — clearing BT state")
-                    self._on_nav2_bt_gone()
         
         started_topics = current_topics - self._active_topics
         for topic_name in started_topics:
