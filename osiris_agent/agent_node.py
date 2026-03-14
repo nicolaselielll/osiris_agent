@@ -427,7 +427,12 @@ class WebBridge(Node):
             'timestamp': timestamp
         }
         self.get_logger().debug(f"Received message on {topic_name}")
-        self._send_event_and_update(event, f"Topic data: {topic_name}")
+        # Send topic data directly without marking graph dirty —
+        # topic data is payload on existing subscriptions, not a graph change.
+        if self.ws and self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_queue.put(json.dumps(event)), self.loop
+            )
 
     # Update topic publishers and subscribers
     def _update_topic_relations(self): 
