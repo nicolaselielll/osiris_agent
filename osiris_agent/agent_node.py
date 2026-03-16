@@ -990,7 +990,14 @@ class WebBridge(Node):
                 'timestamp': time.time()
             }
             self._send_event_and_update(event, f"Service destroyed: {service_name}")
-            
+
+        # If services changed, expire the rate-limit so the flush below rebuilds
+        # provider relations immediately rather than using a stale 5s-old snapshot.
+        real_started = {s for s in started_services if not s.startswith('/ros2cli_daemon')}
+        real_stopped = {s for s in stopped_services if not s.startswith('/ros2cli_daemon')}
+        if real_started or real_stopped:
+            self._service_relations_last_update = 0
+
         self._active_nodes = current_nodes
         self._active_topics = current_topics
         self._active_actions = current_actions
