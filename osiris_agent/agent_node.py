@@ -105,7 +105,7 @@ class WebBridge(Node):
         )
         
         self._check_graph_changes()
-        self.create_timer(0.1, self._check_graph_changes)
+        self.create_timer(1.0, self._check_graph_changes)
         self.create_timer(1.0, self._collect_telemetry)
         self.create_timer(5.0, self._refresh_empty_param_caches)
 
@@ -458,23 +458,20 @@ class WebBridge(Node):
 
     # Get topics with publishers, subscribers, and QoS profiles
     def _get_topics_with_relations(self):
-        """Get topics with their publishers and subscribers with QoS info (uses cached data)."""
+        """Get topics with their publishers and subscribers with QoS info."""
         self._update_topic_relations()
         topics_with_relations = {}
         topic_types_dict = dict(self.get_topic_names_and_types())
         
         for topic_name, relations in self._topic_relations.items():
             publishers_list = []
-            pub_info_list = self.get_publishers_info_by_topic(topic_name)
-            for pub_info in pub_info_list:
+            for pub_info in self.get_publishers_info_by_topic(topic_name):
                 publishers_list.append({
                     'node': self._node_full_name(pub_info.node_name, pub_info.node_namespace),
                     'qos': self._qos_profile_to_dict(pub_info.qos_profile)
                 })
-            
             subscribers_list = []
-            sub_info_list = self.get_subscriptions_info_by_topic(topic_name)
-            for sub_info in sub_info_list:
+            for sub_info in self.get_subscriptions_info_by_topic(topic_name):
                 subscribers_list.append({
                     'node': self._node_full_name(sub_info.node_name, sub_info.node_namespace),
                     'qos': self._qos_profile_to_dict(sub_info.qos_profile)
@@ -637,33 +634,30 @@ class WebBridge(Node):
                 'parameters': {}
             }
         
+        # Build per-node QoS lookup
+        pub_qos = {}   # (topic, node) -> qos dict
+        sub_qos = {}   # (topic, node) -> qos dict
+        for topic_name in self._topic_relations:
+            for pub_info in self.get_publishers_info_by_topic(topic_name):
+                node = self._node_full_name(pub_info.node_name, pub_info.node_namespace)
+                pub_qos[(topic_name, node)] = self._qos_profile_to_dict(pub_info.qos_profile)
+            for sub_info in self.get_subscriptions_info_by_topic(topic_name):
+                node = self._node_full_name(sub_info.node_name, sub_info.node_namespace)
+                sub_qos[(topic_name, node)] = self._qos_profile_to_dict(sub_info.qos_profile)
+
         for topic_name, relations in self._topic_relations.items():
             for node_name in relations['publishers']:
                 if node_name in nodes_with_relations:
-                    pub_info_list = self.get_publishers_info_by_topic(topic_name)
-                    qos_profile = None
-                    for pub_info in pub_info_list:
-                        if self._node_full_name(pub_info.node_name, pub_info.node_namespace) == node_name:
-                            qos_profile = self._qos_profile_to_dict(pub_info.qos_profile)
-                            break
-                    
                     nodes_with_relations[node_name]['publishes'].append({
                         'topic': topic_name,
-                        'qos': qos_profile
+                        'qos': pub_qos.get((topic_name, node_name))
                     })
             
             for node_name in relations['subscribers']:
                 if node_name in nodes_with_relations:
-                    sub_info_list = self.get_subscriptions_info_by_topic(topic_name)
-                    qos_profile = None
-                    for sub_info in sub_info_list:
-                        if self._node_full_name(sub_info.node_name, sub_info.node_namespace) == node_name:
-                            qos_profile = self._qos_profile_to_dict(sub_info.qos_profile)
-                            break
-                    
                     nodes_with_relations[node_name]['subscribes'].append({
                         'topic': topic_name,
-                        'qos': qos_profile
+                        'qos': sub_qos.get((topic_name, node_name))
                     })
         
         for action_name, relations in self._action_relations.items():
@@ -712,24 +706,41 @@ class WebBridge(Node):
         
         return actions_with_relations
 
-    # Update cached service providers by querying nodes
-    def _update_service_relations(self):
-        """Update the cached service relations."""
+    # Update cached service providers by querying nodes (rate-limited)
+    def _update_service_relations(self, force=False):
+        """Update the cached service relations.
+
+        This is an O(nodes × services) operation, so it is rate-limited to once
+        every 5 seconds unless *force* is True (used by initial_state).
+        """
+        now = time.time()
+        if not force and hasattr(self, '_service_relations_last_update'):
+            if now - self._service_relations_last_update < 5.0:
+                return
+        self._service_relations_last_update = now
+
         service_relations = {}
         
+        # Build a per-node service lookup once — avoids calling
+        # get_service_names_and_types_by_node() for every (service, node) pair.
+        node_service_map = {}  # node_full_name -> set of service names
+        for node_short_name, node_namespace in self.get_node_names_and_namespaces():
+            node_name = self._node_full_name(node_short_name, node_namespace)
+            try:
+                node_service_map[node_name] = {
+                    svc_name
+                    for svc_name, _ in self.get_service_names_and_types_by_node(node_short_name, node_namespace)
+                }
+            except Exception as e:
+                self.get_logger().debug(f"Error checking services for node {node_name}: {e}")
+
         all_services = self.get_service_names_and_types()
-        
         for service_name, service_types in all_services:
-            providers = set()
-            for node_short_name, node_namespace in self.get_node_names_and_namespaces():
-                node_name = self._node_full_name(node_short_name, node_namespace)
-                try:
-                    node_services = self.get_service_names_and_types_by_node(node_short_name, node_namespace)
-                    if any(svc_name == service_name for svc_name, _ in node_services):
-                        providers.add(node_name)
-                except Exception as e:
-                    self.get_logger().debug(f"Error checking services for node {node_name}: {e}")
-            
+            providers = {
+                node_name
+                for node_name, svc_set in node_service_map.items()
+                if service_name in svc_set
+            }
             service_relations[service_name] = {
                 'providers': providers,
                 'type': service_types[0] if service_types else 'unknown'
