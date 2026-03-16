@@ -35,12 +35,21 @@ class Ros2ControlCollector:
         self._list_controllers_client = None
         self._list_hardware_client = None
 
+        # Rate-limiting: poll at most once every 2 seconds
+        self._last_poll_time = 0.0
+        self._poll_interval = 2.0  # seconds
+
     # ------------------------------------------------------------------
     # Public API – called from _check_graph_changes
     # ------------------------------------------------------------------
 
-    def poll(self):
+    def poll(self, force: bool = False):
         """Check controller_manager state and emit events on change."""
+        now = time.time()
+        if not force and now - self._last_poll_time < self._poll_interval:
+            return
+        self._last_poll_time = now
+
         if not self._ensure_cm_msgs():
             return  # controller_manager_msgs not installed
 
