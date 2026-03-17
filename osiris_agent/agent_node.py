@@ -37,8 +37,8 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -69,7 +69,7 @@ class WebBridge(Node):
             topic: {
                 self._node_full_name(sub.node_name, sub.node_namespace)
                 for sub in self.get_subscriptions_info_by_topic(topic)
-            }
+            } 
             for topic in self._active_topics
         }
         self._telemetry_enabled = True
@@ -435,52 +435,43 @@ class WebBridge(Node):
             )
 
     # Update topic publishers and subscribers
-    def _update_topic_relations(self): 
+    def _update_topic_relations(self):
         """Update the cached topic relations."""
-        current_topics = set(dict(self.get_topic_names_and_types()).keys())
+        current_topic_types = dict(self.get_topic_names_and_types())
         current_topic_relations = {}
-        
-        for topic_name in current_topics:
-            publishers = {
-                self._node_full_name(pub.node_name, pub.node_namespace)
-                for pub in self.get_publishers_info_by_topic(topic_name)
-            }
-            subscribers = {
-                self._node_full_name(sub.node_name, sub.node_namespace)
-                for sub in self.get_subscriptions_info_by_topic(topic_name)
-            }
+
+        for topic_name, topic_types in current_topic_types.items():
+            pub_infos = self.get_publishers_info_by_topic(topic_name)
+            sub_infos = self.get_subscriptions_info_by_topic(topic_name)
+            publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
+            subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
             current_topic_relations[topic_name] = {
                 'publishers': publishers,
-                'subscribers': subscribers
+                'subscribers': subscribers,
+                'publisher_infos': pub_infos,
+                'subscriber_infos': sub_infos,
+                'type': topic_types[0] if topic_types else 'unknown',
             }
-        
+
         self._topic_relations = current_topic_relations
 
     # Get topics with publishers, subscribers, and QoS profiles
     def _get_topics_with_relations(self):
         """Get topics with their publishers and subscribers with QoS info."""
-        self._update_topic_relations()
         topics_with_relations = {}
-        topic_types_dict = dict(self.get_topic_names_and_types())
-        
         for topic_name, relations in self._topic_relations.items():
-            publishers_list = []
-            for pub_info in self.get_publishers_info_by_topic(topic_name):
-                publishers_list.append({
-                    'node': self._node_full_name(pub_info.node_name, pub_info.node_namespace),
-                    'qos': self._qos_profile_to_dict(pub_info.qos_profile)
-                })
-            subscribers_list = []
-            for sub_info in self.get_subscriptions_info_by_topic(topic_name):
-                subscribers_list.append({
-                    'node': self._node_full_name(sub_info.node_name, sub_info.node_namespace),
-                    'qos': self._qos_profile_to_dict(sub_info.qos_profile)
-                })
-            
             topics_with_relations[topic_name] = {
-                'type': topic_types_dict.get(topic_name, ['unknown'])[0],
-                'publishers': publishers_list,
-                'subscribers': subscribers_list,
+                'type': relations.get('type', 'unknown'),
+                'publishers': [
+                    {'node': self._node_full_name(p.node_name, p.node_namespace),
+                     'qos': self._qos_profile_to_dict(p.qos_profile)}
+                    for p in relations.get('publisher_infos', [])
+                ],
+                'subscribers': [
+                    {'node': self._node_full_name(s.node_name, s.node_namespace),
+                     'qos': self._qos_profile_to_dict(s.qos_profile)}
+                    for s in relations.get('subscriber_infos', [])
+                ],
             }
         return topics_with_relations
 
@@ -634,14 +625,14 @@ class WebBridge(Node):
                 'parameters': {}
             }
         
-        # Build per-node QoS lookup
+        # Build per-node QoS lookup from cached infos (zero additional DDS calls)
         pub_qos = {}   # (topic, node) -> qos dict
         sub_qos = {}   # (topic, node) -> qos dict
-        for topic_name in self._topic_relations:
-            for pub_info in self.get_publishers_info_by_topic(topic_name):
+        for topic_name, rel in self._topic_relations.items():
+            for pub_info in rel.get('publisher_infos', []):
                 node = self._node_full_name(pub_info.node_name, pub_info.node_namespace)
                 pub_qos[(topic_name, node)] = self._qos_profile_to_dict(pub_info.qos_profile)
-            for sub_info in self.get_subscriptions_info_by_topic(topic_name):
+            for sub_info in rel.get('subscriber_infos', []):
                 node = self._node_full_name(sub_info.node_name, sub_info.node_namespace)
                 sub_qos[(topic_name, node)] = self._qos_profile_to_dict(sub_info.qos_profile)
 
@@ -775,7 +766,8 @@ class WebBridge(Node):
             self._node_full_name(name, ns)
             for name, ns in self.get_node_names_and_namespaces()
         }
-        current_topics = set(dict(self.get_topic_names_and_types()).keys())
+        current_topic_types = dict(self.get_topic_names_and_types())
+        current_topics = set(current_topic_types.keys())
 
         current_topic_relations = {}
 
@@ -783,17 +775,16 @@ class WebBridge(Node):
             self._last_topic_subscribers = {}
 
         for topic_name in current_topics:
-            publishers = {
-                self._node_full_name(pub.node_name, pub.node_namespace)
-                for pub in self.get_publishers_info_by_topic(topic_name)
-            }
-            subscribers = {
-                self._node_full_name(sub.node_name, sub.node_namespace)
-                for sub in self.get_subscriptions_info_by_topic(topic_name)
-            }
+            pub_infos = self.get_publishers_info_by_topic(topic_name)
+            sub_infos = self.get_subscriptions_info_by_topic(topic_name)
+            publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
+            subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
             current_topic_relations[topic_name] = {
                 'publishers': publishers,
-                'subscribers': subscribers
+                'subscribers': subscribers,
+                'publisher_infos': pub_infos,
+                'subscriber_infos': sub_infos,
+                'type': current_topic_types.get(topic_name, ['unknown'])[0],
             }
 
             prev_subs = self._last_topic_subscribers.get(topic_name, set())
