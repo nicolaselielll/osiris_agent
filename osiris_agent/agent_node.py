@@ -24,7 +24,7 @@ from .tf_tree_collector import TfTreeCollector
 MAX_SUBSCRIPTIONS = 100
 ALLOWED_TOPIC_PREFIXES = ['/', ]
 PARAMETER_REFRESH_INTERVAL = 5.0
-GRAPH_CHECK_INTERVAL = 0.1
+GRAPH_CHECK_INTERVAL = 1.0
 TELEMETRY_INTERVAL = 1.0
 RECONNECT_INITIAL_DELAY = 1
 RECONNECT_MAX_DELAY = 10
@@ -37,8 +37,8 @@ class WebBridge(Node):
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
     
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -61,6 +61,9 @@ class WebBridge(Node):
         self._action_status_subs = {}
         self._active_goals = {}
         self._topic_relations = {}
+        self._topic_pub_sub_counts = {}
+        self._pending_topic_changes = set()  # topics whose counts changed since last deep scan
+        self._last_deep_scan_time = 0.0
         self._action_relations = {}
         self._service_relations = {}
         # Pre-populate subscriber tracking so first tick doesn't emit spurious
@@ -81,6 +84,7 @@ class WebBridge(Node):
             node_name: self._get_node_parameters(node_name)
             for node_name in self._active_nodes
         }
+        self._pending_param_fetches = set()
         self.create_subscription(ParameterEvent, '/parameter_events', self._on_parameter_event, 10)
         
         self._last_sent_nodes = None
@@ -512,12 +516,17 @@ class WebBridge(Node):
     # Non-blocking async parameter fetch (safe to call from timer/subscription callbacks)
     def _fetch_node_parameters_async(self, node_name):
         """Fetch parameters for node_name without blocking the executor."""
+        if node_name in self._pending_param_fetches:
+            return
+
         service_prefix = node_name if node_name.startswith('/') else f"/{node_name}"
 
         list_client = self.create_client(ListParameters, f"{service_prefix}/list_parameters")
         if not list_client.service_is_ready():
             self.destroy_client(list_client)
             return
+
+        self._pending_param_fetches.add(node_name)
 
         req = ListParameters.Request()
         req.depth = 10
@@ -527,6 +536,7 @@ class WebBridge(Node):
             self.destroy_client(list_client)
             response = fut.result()
             if response is None or not response.result.names:
+                self._pending_param_fetches.discard(node_name)
                 return
 
             param_names = list(response.result.names)
@@ -537,6 +547,7 @@ class WebBridge(Node):
 
             def _on_get(gfut):
                 self.destroy_client(get_client)
+                self._pending_param_fetches.discard(node_name)
                 get_resp = gfut.result()
                 if get_resp is None:
                     return
@@ -668,20 +679,20 @@ class WebBridge(Node):
 
     # Update cached action providers by detecting status topics
     def _update_action_relations(self):
-        """Update the cached action relations."""
+        """Update the cached action relations from already-cached topic relations (zero DDS calls)."""
         action_relations = {}
-        
-        for topic_name in self.get_topic_names_and_types():
-            if topic_name[0].endswith('/_action/status'):
-                action_name = topic_name[0].replace('/_action/status', '')
-                providers = [
+
+        for topic_name, rel in self._topic_relations.items():
+            if topic_name.endswith('/_action/status'):
+                action_name = topic_name.replace('/_action/status', '')
+                providers = {
                     self._node_full_name(info.node_name, info.node_namespace)
-                    for info in self.get_publishers_info_by_topic(topic_name[0])
-                ]
-                action_relations[action_name] = {
-                    'providers': set(providers),
+                    for info in rel.get('publisher_infos', [])
                 }
-        
+                action_relations[action_name] = {
+                    'providers': providers,
+                }
+
         self._action_relations = action_relations
 
     # Get actions with their provider nodes
@@ -706,7 +717,7 @@ class WebBridge(Node):
         """
         now = time.time()
         if not force and hasattr(self, '_service_relations_last_update'):
-            if now - self._service_relations_last_update < 5.0:
+            if now - self._service_relations_last_update < 30.0:
                 return
         self._service_relations_last_update = now
 
@@ -762,62 +773,82 @@ class WebBridge(Node):
     # Poll ROS graph for changes and send events
     def _check_graph_changes(self):
         """Check for node, topic, action, and publisher/subscriber changes."""
-        current_nodes = {
-            self._node_full_name(name, ns)
-            for name, ns in self.get_node_names_and_namespaces()
-        }
+        _node_pairs = list(self.get_node_names_and_namespaces())
+        current_nodes = {self._node_full_name(name, ns) for name, ns in _node_pairs}
         current_topic_types = dict(self.get_topic_names_and_types())
         current_topics = set(current_topic_types.keys())
 
-        current_topic_relations = {}
-
-        if not hasattr(self, '_last_topic_subscribers'):
-            self._last_topic_subscribers = {}
-
+        # Cheap phase (every tick): count_publishers/count_subscribers are O(1) DDS
+        # hash-map lookups. Accumulate topics whose counts changed into
+        # _pending_topic_changes without touching the expensive endpoint lists.
+        new_counts = {}
         for topic_name in current_topics:
-            pub_infos = self.get_publishers_info_by_topic(topic_name)
-            sub_infos = self.get_subscriptions_info_by_topic(topic_name)
-            publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
-            subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
-            current_topic_relations[topic_name] = {
-                'publishers': publishers,
-                'subscribers': subscribers,
-                'publisher_infos': pub_infos,
-                'subscriber_infos': sub_infos,
-                'type': current_topic_types.get(topic_name, ['unknown'])[0],
-            }
+            npub = self.count_publishers(topic_name)
+            nsub = self.count_subscribers(topic_name)
+            new_counts[topic_name] = (npub, nsub)
+            old = self._topic_pub_sub_counts.get(topic_name)
+            if old is None or old != (npub, nsub):
+                self._pending_topic_changes.add(topic_name)
+        self._topic_pub_sub_counts = new_counts
 
-            prev_subs = self._last_topic_subscribers.get(topic_name, set())
-            new_subs = subscribers - prev_subs
-            for node_name in new_subs:
-                event = {
-                    'type': 'topic_event',
-                    'topic': topic_name,
-                    'node': node_name,
-                    'event': 'subscribed',
-                    'timestamp': time.time()
-                }
-                self._send_event_and_update(event, f"Node {node_name} subscribed to {topic_name}")
+        # Expensive phase (rate-limited to 2s): fetch full QoS info only for
+        # topics that accumulated a count change — typically zero in steady state.
+        _now = time.time()
+        deep_scan_due = (_now - self._last_deep_scan_time) >= 2.0
 
-            removed_subs = prev_subs - subscribers
-            for node_name in removed_subs:
-                event = {
-                    'type': 'topic_event',
-                    'topic': topic_name,
-                    'node': node_name,
-                    'event': 'unsubscribed',
-                    'timestamp': time.time()
-                }
-                self._send_event_and_update(event, f"Node {node_name} unsubscribed from {topic_name}")
+        if deep_scan_due:
+            self._last_deep_scan_time = _now
+            # Include brand-new topics not yet in the cache.
+            changed_topics = self._pending_topic_changes | (current_topics - set(self._topic_relations))
+            self._pending_topic_changes = set()
 
-            if topic_name in self._topic_relations:
-                old_pubs = self._topic_relations[topic_name]['publishers']
-                if publishers != old_pubs:
+            current_topic_relations = {}
+            for topic_name in current_topics:
+                if topic_name in changed_topics:
+                    pub_infos = self.get_publishers_info_by_topic(topic_name)
+                    sub_infos = self.get_subscriptions_info_by_topic(topic_name)
+                    publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
+                    subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
+                    current_topic_relations[topic_name] = {
+                        'publishers': publishers,
+                        'subscribers': subscribers,
+                        'publisher_infos': pub_infos,
+                        'subscriber_infos': sub_infos,
+                        'type': current_topic_types.get(topic_name, ['unknown'])[0],
+                    }
+                else:
+                    current_topic_relations[topic_name] = self._topic_relations[topic_name]
+
+            # Emit sub/unsub events for topics that changed.
+            for topic_name in changed_topics:
+                if topic_name not in current_topic_relations:
+                    continue
+                subscribers = current_topic_relations[topic_name]['subscribers']
+                prev_subs = self._last_topic_subscribers.get(topic_name, set())
+                for node_name in subscribers - prev_subs:
+                    self._send_event_and_update({
+                        'type': 'topic_event', 'topic': topic_name, 'node': node_name,
+                        'event': 'subscribed', 'timestamp': time.time()
+                    }, f"Node {node_name} subscribed to {topic_name}")
+                for node_name in prev_subs - subscribers:
+                    self._send_event_and_update({
+                        'type': 'topic_event', 'topic': topic_name, 'node': node_name,
+                        'event': 'unsubscribed', 'timestamp': time.time()
+                    }, f"Node {node_name} unsubscribed from {topic_name}")
+
+            # Emit publisher-change events and handle BT topic transitions.
+            for topic_name in changed_topics:
+                old_rel = self._topic_relations.get(topic_name)
+                if old_rel is None or topic_name not in current_topic_relations:
+                    continue
+                old_pubs = old_rel['publishers']
+                new_pubs = current_topic_relations[topic_name]['publishers']
+                if new_pubs != old_pubs:
                     self._send_event_and_update(None, f"Topic publishers changed: {topic_name}")
                     if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
-                        if not publishers and old_pubs:
+                        if not new_pubs and old_pubs:
                             self._on_nav2_bt_gone()
-                        elif publishers and not old_pubs:
+                        elif new_pubs and not old_pubs:
                             self._nav2_bt_publisher_active = True
                             if self._load_and_parse_bt_xml():
                                 self._on_bt_event({
@@ -828,7 +859,17 @@ class WebBridge(Node):
                                     'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
                                 })
 
-        self._last_topic_subscribers = {topic: set(rel['subscribers']) for topic, rel in current_topic_relations.items()}
+            self._last_topic_subscribers = {
+                topic: current_topic_relations[topic]['subscribers']
+                for topic in changed_topics
+                if topic in current_topic_relations
+            } | {
+                topic: self._last_topic_subscribers.get(topic, set())
+                for topic in current_topics
+                if topic not in changed_topics
+            }
+        else:
+            current_topic_relations = self._topic_relations
 
         # Track /behavior_tree_log publisher liveness via the node graph, which updates
         # faster than DDS publisher endpoint info (avoids both false positives and
@@ -878,6 +919,7 @@ class WebBridge(Node):
         stopped_nodes = self._active_nodes - current_nodes
         for node_name in stopped_nodes:
             self._node_parameter_cache.pop(node_name, None)
+            self._pending_param_fetches.discard(node_name)
             event = {
                 'type': 'node_event',
                 'node': node_name,
