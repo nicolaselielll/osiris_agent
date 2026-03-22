@@ -44,8 +44,8 @@ class WebBridge(Node):
         self.declare_parameter('telemetry_interval', TELEMETRY_INTERVAL)
         self.declare_parameter('service_scan_interval', SERVICE_SCAN_INTERVAL)
 
-        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
