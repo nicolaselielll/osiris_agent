@@ -44,8 +44,8 @@ class WebBridge(Node):
         self.declare_parameter('telemetry_interval', TELEMETRY_INTERVAL)
         self.declare_parameter('service_scan_interval', SERVICE_SCAN_INTERVAL)
 
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws = None
         self._topic_subs = {}
         self._topic_subs_lock = threading.Lock()
@@ -1053,12 +1053,29 @@ class WebBridge(Node):
             }
             self._send_event_and_update(event, f"Service destroyed: {service_name}")
 
-        # If services changed, expire the rate-limit so the flush below rebuilds
-        # provider relations immediately rather than using a stale 5s-old snapshot.
-        real_started = {s for s in started_services if not s.startswith('/ros2cli_daemon')}
-        real_stopped = {s for s in stopped_services if not s.startswith('/ros2cli_daemon')}
-        if real_started or real_stopped:
-            self._service_relations_last_update = 0
+        # Incrementally patch service relations for nodes that just started.
+        # This keeps the provider mapping accurate immediately without triggering a
+        # full O(all_nodes) rescan — one DDS call per restarted node instead of ~15-20.
+        # Stopped-node services are already evicted by the eager eviction loop above.
+        real_started_nodes = {n for n in started_nodes if 'ros2cli_daemon' not in n}
+        if real_started_nodes:
+            node_name_map = {self._node_full_name(n, ns): (n, ns) for n, ns in _node_pairs}
+            for node_full_name in real_started_nodes:
+                pair = node_name_map.get(node_full_name)
+                if not pair:
+                    continue
+                short_name, namespace = pair
+                try:
+                    for svc_name, svc_types in self.get_service_names_and_types_by_node(short_name, namespace):
+                        if svc_name in self._service_relations:
+                            self._service_relations[svc_name]['providers'].add(node_full_name)
+                        else:
+                            self._service_relations[svc_name] = {
+                                'providers': {node_full_name},
+                                'type': svc_types[0] if svc_types else 'unknown'
+                            }
+                except Exception as e:
+                    self.get_logger().debug(f"Error patching service relations for {node_full_name}: {e}")
 
         self._active_nodes = current_nodes
         self._active_topics = current_topics
