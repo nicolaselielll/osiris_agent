@@ -1,205 +1,223 @@
-import os
 import asyncio
+import os
+import random
 import threading
 import time
-import rclpy
-from osiris_agent import __version__ as AGENT_VERSION
 from collections import deque
-from rcl_interfaces.msg import ParameterEvent
-from rcl_interfaces.srv import GetParameters, ListParameters
-from rclpy.node import Node
-from rclpy.qos import QoSProfile
-from rclpy.parameter import parameter_value_to_python
+
+import psutil
+import rclpy
 import websockets
 import json
-from rosidl_runtime_py.utilities import get_message
-from rosidl_runtime_py import message_to_ordereddict
-import psutil
 
+from rcl_interfaces.srv import GetParameters, ListParameters
+from rclpy.node import Node
+from rclpy.parameter import parameter_value_to_python
+from rclpy.qos import QoSProfile
+from rosidl_runtime_py import message_to_ordereddict
+from rosidl_runtime_py.utilities import get_message
+
+from osiris_agent import __version__ as AGENT_VERSION
 from .bt_collector import BTCollector
 from .ros2_control_collector import Ros2ControlCollector
 from .tf_tree_collector import TfTreeCollector
 
-# Security and configuration constants
-MAX_SUBSCRIPTIONS = 100
-ALLOWED_TOPIC_PREFIXES = ['/', ]
-PARAMETER_REFRESH_INTERVAL = 5.0
-GRAPH_CHECK_INTERVAL = 1.0
-DEEP_SCAN_BATCH_SIZE = 8  # Max topics to deep-scan per tick (caps DDS mutex hold time)
-TELEMETRY_INTERVAL = 1.0
-RECONNECT_INITIAL_DELAY = 1
-RECONNECT_MAX_DELAY = 10
-SERVICE_SCAN_INTERVAL = 30.0
+# ──────────────────────────────────────────────
+# Constants
+# ──────────────────────────────────────────────
+GRAPH_CHECK_INTERVAL       = 2.0   # seconds between graph polls
+TOPIC_BATCH_SIZE           = 10    # max topics enriched (deep-scan) per tick
+TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
+SERVICE_SCAN_INTERVAL      = 30.0  # seconds between service graph scans
+PARAMETER_REFRESH_INTERVAL = 60.0  # seconds between retries for nodes with no params yet
+MAX_SUBSCRIPTIONS      = 100   # hard cap on gateway-requested topic subs
+RECONNECT_INITIAL_DELAY = 1    # seconds
+RECONNECT_MAX_DELAY    = 30    # seconds
+
+# Services to suppress from graph output (internal ROS2 plumbing)
+_SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
+
 
 class WebBridge(Node):
-    # Initialize node, validate token, setup timers and start websocket thread
+
+    # ──────────────────────────────────────────────
+    # Init
+    # ──────────────────────────────────────────────
+
     def __init__(self):
         super().__init__('osiris_node')
+
+        # Auth token (required)
         auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
 
-        self.declare_parameter('graph_check_interval', GRAPH_CHECK_INTERVAL)
-        self.declare_parameter('deep_scan_batch_size', DEEP_SCAN_BATCH_SIZE)
-        self.declare_parameter('telemetry_interval', TELEMETRY_INTERVAL)
-        self.declare_parameter('service_scan_interval', SERVICE_SCAN_INTERVAL)
+        # Declare tunable parameters
+        self.declare_parameter('graph_check_interval',     GRAPH_CHECK_INTERVAL)
+        self.declare_parameter('topic_batch_size',         TOPIC_BATCH_SIZE)
+        self.declare_parameter('telemetry_interval',       TELEMETRY_INTERVAL)
 
-        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
-        self.ws = None
-        self._topic_subs = {}
-        self._topic_subs_lock = threading.Lock()
+        # WebSocket URL
+        base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+
+        self.ws   = None
         self.loop = None
-        self._send_queue = None
-        self._active_nodes = {
-            self._node_full_name(name, ns)
-            for name, ns in self.get_node_names_and_namespaces()
-        }
-        self._active_topics = set(dict(self.get_topic_names_and_types()).keys())
-        self._active_actions = {
-            t.replace('/_action/status', '')
-            for t in self._active_topics
-            if t.endswith('/_action/status')
-        }
-        self._active_services = {
-            service_name
-            for service_name, _ in self.get_service_names_and_types()
-        }
-        self._action_status_subs = {}
-        self._active_goals = {}
-        self._topic_relations = {}
-        self._topic_pub_sub_counts = {}
-        self._pending_topic_changes = set()  # topics whose counts changed since last scan
-        self._deep_scan_batch_size = self.get_parameter('deep_scan_batch_size').get_parameter_value().integer_value
-        self._service_scan_interval = self.get_parameter('service_scan_interval').get_parameter_value().double_value
-        self._action_relations = {}
-        self._service_relations = {}
-        # Pre-populate subscriber tracking so first tick doesn't emit spurious
-        # 'subscribed' events for nodes that were already running before osiris.
-        self._last_topic_subscribers = {
-            topic: {
-                self._node_full_name(sub.node_name, sub.node_namespace)
-                for sub in self.get_subscriptions_info_by_topic(topic)
-            } 
-            for topic in self._active_topics
-        }
-        self._telemetry_enabled = True
-        self._topic_last_timestamp = {}
-        self._topic_rate_history = {}
-        self._rate_history_depth = 8
-        # Fetch params synchronously so initial_state includes them on first connect
-        self._node_parameter_cache = {
-            node_name: self._get_node_parameters(node_name)
-            for node_name in self._active_nodes
-        }
-        self._pending_param_fetches = set()
-        self.create_subscription(ParameterEvent, '/parameter_events', self._on_parameter_event, 10)
-        
-        self._last_sent_nodes = None
-        self._last_sent_topics = None
-        self._last_sent_actions = None
-        self._last_sent_services = None
-        self._cached_bt_tree_event = None  # Cache tree event until WS connects
-        self._graph_dirty = False  # Debounce flag for graph snapshot sends
+        self._send_queue: asyncio.Queue | None = None
 
-        # ros2_control collector (controllers + hardware panels)
+        # ── Topic subscriptions (gateway-requested) ──────────────────────────
+        self._topic_subs: dict[str, rclpy.subscription.Subscription] = {}
+        self._topic_subs_lock = threading.Lock()
+        self._topic_last_timestamp: dict[str, float] = {}
+        self._topic_rate_history: dict[str, deque] = {}
+        self._rate_history_depth = 8
+
+        # ── Existence caches (set of fully-qualified names) ───────────────────
+        # Populated on first tick — NOT pre-populated here to avoid any DDS calls
+        # during __init__ (which would contend Nav2's controller loop).
+        self._active_nodes:    set[str] = set()   # fqn, e.g. /bt_navigator
+        self._active_topics:   set[str] = set()   # e.g. /cmd_vel
+        self._active_services: dict[str, str] = {}  # service_name → type_str
+        self._active_actions:  set[str] = set()   # action name (no /_action/status suffix)
+
+        # ── Count sentinels (cheap change detection) ─────────────────────────
+        # count_publishers/count_subscribers are O(1) hash-map lookups in DDS.
+        # When a count changes, the topic goes into the enrichment pending set.
+        self._topic_counts: dict[str, tuple[int, int]] = {}  # topic → (pub_n, sub_n)
+
+        # ── Relation caches (populated by Tier-2 enrichment) ─────────────────
+        self._topic_relations: dict[str, dict] = {}
+        # {topic: {publishers: set[fqn], subscribers: set[fqn],
+        #          publisher_infos: list, subscriber_infos: list, type: str}}
+
+        # Service relations are type-only (no expensive per-service provider scan)
+        # _active_services already holds {name: type}
+
+        # Action relations derived from _topic_relations at snapshot time
+        # (zero extra DDS calls)
+
+        # ── Enrichment pending queues ─────────────────────────────────────────
+        self._pending_topic_enrichment: set[str] = set()
+
+        # ── Parameters (lazy-loaded, async) ──────────────────────────────────
+        self._node_parameter_cache: dict[str, dict] = {}
+        self._pending_param_fetches: set[str] = set()
+
+
+
+        # ── Snapshot & dirty-flag ─────────────────────────────────────────────
+        self._last_sent_nodes:    dict | None = None
+        self._last_sent_topics:   dict | None = None
+        self._last_sent_actions:  dict | None = None
+        self._last_sent_services: dict | None = None
+        self._graph_dirty = False
+
+        # ── Service scan throttle ──────────────────────────────────────────────
+        # get_service_names_and_types() is expensive with hundreds of services;
+        # only scan on first tick and every SERVICE_SCAN_INTERVAL seconds after.
+        # _service_rescan_ticks forces extra scans after node loss (DDS lag).
+        self._last_service_scan: float = 0.0
+        self._service_rescan_ticks: int = 0
+
+        # ── Initial scan synchronization ──────────────────────────────────────
+        # _initial_scan_complete is set on the first _check_graph_changes tick
+        # so _send_initial_state waits until caches are fully populated.
+        self._initial_scan_complete = threading.Event()
+        self._first_graph_check_done = False
+
+        # ── BT state ─────────────────────────────────────────────────────────
+        self._cached_bt_tree_event: dict | None = None
+
+        # ── Telemetry ─────────────────────────────────────────────────────────
+        self._telemetry_enabled = True
+
+        # ── Collectors ────────────────────────────────────────────────────────
         self._ros2_control = Ros2ControlCollector(
             node=self,
             event_callback=self._on_ros2_control_event,
             logger=self.get_logger(),
         )
-
-        # TF tree collector
         self._tf_tree = TfTreeCollector(
             node=self,
             event_callback=self._on_tf_tree_event,
             logger=self.get_logger(),
         )
-        
-        _graph_check_interval = self.get_parameter('graph_check_interval').get_parameter_value().double_value
-        _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
-        self.get_logger().info(
-            f"Config: graph_check_interval={_graph_check_interval}s, "
-            f"deep_scan_batch_size={self._deep_scan_batch_size}, "
-            f"telemetry_interval={_telemetry_interval}s, "
-            f"service_scan_interval={self._service_scan_interval}s"
-        )
-        self._check_graph_changes()
-        self.create_timer(_graph_check_interval, self._check_graph_changes)
-        self.create_timer(_telemetry_interval, self._collect_telemetry)
-        self.create_timer(5.0, self._refresh_empty_param_caches)
 
+        # ── Timers ───────────────────────────────────────────────────────────
+        _graph_interval = self.get_parameter('graph_check_interval').get_parameter_value().double_value
+        _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
+
+        self.create_timer(_graph_interval,          self._check_graph_changes)
+        self.create_timer(_telemetry_interval,       self._collect_telemetry)
+        self.create_timer(PARAMETER_REFRESH_INTERVAL, self._refresh_empty_param_caches)
+
+        self._topic_batch_size = self.get_parameter('topic_batch_size').get_parameter_value().integer_value
+
+        # ── WebSocket thread ──────────────────────────────────────────────────
         threading.Thread(target=self._run_ws_client, daemon=True).start()
-        
-        # Initialize BT Collector for Groot2 events (optional)
-        bt_enabled = os.environ.get('OSIRIS_BT_COLLECTOR_ENABLED', '').lower() in ('true', '1', 'yes')
+
+        # ── Optional BT collectors ────────────────────────────────────────────
+        bt_enabled = os.environ.get(
+            'OSIRIS_BT_COLLECTOR_ENABLED', ''
+        ).lower() in ('true', '1', 'yes')
         if bt_enabled:
             self._bt_collector = BTCollector(
                 event_callback=self._on_bt_event,
-                logger=self.get_logger()
+                logger=self.get_logger(),
             )
             self._bt_collector.start()
         else:
             self._bt_collector = None
 
-        # Initialize nav2 BT monitoring via /behavior_tree_log ROS topic
         self._init_nav2_bt_monitor()
 
-        self.get_logger().info("🚀 Osiris agent running")
+        self.get_logger().info(
+            f"Osiris agent v{AGENT_VERSION} — graph_interval={_graph_interval}s, "
+            f"topic_batch={self._topic_batch_size}"
+        )
 
-    # Create event loop and queue, run websocket client
+    # ──────────────────────────────────────────────
+    # WebSocket client
+    # ──────────────────────────────────────────────
+
     def _run_ws_client(self):
         self.loop = asyncio.new_event_loop()
         asyncio.set_event_loop(self.loop)
         self._send_queue = asyncio.Queue()
         self.loop.run_until_complete(self._client_loop_with_reconnect())
 
-    # Wrapper for client loop with exponential backoff reconnection
     async def _client_loop_with_reconnect(self):
-        """Wrapper that handles reconnection."""
-        reconnect_delay = RECONNECT_INITIAL_DELAY
-        
+        delay = RECONNECT_INITIAL_DELAY
         while self.context.ok():
             try:
                 await self._client_loop()
             except Exception as e:
                 if self.context.ok():
-                    self.get_logger().warning(f"WebSocket connection failed: {e}, retrying in {reconnect_delay:.1f}s")
-            
-            await asyncio.sleep(reconnect_delay)
-            
-            reconnect_delay = min(reconnect_delay * 2, RECONNECT_MAX_DELAY)
-            import random
-            reconnect_delay += random.uniform(0, 1)  # Jitter prevents thundering herd
+                    self.get_logger().warning(
+                        f"WebSocket error: {e}; retrying in {delay:.1f}s"
+                    )
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, RECONNECT_MAX_DELAY) + random.uniform(0, 1)
 
-    # Main client loop for sending and receiving messages
     async def _client_loop(self):
         send_task = None
         try:
             async with websockets.connect(self.ws_url) as ws:
-                # Wait for gateway auth response before sending initial state
                 try:
                     auth_msg = await ws.recv()
-                except Exception as e:
-                    return
-
-                try:
                     auth_data = json.loads(auth_msg)
                 except Exception:
-                    auth_data = None
+                    return
 
                 if not auth_data or auth_data.get('type') != 'auth_success':
                     return
 
                 self.ws = ws
-
                 send_task = asyncio.create_task(self._send_loop(ws))
 
                 await self._send_initial_state()
-
                 await self._receive_loop(ws)
-        except Exception as e:
-            raise
         finally:
             if send_task and not send_task.done():
                 send_task.cancel()
@@ -207,230 +225,598 @@ class WebBridge(Node):
                     await send_task
                 except (asyncio.CancelledError, Exception):
                     pass
-            
             self.ws = None
-            if self.context.ok():
-                self.get_logger().info("Connection closed, cleaning up...")
 
-    # Collect and send complete ROS graph state on connection
+    async def _send_loop(self, ws):
+        while True:
+            msg = await self._send_queue.get()
+            try:
+                await ws.send(msg)
+            except Exception as e:
+                self.get_logger().error(f"WS send failed: {e}")
+                raise
+
+    async def _receive_loop(self, ws):
+        async for raw in ws:
+            if not self.context.ok():
+                break
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            msg_type = data.get('type')
+            if msg_type == 'subscribe':
+                topic = data.get('topic')
+                if topic:
+                    self._subscribe_to_topic(topic)
+            elif msg_type == 'unsubscribe':
+                topic = data.get('topic')
+                if topic:
+                    self._unsubscribe_from_topic(topic)
+            elif msg_type == 'start_telemetry':
+                self._telemetry_enabled = True
+            elif msg_type == 'stop_telemetry':
+                self._telemetry_enabled = False
+            elif msg_type == 'error':
+                self.get_logger().warning(f"Gateway error: {data.get('message', '')}")
+
+    # ──────────────────────────────────────────────
+    # Initial state
+    # ──────────────────────────────────────────────
+
     async def _send_initial_state(self):
-        """Send complete initial state as a single message"""
-        nodes = self._get_nodes_with_relations()
-        actions = self._get_actions_with_relations()
-        services = self._get_services_with_relations()
-        topics = self._get_topics_with_relations()
+        # Wait for the first _check_graph_changes tick to populate all caches.
+        # Times out after 15s as a safety net in case the executor is slow to start.
+        await asyncio.to_thread(self._initial_scan_complete.wait, 15.0)
 
-        # Force a tf_tree poll so the snapshot is current when sent
-        self._tf_tree.poll(force=True)
-        
-        self._last_sent_nodes = nodes.copy()
-        self._last_sent_actions = actions.copy()
+        # Reset delta caches so _flush_graph_snapshots treats everything as
+        # "unsent" after this reconnect — any change that occurred while
+        # the WS was down will be immediately re-broadcast.
+        self._last_sent_nodes    = None
+        self._last_sent_topics   = None
+        self._last_sent_actions  = None
+        self._last_sent_services = None
+        self._graph_dirty        = True
+
+        nodes    = self._get_nodes_with_relations()
+        topics   = self._get_topics_with_relations()
+        actions  = self._get_actions_with_relations()
+        services = self._get_services_with_relations()
+
+        self._last_sent_nodes    = nodes.copy()
+        self._last_sent_topics   = topics.copy()
+        self._last_sent_actions  = actions.copy()
         self._last_sent_services = services.copy()
-        self._last_sent_topics = topics.copy()
-        
+
         await self._send_queue.put(json.dumps({
             'type': 'agent_version',
             'version': AGENT_VERSION,
         }))
 
-        message = {
+        await self._send_queue.put(json.dumps({
             'type': 'initial_state',
             'timestamp': time.time(),
             'data': {
-                'nodes': nodes,
-                'topics': topics,
-                'actions': actions,
-                'services': services,
-                'telemetry': self._get_telemetry_snapshot(),
+                'nodes':       nodes,
+                'topics':      topics,
+                'actions':     actions,
+                'services':    services,
+                'telemetry':   self._get_telemetry_snapshot(),
                 'controllers': self._ros2_control.get_controllers_snapshot(),
-                'hardware': self._ros2_control.get_hardware_snapshot(),
-                'tf_tree': self._tf_tree.get_snapshot(),
-            }
-        }
-        
-        await self._send_queue.put(json.dumps(message))
-        self.get_logger().info(f"Sent initial state: {len(nodes)} nodes, {len(topics)} topics, {len(actions)} actions, {len(services)} services")
+                'hardware':    self._ros2_control.get_hardware_snapshot(),
+                'tf_tree':     self._tf_tree.get_snapshot(),
+            },
+        }))
 
         await self._send_queue.put(json.dumps(self._build_startup_bt_state_event()))
-        self.get_logger().info("Sent startup bt_state event")
-        
-        # Send cached BT tree event if we have one
+
         if self._cached_bt_tree_event:
-            self.get_logger().info("Sending cached BT tree event")
             await self._send_queue.put(json.dumps(self._cached_bt_tree_event))
             self._cached_bt_tree_event = None
-        
+
         await self._send_bridge_subscriptions()
 
-    # Build bt_state event for startup regardless of BT collector state
-    def _build_startup_bt_state_event(self):
-        # BT.CPP: use cached tree event if available
-        source = self._cached_bt_tree_event
-        if source:
-            return {
-                'type': 'bt_state',
-                'timestamp': source.get('timestamp', time.time()),
-                'tree_id': source.get('tree_id'),
-                'tree': source.get('tree'),
-                'nodes': source.get('nodes', []),
-            }
+        self.get_logger().info(
+            f"Sent initial_state: {len(nodes)} nodes, {len(topics)} topics, "
+            f"{len(actions)} actions, {len(services)} services"
+        )
 
-        # Nav2 BT: if bt_navigator is running, build state from parsed XML + known statuses
-        if hasattr(self, '_nav2_bt_tree_id') and self._nav2_bt_tree_id and self._nav2_bt_tree_structure:
-            nodes_with_status = [
-                {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
-                for nd in self._nav2_bt_nodes_list
-            ]
-            return {
-                'type': 'bt_state',
-                'timestamp': time.time(),
-                'tree_id': self._nav2_bt_tree_id,
-                'tree': self._nav2_bt_tree_structure,
-                'nodes': nodes_with_status,
-            }
-
-        return {
-            'type': 'bt_state',
-            'timestamp': time.time(),
-            'tree_id': None,
-            'tree': None,
-            'nodes': [],
-        }
-
-    # Send list of currently subscribed topics to gateway
     async def _send_bridge_subscriptions(self):
-        """Send current bridge subscriptions as a separate message."""
         with self._topic_subs_lock:
-            subscriptions = list(self._topic_subs.keys())
-        
-        message = {
+            subs = list(self._topic_subs.keys())
+        await self._send_queue.put(json.dumps({
             'type': 'bridge_subscriptions',
-            'subscriptions': subscriptions,
-            'timestamp': time.time()
+            'subscriptions': subs,
+            'timestamp': time.time(),
+        }))
+
+    # ──────────────────────────────────────────────
+    # Tier-1: cheap existence detection
+    # ──────────────────────────────────────────────
+
+    def _check_graph_changes(self):
+        # ── 1. Node + topic queries (always, both cheap) ──────────────────────
+        node_pairs      = list(self.get_node_names_and_namespaces())
+        topic_type_list = self.get_topic_names_and_types()
+
+        current_nodes   = {self._node_full_name(n, ns) for n, ns in node_pairs}
+        current_topics  = {t for t, _ in topic_type_list}
+        current_actions = {
+            t.replace('/_action/status', '')
+            for t in current_topics
+            if t.endswith('/_action/status')
         }
-        await self._send_queue.put(json.dumps(message))
-        self.get_logger().debug(f"Sent bridge subscriptions: {len(subscriptions)} topics")
 
-    # Receive and handle commands from gateway
-    async def _receive_loop(self, ws):
-        async for msg in ws:
-            if not self.context.ok():
-                break
-            try:
-                data = json.loads(msg)
-                msg_type = data.get('type')
-                
-                if msg_type == 'subscribe':
-                    topic = data.get('topic')
-                    if topic:
-                        self.get_logger().info(f"Subscribing to topic: {topic}")
-                        self._subscribe_to_topic(topic)
-                    else:
-                        self.get_logger().warn("Subscribe message missing topic field")
-                        
-                elif msg_type == 'unsubscribe':
-                    topic = data.get('topic')
-                    if topic:
-                        self._unsubscribe_from_topic(topic)
-                    else:
-                        self.get_logger().warn("Unsubscribe message missing topic field")
-                        
-                elif msg_type == 'start_telemetry':
-                    self._telemetry_enabled = True
-                    self.get_logger().info("Telemetry started")
-                    
-                elif msg_type == 'stop_telemetry':
-                    self._telemetry_enabled = False
-                    self.get_logger().info("Telemetry stopped")
-                    
-                elif msg_type == 'error':
-                    error_msg = data.get('message', 'Unknown error')
-                    self.get_logger().warn(f"Server error: {error_msg}")
-                    
-                else:
-                    self.get_logger().debug(f"Unhandled message type: {msg_type}")
-                    
-            except json.JSONDecodeError as e:
-                self.get_logger().error(f"Invalid JSON received: {e}")
-            except Exception as e:
-                self.get_logger().error(f"Error processing message: {e}")
+        # ── 1b. Service scan — throttled to SERVICE_SCAN_INTERVAL ─────────────
+        # get_service_names_and_types() enumerates every service in DDS and is
+        # expensive on large stacks (500+ services). Also force a rescan any time
+        # a node disappears so stale services are evicted immediately.
+        _now = time.time()
+        _nodes_stopped = self._first_graph_check_done and bool(self._active_nodes - current_nodes)
+        _do_service_scan = (
+            not self._first_graph_check_done
+            or _nodes_stopped
+            or self._service_rescan_ticks > 0
+            or (_now - self._last_service_scan) >= SERVICE_SCAN_INTERVAL
+        )
+        if _do_service_scan:
+            self._last_service_scan = _now
+            if _nodes_stopped:
+                # Schedule follow-up scans to catch DDS endpoint lag.
+                self._service_rescan_ticks = 4
+            elif self._service_rescan_ticks > 0:
+                self._service_rescan_ticks -= 1
+            service_type_list = self.get_service_names_and_types()
+            current_services = {
+                s: types[0] if types else 'unknown'
+                for s, types in service_type_list
+                if not any(s.startswith(p) for p in _SUPPRESSED_SERVICE_PREFIXES)
+            }
+        else:
+            current_services = self._active_services
 
-    # Send messages out
-    async def _send_loop(self, ws):
-        while True:
-            msg = await self._send_queue.get()
-            try:
-                # Log truncated message for debugging
-                self.get_logger().debug(f"_send_loop: sending message (len={len(msg)}): {msg[:200]}")
-                await ws.send(msg)
-                self.get_logger().debug("_send_loop: message sent")
-            except Exception as e:
-                self.get_logger().error(f"_send_loop: failed to send message: {e}")
-                raise
-
-    # Create ROS subscription for topic with validation and limits
-    def _subscribe_to_topic(self, topic_name):
-        if not topic_name or not isinstance(topic_name, str):
-            self.get_logger().warn(f"Invalid topic name: {topic_name}")
+        # ── FIRST TICK: silently populate caches, no events ───────────────────
+        # The WS thread is waiting on _initial_scan_complete before sending
+        # initial_state. Populate everything here so the snapshot is full.
+        # Subsequent ticks will only emit events for actual changes.
+        if not self._first_graph_check_done:
+            self._first_graph_check_done = True
+            self._active_nodes    = current_nodes
+            self._active_topics   = current_topics
+            self._active_services = current_services
+            self._active_actions  = current_actions
+            self._do_full_initial_enrichment(topic_type_list, node_pairs)
+            for fqn in current_nodes:
+                self._fetch_node_parameters_async(fqn)
+            self._ros2_control.poll()
+            self._tf_tree.poll(force=True)
+            self._initial_scan_complete.set()
             return
-        
+
+        # ── 2. Node events ────────────────────────────────────────────────────
+        started_nodes = current_nodes - self._active_nodes
+        if started_nodes:
+            # New nodes may subscribe to existing topics — queue all known topics
+            # for re-enrichment so their memberships are reflected accurately.
+            self._pending_topic_enrichment.update(self._active_topics)
+        for fqn in started_nodes:
+            self._fetch_node_parameters_async(fqn)
+            self._send_event_and_update({
+                'type': 'node_event', 'node': fqn,
+                'event': 'started', 'timestamp': time.time(),
+            })
+
+        stopped_nodes = self._active_nodes - current_nodes
+        for fqn in stopped_nodes:
+            # Re-enrich every topic this node was involved in so stale
+            # publisher/subscriber entries are removed from the relations cache.
+            for topic, rel in self._topic_relations.items():
+                if fqn in rel.get('publishers', set()) or fqn in rel.get('subscribers', set()):
+                    self._pending_topic_enrichment.add(topic)
+            # Drop stale parameter data for the stopped node.
+            self._node_parameter_cache.pop(fqn, None)
+            self._pending_param_fetches.discard(fqn)
+            self._send_event_and_update({
+                'type': 'node_event', 'node': fqn,
+                'event': 'stopped', 'timestamp': time.time(),
+            })
+
+        # ── 3. Topic events ───────────────────────────────────────────────────
+        for t in current_topics - self._active_topics:
+            self._pending_topic_enrichment.add(t)
+            self._send_event_and_update({
+                'type': 'topic_event', 'topic': t,
+                'event': 'created', 'timestamp': time.time(),
+            })
+            # Nav2 BT edge-case: /behavior_tree_log just appeared
+            if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                if self.count_publishers(t) > 0:
+                    self._nav2_bt_publisher_active = True
+                    if self._load_and_parse_bt_xml():
+                        self._on_bt_event({
+                            'type': 'bt_tree', 'timestamp': time.time(),
+                            'tree_id': self._nav2_bt_tree_id,
+                            'tree': self._nav2_bt_tree_structure,
+                            'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                        })
+
+        for t in self._active_topics - current_topics:
+            self._topic_relations.pop(t, None)
+            self._topic_counts.pop(t, None)
+            self._pending_topic_enrichment.discard(t)
+            self._send_event_and_update({
+                'type': 'topic_event', 'topic': t,
+                'event': 'destroyed', 'timestamp': time.time(),
+            })
+            if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                self._on_nav2_bt_gone()
+
+        # ── 4. Service events (only every SERVICE_SCAN_INTERVAL) ──────────────
+        if _do_service_scan:
+            for s in set(current_services) - set(self._active_services):
+                self._send_event_and_update({
+                    'type': 'service_event', 'service': s,
+                    'event': 'created', 'timestamp': time.time(),
+                })
+
+            for s in set(self._active_services) - set(current_services):
+                self._send_event_and_update({
+                    'type': 'service_event', 'service': s,
+                    'event': 'destroyed', 'timestamp': time.time(),
+                })
+
+        # ── 5. Action events ──────────────────────────────────────────────────
+        for a in current_actions - self._active_actions:
+            self._send_event_and_update({
+                'type': 'action_event', 'action': a,
+                'event': 'created', 'timestamp': time.time(),
+            })
+
+        for a in self._active_actions - current_actions:
+            self._send_event_and_update({
+                'type': 'action_event', 'action': a,
+                'event': 'destroyed', 'timestamp': time.time(),
+            })
+
+        # ── 6. Update existence caches ────────────────────────────────────────
+        self._active_nodes    = current_nodes
+        self._active_topics   = current_topics
+        if _do_service_scan:
+            self._active_services = current_services
+        self._active_actions  = current_actions
+
+        # ── 7. Tier-2: batched relation enrichment ────────────────────────────
+        self._enrich_pending_relations(topic_type_list)
+
+        # ── 9. Nav2 BT publisher liveness check (uses cached topic relations) ─
+        if hasattr(self, '_nav2_bt_publisher_active'):
+            bt_rel = self._topic_relations.get('/behavior_tree_log', {})
+            bt_pubs = bt_rel.get('publishers', set()) & current_nodes
+            if self._nav2_bt_publisher_active and not bt_pubs:
+                self._on_nav2_bt_gone()
+            elif self._nav2_bt_publisher_active and bt_pubs and self._nav2_bt_tree_id is None:
+                # Publisher is live but we failed to load the BT XML at startup
+                # (executor wasn't spinning yet) — retry every tick until it works.
+                if self._load_and_parse_bt_xml():
+                    self._on_bt_event({
+                        'type': 'bt_tree', 'timestamp': time.time(),
+                        'tree_id': self._nav2_bt_tree_id,
+                        'tree': self._nav2_bt_tree_structure,
+                        'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                    })
+            elif not self._nav2_bt_publisher_active and bt_pubs:
+                self._nav2_bt_publisher_active = True
+                if self._load_and_parse_bt_xml():
+                    self._on_bt_event({
+                        'type': 'bt_tree', 'timestamp': time.time(),
+                        'tree_id': self._nav2_bt_tree_id,
+                        'tree': self._nav2_bt_tree_structure,
+                        'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                    })
+
+        # ── 10. Flush graph snapshots if anything changed ─────────────────────
+        self._flush_graph_snapshots()
+
+        # ── 11. Poll collectors (internally rate-limited) ─────────────────────
+        self._ros2_control.poll()
+        self._tf_tree.poll()
+
+    # ──────────────────────────────────────────────
+    # Initial full enrichment (called once on first tick)
+    # ──────────────────────────────────────────────
+
+    def _do_full_initial_enrichment(self, topic_type_list, node_pairs):
+        """Enrich every known topic synchronously for the initial state snapshot.
+
+        Called once on the first _check_graph_changes tick (before any WS events
+        are emitted). Runs unbatched so initial_state contains full relation data.
+        Subsequent changes are handled by the normal batched Tier-2 path.
+        """
+        topic_type_map = dict(topic_type_list)
+        self._pending_topic_enrichment.clear()
+
+        for topic in self._active_topics:
+            try:
+                pub_infos = self.get_publishers_info_by_topic(topic)
+                sub_infos = self.get_subscriptions_info_by_topic(topic)
+            except Exception:
+                continue
+            publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
+            subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
+            self._topic_relations[topic] = {
+                'publishers':       publishers,
+                'subscribers':      subscribers,
+                'publisher_infos':  pub_infos,
+                'subscriber_infos': sub_infos,
+                'type': topic_type_map.get(topic, ['unknown'])[0],
+            }
+            self._topic_counts[topic] = (len(pub_infos), len(sub_infos))
+
+    # ──────────────────────────────────────────────
+    # Tier-2: batched relation enrichment
+    # ──────────────────────────────────────────────
+
+    def _enrich_pending_relations(self, topic_type_list=None):
+        """Process up to TOPIC_BATCH_SIZE topics from the pending enrichment set.
+
+        Uses get_publishers_info_by_topic() and get_subscriptions_info_by_topic()
+        which allocate memory and hold the DDS participant mutex briefly.
+        Batching ensures we never block the executor for more than ~16–32 ms
+        even during a burst (e.g. Nav2 startup creating 40 topics at once).
+        """
+        if not self._pending_topic_enrichment:
+            return
+
+        batch = set(list(self._pending_topic_enrichment)[:self._topic_batch_size])
+        self._pending_topic_enrichment -= batch
+
+        # Reuse the already-fetched type list from Tier-1 when available,
+        # avoiding a redundant global DDS query.
+        if topic_type_list is not None:
+            topic_type_map = dict(topic_type_list)
+        else:
+            topic_type_map = dict(self.get_topic_names_and_types())
+
+        for topic in batch:
+            if topic not in self._active_topics:
+                continue  # topic disappeared between Tier-1 and now
+            try:
+                pub_infos = self.get_publishers_info_by_topic(topic)
+                sub_infos = self.get_subscriptions_info_by_topic(topic)
+            except Exception as e:
+                self.get_logger().debug(f"Enrichment failed for {topic}: {e}")
+                continue
+
+            publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
+            subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
+
+            old = self._topic_relations.get(topic)
+            new_rel = {
+                'publishers':      publishers,
+                'subscribers':     subscribers,
+                'publisher_infos': pub_infos,
+                'subscriber_infos': sub_infos,
+                'type': topic_type_map.get(topic, ['unknown'])[0],
+            }
+            self._topic_relations[topic] = new_rel
+            # Update count sentinel from Tier-2 results for free — avoids a
+            # redundant count_publishers/count_subscribers call next tick.
+            self._topic_counts[topic] = (len(pub_infos), len(sub_infos))
+
+            # Emit subscriber-joined / subscriber-left events
+            if old is not None:
+                old_subs = old['subscribers']
+                for fqn in subscribers - old_subs:
+                    self._send_event_and_update({
+                        'type': 'topic_event', 'topic': topic, 'node': fqn,
+                        'event': 'subscribed', 'timestamp': time.time(),
+                    })
+                for fqn in old_subs - subscribers:
+                    self._send_event_and_update({
+                        'type': 'topic_event', 'topic': topic, 'node': fqn,
+                        'event': 'unsubscribed', 'timestamp': time.time(),
+                    })
+
+                # Nav2 BT: publisher appeared/vanished on /behavior_tree_log
+                if topic == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                    old_pubs = old['publishers']
+                    if publishers and not old_pubs:
+                        self._nav2_bt_publisher_active = True
+                        if self._load_and_parse_bt_xml():
+                            self._on_bt_event({
+                                'type': 'bt_tree', 'timestamp': time.time(),
+                                'tree_id': self._nav2_bt_tree_id,
+                                'tree': self._nav2_bt_tree_structure,
+                                'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                            })
+                    elif old_pubs and not publishers:
+                        self._on_nav2_bt_gone()
+
+    # ──────────────────────────────────────────────
+    # Graph snapshot builders
+    # ──────────────────────────────────────────────
+
+    def _get_nodes_with_relations(self) -> dict:
+        result = {}
+        for fqn in self._active_nodes:
+            result[fqn] = {
+                'publishes':  [],
+                'subscribes': [],
+                'actions':    [],
+                'services':   [],
+                'parameters': self._node_parameter_cache.get(fqn, {}),
+            }
+
+        # Derive pub/sub per node from cached topic relations (zero DDS calls)
+        for topic, rel in self._topic_relations.items():
+            pub_infos = rel.get('publisher_infos', [])
+            sub_infos = rel.get('subscriber_infos', [])
+            for p in pub_infos:
+                fqn = self._node_full_name(p.node_name, p.node_namespace)
+                if fqn in result:
+                    result[fqn]['publishes'].append({
+                        'topic': topic,
+                        'qos': self._qos_to_dict(p.qos_profile),
+                    })
+            for s in sub_infos:
+                fqn = self._node_full_name(s.node_name, s.node_namespace)
+                if fqn in result:
+                    result[fqn]['subscribes'].append({
+                        'topic': topic,
+                        'qos': self._qos_to_dict(s.qos_profile),
+                    })
+
+        # Actions: derived from topic relations (zero DDS calls)
+        for topic, rel in self._topic_relations.items():
+            if topic.endswith('/_action/status') and rel['publishers']:
+                action = topic.replace('/_action/status', '')
+                for p in rel['publisher_infos']:
+                    fqn = self._node_full_name(p.node_name, p.node_namespace)
+                    if fqn in result and action not in result[fqn]['actions']:
+                        result[fqn]['actions'].append(action)
+
+        return result
+
+    def _get_topics_with_relations(self) -> dict:
+        result = {}
+        for topic, rel in self._topic_relations.items():
+            result[topic] = {
+                'type': rel.get('type', 'unknown'),
+                'publishers': [
+                    {
+                        'node': self._node_full_name(p.node_name, p.node_namespace),
+                        'qos': self._qos_to_dict(p.qos_profile),
+                    }
+                    for p in rel.get('publisher_infos', [])
+                ],
+                'subscribers': [
+                    {
+                        'node': self._node_full_name(s.node_name, s.node_namespace),
+                        'qos': self._qos_to_dict(s.qos_profile),
+                    }
+                    for s in rel.get('subscriber_infos', [])
+                ],
+            }
+        return result
+
+    def _get_actions_with_relations(self) -> dict:
+        result = {}
+        for topic, rel in self._topic_relations.items():
+            if topic.endswith('/_action/status') and rel['publishers']:
+                action = topic.replace('/_action/status', '')
+                providers = [
+                    self._node_full_name(p.node_name, p.node_namespace)
+                    for p in rel.get('publisher_infos', [])
+                ]
+                result[action] = {'providers': providers}
+        return result
+
+    def _get_services_with_relations(self) -> dict:
+        return {
+            name: {'type': type_str, 'providers': []}
+            for name, type_str in self._active_services.items()
+        }
+
+    # ──────────────────────────────────────────────
+    # Delta-send: flush graph snapshots after each tick
+    # ──────────────────────────────────────────────
+
+    def _flush_graph_snapshots(self):
+        if not self._graph_dirty or not self.ws or not self.loop:
+            return
+        self._graph_dirty = False
+
+        nodes = self._get_nodes_with_relations()
+        if nodes != self._last_sent_nodes:
+            self._last_sent_nodes = nodes.copy()
+            self._enqueue({
+                'type': 'nodes', 'data': nodes, 'timestamp': time.time(),
+            })
+
+        topics = self._get_topics_with_relations()
+        if topics != self._last_sent_topics:
+            self._last_sent_topics = topics.copy()
+            self._enqueue({
+                'type': 'topics', 'data': topics, 'timestamp': time.time(),
+            })
+
+        actions = self._get_actions_with_relations()
+        if actions != self._last_sent_actions:
+            self._last_sent_actions = actions.copy()
+            self._enqueue({
+                'type': 'actions', 'data': actions, 'timestamp': time.time(),
+            })
+
+        services = self._get_services_with_relations()
+        if services != self._last_sent_services:
+            self._last_sent_services = services.copy()
+            self._enqueue({
+                'type': 'services', 'data': services, 'timestamp': time.time(),
+            })
+
+    # ──────────────────────────────────────────────
+    # Topic subscriptions (gateway-requested)
+    # ──────────────────────────────────────────────
+
+    def _subscribe_to_topic(self, topic_name: str):
+        if not topic_name or not isinstance(topic_name, str):
+            return
         with self._topic_subs_lock:
             if topic_name in self._topic_subs:
                 return
-            
             if len(self._topic_subs) >= MAX_SUBSCRIPTIONS:
-                self.get_logger().error(f"Subscription limit reached ({MAX_SUBSCRIPTIONS}). Cannot subscribe to {topic_name}")
+                self.get_logger().error(
+                    f"Subscription limit ({MAX_SUBSCRIPTIONS}) reached; "
+                    f"cannot subscribe to {topic_name}"
+                )
                 return
-        
-        topic_types = dict(self.get_topic_names_and_types()).get(topic_name)
-        if not topic_types:
-            self.get_logger().warn(f"Topic {topic_name} not found in ROS graph")
+
+        types = dict(self.get_topic_names_and_types()).get(topic_name)
+        if not types:
+            self.get_logger().warning(f"Topic not found: {topic_name}")
             return
-        
-        msg_class = get_message(topic_types[0])
+
+        msg_class = get_message(types[0])
         sub = self.create_subscription(
             msg_class,
             topic_name,
             lambda msg, t=topic_name: self._on_topic_msg(msg, t),
-            QoSProfile(depth=10)
+            QoSProfile(depth=10),
         )
-
         with self._topic_subs_lock:
             self._topic_subs[topic_name] = sub
 
-        self._update_topic_relations()
         self.get_logger().info(f"Subscribed to {topic_name}")
-        
-        asyncio.create_task(self._send_bridge_subscriptions())
+        if self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._send_bridge_subscriptions(), self.loop
+            )
 
-    # Destroy ROS subscription and update gateway
-    def _unsubscribe_from_topic(self, topic_name):
+    def _unsubscribe_from_topic(self, topic_name: str):
         with self._topic_subs_lock:
-            if topic_name in self._topic_subs:
-                self.destroy_subscription(self._topic_subs[topic_name])
-                del self._topic_subs[topic_name]
+            sub = self._topic_subs.pop(topic_name, None)
+        if sub:
+            self.destroy_subscription(sub)
+            self.get_logger().info(f"Unsubscribed from {topic_name}")
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_bridge_subscriptions(), self.loop
+                )
 
-        self._update_topic_relations()
-        self.get_logger().info(f"Unsubscribed from {topic_name}")
-        
-        asyncio.run_coroutine_threadsafe(
-            self._send_bridge_subscriptions(),
-            self.loop
-        )
-
-    # Handle incoming topic message, calculate rate, send to gateway
-    def _on_topic_msg(self, msg, topic_name):
+    def _on_topic_msg(self, msg, topic_name: str):
         if not self.ws or not self.loop:
             return
 
-        timestamp = time.time()
-        last_timestamp = self._topic_last_timestamp.get(topic_name)
-        if last_timestamp is not None:
-            delta = timestamp - last_timestamp
+        ts = time.time()
+        last_ts = self._topic_last_timestamp.get(topic_name)
+        if last_ts is not None:
+            delta = ts - last_ts
             if delta > 0:
-                history = self._topic_rate_history.setdefault(topic_name, deque(maxlen=self._rate_history_depth))
+                history = self._topic_rate_history.setdefault(
+                    topic_name, deque(maxlen=self._rate_history_depth)
+                )
                 history.append(delta)
-        self._topic_last_timestamp[topic_name] = timestamp
+        self._topic_last_timestamp[topic_name] = ts
 
         rate = None
         history = self._topic_rate_history.get(topic_name)
@@ -439,111 +825,47 @@ class WebBridge(Node):
             if total > 0:
                 rate = len(history) / total
 
-        event = {
-            'type': 'topic_data',
-            'topic': topic_name,
-            'data': message_to_ordereddict(msg),
-            'rate_hz': rate,
-            'timestamp': timestamp
-        }
-        self.get_logger().debug(f"Received message on {topic_name}")
-        # Send topic data directly without marking graph dirty —
-        # topic data is payload on existing subscriptions, not a graph change.
-        if self.ws and self.loop:
-            asyncio.run_coroutine_threadsafe(
-                self._send_queue.put(json.dumps(event)), self.loop
-            )
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(json.dumps({
+                'type': 'topic_data',
+                'topic': topic_name,
+                'data': message_to_ordereddict(msg),
+                'rate_hz': rate,
+                'timestamp': ts,
+            })),
+            self.loop,
+        )
 
-    # Update topic publishers and subscribers
-    def _update_topic_relations(self):
-        """Update the cached topic relations."""
-        current_topic_types = dict(self.get_topic_names_and_types())
-        current_topic_relations = {}
+    # ──────────────────────────────────────────────
+    # Telemetry
+    # ──────────────────────────────────────────────
 
-        for topic_name, topic_types in current_topic_types.items():
-            pub_infos = self.get_publishers_info_by_topic(topic_name)
-            sub_infos = self.get_subscriptions_info_by_topic(topic_name)
-            publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
-            subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
-            current_topic_relations[topic_name] = {
-                'publishers': publishers,
-                'subscribers': subscribers,
-                'publisher_infos': pub_infos,
-                'subscriber_infos': sub_infos,
-                'type': topic_types[0] if topic_types else 'unknown',
-            }
+    # ──────────────────────────────────────────────
+    # Parameters (async, lazy-loaded)
+    # ──────────────────────────────────────────────
 
-        self._topic_relations = current_topic_relations
-
-    # Get topics with publishers, subscribers, and QoS profiles
-    def _get_topics_with_relations(self):
-        """Get topics with their publishers and subscribers with QoS info."""
-        topics_with_relations = {}
-        for topic_name, relations in self._topic_relations.items():
-            topics_with_relations[topic_name] = {
-                'type': relations.get('type', 'unknown'),
-                'publishers': [
-                    {'node': self._node_full_name(p.node_name, p.node_namespace),
-                     'qos': self._qos_profile_to_dict(p.qos_profile)}
-                    for p in relations.get('publisher_infos', [])
-                ],
-                'subscribers': [
-                    {'node': self._node_full_name(s.node_name, s.node_namespace),
-                     'qos': self._qos_profile_to_dict(s.qos_profile)}
-                    for s in relations.get('subscriber_infos', [])
-                ],
-            }
-        return topics_with_relations
-
-    # Build fully-qualified node name from short name and namespace
-    @staticmethod
-    def _node_full_name(name, namespace):
-        """Return the fully-qualified node path, e.g. /ns/node or /node."""
-        ns = namespace if namespace.endswith('/') else namespace + '/'
-        return ns + name
-
-    # Convert ROS QoS profile to dictionary
-    def _qos_profile_to_dict(self, qos_profile):
-        """Convert a QoS profile to a dictionary."""
-        if not qos_profile:
-            return None
-        
-        return {
-            'reliability': qos_profile.reliability.name if hasattr(qos_profile.reliability, 'name') else str(qos_profile.reliability),
-            'durability': qos_profile.durability.name if hasattr(qos_profile.durability, 'name') else str(qos_profile.durability),
-            'history': qos_profile.history.name if hasattr(qos_profile.history, 'name') else str(qos_profile.history),
-            'depth': qos_profile.depth,
-            'liveliness': qos_profile.liveliness.name if hasattr(qos_profile.liveliness, 'name') else str(qos_profile.liveliness),
-        }
-
-    # Retry fetching parameters for nodes whose cache is still empty
     def _refresh_empty_param_caches(self):
-        for node_name in list(self._active_nodes):
-            if not self._node_parameter_cache.get(node_name):
-                self._fetch_node_parameters_async(node_name)
+        """Retry parameter fetch for nodes that don't have cached params yet."""
+        for fqn in list(self._active_nodes):
+            if not self._node_parameter_cache.get(fqn):
+                self._fetch_node_parameters_async(fqn)
 
-    # Handle runtime parameter changes from any node
-    def _on_parameter_event(self, msg):
-        node_name = msg.node if msg.node.startswith('/') else f"/{msg.node}"
-        if node_name in self._active_nodes:
-            # Async fetch: avoids re-entrant spin_until_future_complete inside subscription callback
-            self._fetch_node_parameters_async(node_name)
+    def _fetch_node_parameters_async(self, fqn: str):
+        """Fetch parameters for *fqn* without blocking the executor.
 
-    # Non-blocking async parameter fetch (safe to call from timer/subscription callbacks)
-    def _fetch_node_parameters_async(self, node_name):
-        """Fetch parameters for node_name without blocking the executor."""
-        if node_name in self._pending_param_fetches:
+        Creates service clients, fires async calls, and stores results in
+        _node_parameter_cache when callbacks fire.  Safe to call from any
+        timer or graph-change callback.
+        """
+        if fqn in self._pending_param_fetches:
             return
 
-        service_prefix = node_name if node_name.startswith('/') else f"/{node_name}"
-
-        list_client = self.create_client(ListParameters, f"{service_prefix}/list_parameters")
+        list_client = self.create_client(ListParameters, f"{fqn}/list_parameters")
         if not list_client.service_is_ready():
             self.destroy_client(list_client)
             return
 
-        self._pending_param_fetches.add(node_name)
-
+        self._pending_param_fetches.add(fqn)
         req = ListParameters.Request()
         req.depth = 10
         future = list_client.call_async(req)
@@ -552,18 +874,17 @@ class WebBridge(Node):
             self.destroy_client(list_client)
             response = fut.result()
             if response is None or not response.result.names:
-                self._pending_param_fetches.discard(node_name)
+                self._pending_param_fetches.discard(fqn)
                 return
-
             param_names = list(response.result.names)
-            get_client = self.create_client(GetParameters, f"{service_prefix}/get_parameters")
+            get_client = self.create_client(GetParameters, f"{fqn}/get_parameters")
             get_req = GetParameters.Request()
             get_req.names = param_names
             get_future = get_client.call_async(get_req)
 
             def _on_get(gfut):
                 self.destroy_client(get_client)
-                self._pending_param_fetches.discard(node_name)
+                self._pending_param_fetches.discard(fqn)
                 get_resp = gfut.result()
                 if get_resp is None:
                     return
@@ -571,703 +892,148 @@ class WebBridge(Node):
                 for name, value in zip(param_names, get_resp.values):
                     try:
                         params[name] = parameter_value_to_python(value)
-                    except Exception as e:
-                        self.get_logger().debug(f"Could not convert parameter {name}: {e}")
-                self._node_parameter_cache[node_name] = params
+                    except Exception:
+                        pass
+                self._node_parameter_cache[fqn] = params
                 self._graph_dirty = True
 
             get_future.add_done_callback(_on_get)
 
         future.add_done_callback(_on_list)
 
-    # Get all parameters for a node using ROS services (sync – only safe before executor starts)
-    def _get_node_parameters(self, node_name):
-        """Get parameters for a specific node using the ROS parameter services."""
-        service_prefix = node_name if node_name.startswith('/') else f"/{node_name}"
-        param_names = self._list_node_parameters(service_prefix)
-        if not param_names:
-            return {}
-
-        param_values = self._get_node_parameter_values(service_prefix, param_names)
-        parameters = {}
-        for name, value in zip(param_names, param_values):
-            try:
-                parameters[name] = parameter_value_to_python(value)
-            except Exception as e:
-                self.get_logger().debug(f"Could not convert parameter {name}: {e}")
-        return parameters
-
-    # Call list_parameters service for a node
-    def _list_node_parameters(self, service_prefix, timeout_sec=0.2):
-        service_name = f"{service_prefix}/list_parameters"
-        client = self.create_client(ListParameters, service_name)
-        if not client.wait_for_service(timeout_sec=timeout_sec):
-            self.destroy_client(client)
-            return []
-
-        request = ListParameters.Request()
-        request.depth = 10
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
-        response = future.result()
-        self.destroy_client(client)
-
-        if response is None:
-            return []
-        return list(response.result.names)
-
-    # Call get_parameters service for a node
-    def _get_node_parameter_values(self, service_prefix, names, timeout_sec=0.2):
-        service_name = f"{service_prefix}/get_parameters"
-        client = self.create_client(GetParameters, service_name)
-        if not client.wait_for_service(timeout_sec=timeout_sec):
-            self.destroy_client(client)
-            return []
-
-        request = GetParameters.Request()
-        request.names = names
-        future = client.call_async(request)
-        rclpy.spin_until_future_complete(self, future, timeout_sec=timeout_sec)
-        response = future.result()
-        self.destroy_client(client)
-
-        if response is None:
-            return []
-        return list(response.values)
-
-    # Get nodes with their topics, actions, services, and parameters
-    def _get_nodes_with_relations(self):
-        """Get nodes with the topics they publish and subscribe to (derived from cached topic relations)."""
-        nodes_with_relations = {}
-        
-        self._update_action_relations()
-        self._update_service_relations()
-        
-        for node_name in self._active_nodes:
-            nodes_with_relations[node_name] = {
-                'publishes': [],
-                'subscribes': [],
-                'actions': [],
-                'services': [],
-                'parameters': {}
-            }
-        
-        # Build per-node QoS lookup from cached infos (zero additional DDS calls)
-        pub_qos = {}   # (topic, node) -> qos dict
-        sub_qos = {}   # (topic, node) -> qos dict
-        for topic_name, rel in self._topic_relations.items():
-            for pub_info in rel.get('publisher_infos', []):
-                node = self._node_full_name(pub_info.node_name, pub_info.node_namespace)
-                pub_qos[(topic_name, node)] = self._qos_profile_to_dict(pub_info.qos_profile)
-            for sub_info in rel.get('subscriber_infos', []):
-                node = self._node_full_name(sub_info.node_name, sub_info.node_namespace)
-                sub_qos[(topic_name, node)] = self._qos_profile_to_dict(sub_info.qos_profile)
-
-        for topic_name, relations in self._topic_relations.items():
-            for node_name in relations['publishers']:
-                if node_name in nodes_with_relations:
-                    nodes_with_relations[node_name]['publishes'].append({
-                        'topic': topic_name,
-                        'qos': pub_qos.get((topic_name, node_name))
-                    })
-            
-            for node_name in relations['subscribers']:
-                if node_name in nodes_with_relations:
-                    nodes_with_relations[node_name]['subscribes'].append({
-                        'topic': topic_name,
-                        'qos': sub_qos.get((topic_name, node_name))
-                    })
-        
-        for action_name, relations in self._action_relations.items():
-            for node_name in relations['providers']:
-                if node_name in nodes_with_relations:
-                    nodes_with_relations[node_name]['actions'].append(action_name)
-        
-        for service_name, relations in self._service_relations.items():
-            for node_name in relations['providers']:
-                if node_name in nodes_with_relations:
-                    nodes_with_relations[node_name]['services'].append(service_name)
-        
-        cache = self._node_parameter_cache
-        for node_name in nodes_with_relations.keys():
-            nodes_with_relations[node_name]['parameters'] = cache.get(node_name, {})
-        return nodes_with_relations
-
-    # Update cached action providers by detecting status topics
-    def _update_action_relations(self):
-        """Update the cached action relations from already-cached topic relations (zero DDS calls)."""
-        action_relations = {}
-
-        for topic_name, rel in self._topic_relations.items():
-            if topic_name.endswith('/_action/status'):
-                action_name = topic_name.replace('/_action/status', '')
-                providers = {
-                    self._node_full_name(info.node_name, info.node_namespace)
-                    for info in rel.get('publisher_infos', [])
-                }
-                action_relations[action_name] = {
-                    'providers': providers,
-                }
-
-        self._action_relations = action_relations
-
-    # Get actions with their provider nodes
-    def _get_actions_with_relations(self):
-        """Get actions from status topics and update cached action relations."""
-        self._update_action_relations()
-        
-        actions_with_relations = {}
-        for action_name, relations in self._action_relations.items():
-            actions_with_relations[action_name] = {
-                'providers': list(relations['providers']),
-            }
-        
-        return actions_with_relations
-
-    # Update cached service providers by querying nodes (rate-limited)
-    def _update_service_relations(self, force=False):
-        """Update the cached service relations.
-
-        This is an O(nodes × services) operation, so it is rate-limited to once
-        every 5 seconds unless *force* is True (used by initial_state).
-        """
-        now = time.time()
-        if not force and hasattr(self, '_service_relations_last_update'):
-            if now - self._service_relations_last_update < self._service_scan_interval:
-                return
-        self._service_relations_last_update = now
-
-        service_relations = {}
-        
-        # Build a per-node service lookup once — avoids calling
-        # get_service_names_and_types_by_node() for every (service, node) pair.
-        node_service_map = {}  # node_full_name -> set of service names
-        for node_short_name, node_namespace in self.get_node_names_and_namespaces():
-            node_name = self._node_full_name(node_short_name, node_namespace)
-            try:
-                node_service_map[node_name] = {
-                    svc_name
-                    for svc_name, _ in self.get_service_names_and_types_by_node(node_short_name, node_namespace)
-                }
-            except Exception as e:
-                self.get_logger().debug(f"Error checking services for node {node_name}: {e}")
-
-        all_services = self.get_service_names_and_types()
-        for service_name, service_types in all_services:
-            providers = {
-                node_name
-                for node_name, svc_set in node_service_map.items()
-                if service_name in svc_set
-            }
-            service_relations[service_name] = {
-                'providers': providers,
-                'type': service_types[0] if service_types else 'unknown'
-            }
-        
-        self._service_relations = service_relations
-
-    # Get services with their provider nodes and types
-    def _get_services_with_relations(self):
-        """Get services with their providers and update cached service relations."""
-        self._update_service_relations()
-        
-        services_with_relations = {}
-        for service_name, relations in self._service_relations.items():
-            providers = list(relations['providers'])
-            # Skip services with no live provider — DDS can lag behind and
-            # keep reporting service endpoints for a few seconds after the
-            # providing node has shut down.
-            if not providers:
-                continue
-            services_with_relations[service_name] = {
-                'providers': providers,
-                'type': relations['type']
-            }
-        
-        return services_with_relations
-
-    # Poll ROS graph for changes and send events
-    def _check_graph_changes(self):
-        """Check for node, topic, action, and publisher/subscriber changes."""
-        _node_pairs = list(self.get_node_names_and_namespaces())
-        current_nodes = {self._node_full_name(name, ns) for name, ns in _node_pairs}
-        current_topic_types = dict(self.get_topic_names_and_types())
-        current_topics = set(current_topic_types.keys())
-
-        # Cheap phase (every tick): count_publishers/count_subscribers are O(1) DDS
-        # hash-map lookups. Accumulate topics whose counts changed into
-        # _pending_topic_changes without touching the expensive endpoint lists.
-        new_counts = {}
-        for topic_name in current_topics:
-            npub = self.count_publishers(topic_name)
-            nsub = self.count_subscribers(topic_name)
-            new_counts[topic_name] = (npub, nsub)
-            old = self._topic_pub_sub_counts.get(topic_name)
-            if old is None or old != (npub, nsub):
-                self._pending_topic_changes.add(topic_name)
-        self._topic_pub_sub_counts = new_counts
-
-        # Expensive phase: fetch full QoS info only for topics whose counts
-        # changed. Capped to DEEP_SCAN_BATCH_SIZE per tick so we never hold the
-        # DDS participant mutex for more than ~16-32 ms even during a burst
-        # (e.g. Nav2 startup creating 40 topics at once). Remaining topics stay
-        # in _pending_topic_changes and get processed on the next tick.
-        all_changed = self._pending_topic_changes | (current_topics - set(self._topic_relations))
-        if all_changed:
-            batch = set(list(all_changed)[:self._deep_scan_batch_size])
-            self._pending_topic_changes = all_changed - batch
-            changed_topics = batch
-        else:
-            changed_topics = set()
-            self._pending_topic_changes = set()
-
-        current_topic_relations = {}
-        for topic_name in current_topics:
-            if topic_name in changed_topics:
-                pub_infos = self.get_publishers_info_by_topic(topic_name)
-                sub_infos = self.get_subscriptions_info_by_topic(topic_name)
-                publishers = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
-                subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
-                current_topic_relations[topic_name] = {
-                    'publishers': publishers,
-                    'subscribers': subscribers,
-                    'publisher_infos': pub_infos,
-                    'subscriber_infos': sub_infos,
-                    'type': current_topic_types.get(topic_name, ['unknown'])[0],
-                }
-            else:
-                cached = self._topic_relations.get(topic_name)
-                if cached:
-                    current_topic_relations[topic_name] = cached
-                else:
-                    # Brand-new topic not yet deep-scanned — add minimal entry so
-                    # it exists in the relations dict (will be deep-scanned next tick).
-                    current_topic_relations[topic_name] = {
-                        'publishers': set(),
-                        'subscribers': set(),
-                        'publisher_infos': [],
-                        'subscriber_infos': [],
-                        'type': current_topic_types.get(topic_name, ['unknown'])[0],
-                    }
-
-        # Emit sub/unsub events for topics that changed.
-        for topic_name in changed_topics:
-            if topic_name not in current_topic_relations:
-                continue
-            subscribers = current_topic_relations[topic_name]['subscribers']
-            prev_subs = self._last_topic_subscribers.get(topic_name, set())
-            for node_name in subscribers - prev_subs:
-                self._send_event_and_update({
-                    'type': 'topic_event', 'topic': topic_name, 'node': node_name,
-                    'event': 'subscribed', 'timestamp': time.time()
-                }, f"Node {node_name} subscribed to {topic_name}")
-            for node_name in prev_subs - subscribers:
-                self._send_event_and_update({
-                    'type': 'topic_event', 'topic': topic_name, 'node': node_name,
-                    'event': 'unsubscribed', 'timestamp': time.time()
-                }, f"Node {node_name} unsubscribed from {topic_name}")
-
-        # Emit publisher-change events and handle BT topic transitions.
-        for topic_name in changed_topics:
-            old_rel = self._topic_relations.get(topic_name)
-            if old_rel is None or topic_name not in current_topic_relations:
-                continue
-            old_pubs = old_rel['publishers']
-            new_pubs = current_topic_relations[topic_name]['publishers']
-            if new_pubs != old_pubs:
-                self._send_event_and_update(None, f"Topic publishers changed: {topic_name}")
-                if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
-                    if not new_pubs and old_pubs:
-                        self._on_nav2_bt_gone()
-                    elif new_pubs and not old_pubs:
-                        self._nav2_bt_publisher_active = True
-                        if self._load_and_parse_bt_xml():
-                            self._on_bt_event({
-                                'type': 'bt_tree',
-                                'timestamp': time.time(),
-                                'tree_id': self._nav2_bt_tree_id,
-                                'tree': self._nav2_bt_tree_structure,
-                                'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
-                            })
-
-        self._last_topic_subscribers = {
-            topic: current_topic_relations[topic]['subscribers']
-            for topic in changed_topics
-            if topic in current_topic_relations
-        } | {
-            topic: self._last_topic_subscribers.get(topic, set())
-            for topic in current_topics
-            if topic not in changed_topics
-        }
-
-        # Track /behavior_tree_log publisher liveness via the node graph, which updates
-        # faster than DDS publisher endpoint info (avoids both false positives and
-        # missed transitions when DDS skips the zero-publisher intermediate state).
-        if hasattr(self, '_nav2_bt_publisher_active'):
-            bt_pubs = current_topic_relations.get('/behavior_tree_log', {}).get('publishers', set())
-            live_bt_pubs = bt_pubs & current_nodes
-            if self._nav2_bt_publisher_active and not live_bt_pubs:
-                # Publisher node confirmed gone — clear BT state.
-                self.get_logger().info(f"BT publisher nodes gone from graph (pubs={bt_pubs}) — clearing BT state")
-                self._on_nav2_bt_gone()
-            elif not self._nav2_bt_publisher_active and live_bt_pubs:
-                # Publisher node is back but the flag was left False (DDS kept showing the
-                # old endpoint so the publisher-change delta above never fired).
-                self.get_logger().info(f"BT publisher {live_bt_pubs} back in graph — re-arming")
-                self._nav2_bt_publisher_active = True
-                if self._load_and_parse_bt_xml():
-                    self._on_bt_event({
-                        'type': 'bt_tree',
-                        'timestamp': time.time(),
-                        'tree_id': self._nav2_bt_tree_id,
-                        'tree': self._nav2_bt_tree_structure,
-                        'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
-                    })
-
-        # Only count actions whose /_action/status topic has at least one publisher.
-        # A bare subscriber (like our own) must not prevent actions from being detected
-        # as gone when the providing node stops.
-        current_actions = {
-            topic_name.replace('/_action/status', '')
-            for topic_name, rel in current_topic_relations.items()
-            if topic_name.endswith('/_action/status') and rel['publishers']
-        }
-
-        started_nodes = current_nodes - self._active_nodes
-        for node_name in started_nodes:
-            # Async fetch: avoids re-entrant spin_until_future_complete inside timer callback
-            self._fetch_node_parameters_async(node_name)
-            event = {
-                'type': 'node_event',
-                'node': node_name,
-                'event': 'started',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Node started: {node_name}")
-        
-        stopped_nodes = self._active_nodes - current_nodes
-        for node_name in stopped_nodes:
-            self._node_parameter_cache.pop(node_name, None)
-            self._pending_param_fetches.discard(node_name)
-            event = {
-                'type': 'node_event',
-                'node': node_name,
-                'event': 'stopped',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Node stopped: {node_name}")
-        
-        started_topics = current_topics - self._active_topics
-        for topic_name in started_topics:
-            event = {
-                'type': 'topic_event',
-                'topic': topic_name,
-                'event': 'created',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Topic created: {topic_name}")
-            # When /behavior_tree_log appears as a brand-new topic (nav2 just started),
-            # the publisher-change path below won't fire because the topic isn't in
-            # self._topic_relations yet. Handle it here instead.
-            if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
-                if current_topic_relations.get(topic_name, {}).get('publishers'):
-                    self._nav2_bt_publisher_active = True
-                    if self._load_and_parse_bt_xml():
-                        self._on_bt_event({
-                            'type': 'bt_tree',
-                            'timestamp': time.time(),
-                            'tree_id': self._nav2_bt_tree_id,
-                            'tree': self._nav2_bt_tree_structure,
-                            'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
-                        })
-        
-        stopped_topics = self._active_topics - current_topics
-        for topic_name in stopped_topics:
-            event = {
-                'type': 'topic_event',
-                'topic': topic_name,
-                'event': 'destroyed',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Topic destroyed: {topic_name}")
-            if topic_name == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
-                self._on_nav2_bt_gone()
-        
-        started_actions = current_actions - self._active_actions
-        for action_name in started_actions:
-            event = {
-                'type': 'action_event',
-                'action': action_name,
-                'event': 'created',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Action created: {action_name}")
-        
-        stopped_actions = self._active_actions - current_actions
-        if stopped_actions:
-            self.get_logger().info(f"Actions stopped: {stopped_actions}")
-        for action_name in stopped_actions:
-            event = {
-                'type': 'action_event',
-                'action': action_name,
-                'event': 'destroyed',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Action destroyed: {action_name}")
-            if action_name in self._action_status_subs:
-                self.destroy_subscription(self._action_status_subs[action_name])
-                del self._action_status_subs[action_name]
-                del self._active_goals[action_name]
-        
-        current_services = {service_name for service_name, _ in self.get_service_names_and_types()}
-
-        # Eagerly evict services whose only provider was a node that just stopped.
-        # get_service_names_and_types() can lag behind DDS, so without this those
-        # services would linger in the services list until DDS catches up.
-        for node_name in stopped_nodes:
-            for service_name, rel in self._service_relations.items():
-                if rel['providers'] == {node_name}:
-                    current_services.discard(service_name)
-
-        started_services = current_services - self._active_services
-        for service_name in started_services:
-            if service_name.startswith('/ros2cli_daemon'):
-                continue
-            event = {
-                'type': 'service_event',
-                'service': service_name,
-                'event': 'created',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Service created: {service_name}")
-        
-        stopped_services = self._active_services - current_services
-        for service_name in stopped_services:
-            if service_name.startswith('/ros2cli_daemon'):
-                continue
-            event = {
-                'type': 'service_event',
-                'service': service_name,
-                'event': 'destroyed',
-                'timestamp': time.time()
-            }
-            self._send_event_and_update(event, f"Service destroyed: {service_name}")
-
-        # Incrementally patch service relations for nodes that just started.
-        # This keeps the provider mapping accurate immediately without triggering a
-        # full O(all_nodes) rescan — one DDS call per restarted node instead of ~15-20.
-        # Stopped-node services are already evicted by the eager eviction loop above.
-        real_started_nodes = {n for n in started_nodes if 'ros2cli_daemon' not in n}
-        if real_started_nodes:
-            node_name_map = {self._node_full_name(n, ns): (n, ns) for n, ns in _node_pairs}
-            for node_full_name in real_started_nodes:
-                pair = node_name_map.get(node_full_name)
-                if not pair:
-                    continue
-                short_name, namespace = pair
-                try:
-                    for svc_name, svc_types in self.get_service_names_and_types_by_node(short_name, namespace):
-                        if svc_name in self._service_relations:
-                            self._service_relations[svc_name]['providers'].add(node_full_name)
-                        else:
-                            self._service_relations[svc_name] = {
-                                'providers': {node_full_name},
-                                'type': svc_types[0] if svc_types else 'unknown'
-                            }
-                except Exception as e:
-                    self.get_logger().debug(f"Error patching service relations for {node_full_name}: {e}")
-
-        self._active_nodes = current_nodes
-        self._active_topics = current_topics
-        self._active_actions = current_actions
-        self._active_services = current_services
-        self._topic_relations = current_topic_relations
-
-        # Flush graph snapshots once per tick if anything changed.
-        # All computation runs here on the ROS executor thread so the asyncio
-        # send loop only ever does I/O (ws.send), never blocks on ROS API calls.
-        if self._graph_dirty and self.ws and self.loop:
-            self._graph_dirty = False
-
-            nodes = self._get_nodes_with_relations()
-            if nodes != self._last_sent_nodes:
-                self._last_sent_nodes = nodes.copy()
-                asyncio.run_coroutine_threadsafe(
-                    self._send_queue.put(json.dumps(
-                        {'type': 'nodes', 'data': nodes, 'timestamp': time.time()}
-                    )),
-                    self.loop
-                )
-                self.get_logger().debug(f"Sent nodes list: {list(nodes.keys())}")
-
-            topics = self._get_topics_with_relations()
-            if topics != self._last_sent_topics:
-                self._last_sent_topics = topics.copy()
-                asyncio.run_coroutine_threadsafe(
-                    self._send_queue.put(json.dumps(
-                        {'type': 'topics', 'data': topics, 'timestamp': time.time()}
-                    )),
-                    self.loop
-                )
-                self.get_logger().debug(f"Sent topics list: {list(topics.keys())}")
-
-            actions = self._get_actions_with_relations()
-            if actions != self._last_sent_actions:
-                self._last_sent_actions = actions.copy()
-                asyncio.run_coroutine_threadsafe(
-                    self._send_queue.put(json.dumps(
-                        {'type': 'actions', 'data': actions, 'timestamp': time.time()}
-                    )),
-                    self.loop
-                )
-                self.get_logger().debug(f"Sent actions list: {list(actions.keys())}")
-
-            services = self._get_services_with_relations()
-            if services != self._last_sent_services:
-                self._last_sent_services = services.copy()
-                asyncio.run_coroutine_threadsafe(
-                    self._send_queue.put(json.dumps(
-                        {'type': 'services', 'data': services, 'timestamp': time.time()}
-                    )),
-                    self.loop
-                )
-                self.get_logger().debug(f"Sent services list: {list(services.keys())}")
-
-        # Poll ros2_control state (internally throttled to 2 s)
-        self._ros2_control.poll()
-
-        # Poll TF tree state (internally throttled to 0.1 s)
-        self._tf_tree.poll()
-
-    # Send event to gateway and mark graph dirty for end-of-tick flush
-    def _send_event_and_update(self, event, log_message):
-        """Send event and mark graph as dirty (snapshot sent at end of tick)."""
-        if not self.ws or not self.loop:
-            return
-
-        if event:
-            asyncio.run_coroutine_threadsafe(self._send_queue.put(json.dumps(event)), self.loop)
-        
-        self._graph_dirty = True
-        
-        if log_message:
-            self.get_logger().debug(log_message)
-
-    # Collect and send system telemetry to gateway
     def _collect_telemetry(self):
-        """Collect system telemetry (CPU, RAM) and send to queue."""
         if not self._telemetry_enabled or not self.ws or not self.loop:
             return
-        data = self._get_telemetry_snapshot()
-        telemetry = {
+        self._enqueue({
             'type': 'telemetry',
-            'data': data,
-            'timestamp': time.time()
-        }
+            'data': self._get_telemetry_snapshot(),
+            'timestamp': time.time(),
+        })
 
-        asyncio.run_coroutine_threadsafe(
-            self._send_queue.put(json.dumps(telemetry)),
-            self.loop
-        )
-
-    # Return current CPU, RAM, and disk usage
-    def _get_telemetry_snapshot(self):
-        """Return a snapshot of system telemetry (CPU, RAM, disk)."""
+    def _get_telemetry_snapshot(self) -> dict:
         return {
             'cpu': {
                 'percent': psutil.cpu_percent(interval=None),
-                'cores': psutil.cpu_count(logical=False),
+                'cores':   psutil.cpu_count(logical=False),
             },
             'ram': {
-                'percent': psutil.virtual_memory().percent,
-                'used_mb': psutil.virtual_memory().used / (1024 * 1024),
+                'percent':  psutil.virtual_memory().percent,
+                'used_mb':  psutil.virtual_memory().used  / (1024 * 1024),
                 'total_mb': psutil.virtual_memory().total / (1024 * 1024),
             },
             'disk': {
-                'percent': psutil.disk_usage('/').percent,
-                'used_gb': psutil.disk_usage('/').used / (1024 * 1024 * 1024),
-                'total_gb': psutil.disk_usage('/').total / (1024 * 1024 * 1024),
-            }
+                'percent':  psutil.disk_usage('/').percent,
+                'used_gb':  psutil.disk_usage('/').used  / (1024 ** 3),
+                'total_gb': psutil.disk_usage('/').total / (1024 ** 3),
+            },
         }
 
-    # Handle BT events from BTCollector
-    def _on_bt_event(self, event):
-        """Handle behavior tree events from BTCollector and forward to websocket."""
-        event_type = event.get('type')
-        
-        # Update cache: store new tree, or clear it when BT is gone (tree_id is None)
-        if event_type == 'bt_tree':
-            self._cached_bt_tree_event = event if event.get('tree_id') else None
+    # ──────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────
 
-        # Cache tree events if WS not connected yet
-        if not self.ws or not self.loop:
-            return
-        
-        try:
+    @staticmethod
+    def _node_full_name(name: str, namespace: str) -> str:
+        ns = namespace if namespace.endswith('/') else namespace + '/'
+        return ns + name
+
+    @staticmethod
+    def _qos_to_dict(qos) -> dict | None:
+        if not qos:
+            return None
+        return {
+            'reliability': qos.reliability.name if hasattr(qos.reliability, 'name') else str(qos.reliability),
+            'durability':  qos.durability.name  if hasattr(qos.durability,  'name') else str(qos.durability),
+            'history':     qos.history.name     if hasattr(qos.history,     'name') else str(qos.history),
+            'depth':       qos.depth,
+            'liveliness':  qos.liveliness.name  if hasattr(qos.liveliness,  'name') else str(qos.liveliness),
+        }
+
+    def _send_event_and_update(self, event: dict, log: str = ''):
+        """Queue an event to the WS send loop and mark the graph dirty."""
+        if log:
+            self.get_logger().debug(log)
+        if event:
+            self._enqueue(event)
+        self._graph_dirty = True
+
+    def _enqueue(self, payload: dict):
+        """Thread-safe enqueue to the asyncio send queue."""
+        if self.ws and self.loop:
             asyncio.run_coroutine_threadsafe(
-                self._send_queue.put(json.dumps(event)),
-                self.loop
+                self._send_queue.put(json.dumps(payload)),
+                self.loop,
             )
-        except Exception as e:
-            self.get_logger().error(f"Failed to queue BT event: {e}")
 
-    # Nav2 BT monitoring via /behavior_tree_log ROS topic
+    # ──────────────────────────────────────────────
+    # Collector event handlers
+    # ──────────────────────────────────────────────
+
+    def _on_ros2_control_event(self, event: dict):
+        self._enqueue(event)
+
+    def _on_tf_tree_event(self, event: dict):
+        self._enqueue(event)
+
+    def _on_bt_event(self, event: dict):
+        if event.get('type') == 'bt_tree':
+            self._cached_bt_tree_event = event if event.get('tree_id') else None
+        self._enqueue(event)
+
+    # ──────────────────────────────────────────────
+    # Nav2 BT monitoring
+    # ──────────────────────────────────────────────
+
     def _init_nav2_bt_monitor(self):
-        """Subscribe to nav2's /behavior_tree_log topic for BT state monitoring."""
         try:
             from nav2_msgs.msg import BehaviorTreeLog
             from action_msgs.msg import GoalStatusArray
-            self._nav2_bt_statuses = {}       # node_name -> current status string
-            self._nav2_bt_session_active = False
-            self._nav2_bt_publisher_active = False  # True only while a publisher exists
-            self._nav2_bt_tree_id = None      # set once XML is parsed
-            self._nav2_bt_tree_structure = None
-            self._nav2_bt_nodes_list = []
-            self._nav2_bt_name_to_uid = {}
+            self._nav2_bt_statuses:        dict[str, str] = {}
+            self._nav2_bt_session_active   = False
+            self._nav2_bt_publisher_active = False
+            self._nav2_bt_tree_id          = None
+            self._nav2_bt_tree_structure   = None
+            self._nav2_bt_nodes_list:      list = []
+            self._nav2_bt_name_to_uid:     dict = {}
             self.create_subscription(
-                BehaviorTreeLog,
-                '/behavior_tree_log',
-                self._on_nav2_bt_log,
-                10
+                BehaviorTreeLog, '/behavior_tree_log', self._on_nav2_bt_log, 10
             )
             self.create_subscription(
                 GoalStatusArray,
                 '/navigate_to_pose/_action/status',
                 self._on_nav2_goal_status,
-                10
+                10,
             )
-            # If bt_navigator is already publishing when the agent starts, pre-parse
-            # the XML so the startup bt_state event can include the nav2 tree structure.
-            bt_log_publishers = self.get_publishers_info_by_topic('/behavior_tree_log')
-            if bt_log_publishers:
+            # If bt_navigator is already publishing, pre-parse the XML so
+            # the startup bt_state event includes the tree structure.
+            if self.count_publishers('/behavior_tree_log') > 0:
                 self._nav2_bt_publisher_active = True
                 self._load_and_parse_bt_xml()
         except Exception as e:
             self.get_logger().debug(f"Nav2 BT monitoring unavailable: {e}")
 
     def _load_and_parse_bt_xml(self) -> bool:
-        """Parse the BT XML file (once) and populate nav2 BT state fields. Returns True on success."""
         if self._nav2_bt_tree_id is not None:
-            return True  # Already done
-
+            return True
         import hashlib
         import xml.etree.ElementTree as ET
 
-        # Determine XML file path: prefer bt_navigator parameter, fall back to nav2 default
-        xml_path = self._node_parameter_cache.get('/bt_navigator', {}).get('default_nav_to_pose_bt_xml', '')
+        xml_path = self._node_parameter_cache.get('/bt_navigator', {}).get(
+            'default_nav_to_pose_bt_xml', ''
+        )
         if not xml_path:
             try:
                 from ament_index_python.packages import get_package_share_directory
                 nav2_share = get_package_share_directory('nav2_bt_navigator')
                 xml_path = os.path.join(
                     nav2_share, 'behavior_trees',
-                    'navigate_to_pose_w_replanning_and_recovery.xml'
+                    'navigate_to_pose_w_replanning_and_recovery.xml',
                 )
             except Exception:
                 return False
 
         try:
-            with open(xml_path, 'r') as f:
+            with open(xml_path) as f:
                 xml_content = f.read()
         except Exception as e:
             self.get_logger().error(f"Cannot read BT XML '{xml_path}': {e}")
@@ -1279,8 +1045,8 @@ class WebBridge(Node):
             if bt_elem is None:
                 return False
 
-            nodes_list = []
-            name_to_uid = {}
+            nodes_list: list = []
+            name_to_uid: dict = {}
             uid_counter = [1]
 
             def elem_to_node(elem):
@@ -1288,7 +1054,10 @@ class WebBridge(Node):
                 uid = uid_counter[0]; uid_counter[0] += 1
                 name_to_uid[name] = uid
                 nodes_list.append({'uid': uid, 'name': name, 'tag': elem.tag})
-                node = {'tag': elem.tag, 'name': name, 'uid': uid, 'attributes': dict(elem.attrib)}
+                node = {
+                    'tag': elem.tag, 'name': name, 'uid': uid,
+                    'attributes': dict(elem.attrib),
+                }
                 kids = [elem_to_node(c) for c in elem]
                 if kids:
                     node['children'] = kids
@@ -1296,10 +1065,9 @@ class WebBridge(Node):
 
             bt_children = list(bt_elem)
             tree_structure = elem_to_node(bt_children[0]) if bt_children else {}
-
             self._nav2_bt_tree_structure = tree_structure
-            self._nav2_bt_nodes_list = nodes_list
-            self._nav2_bt_name_to_uid = name_to_uid
+            self._nav2_bt_nodes_list     = nodes_list
+            self._nav2_bt_name_to_uid    = name_to_uid
             self._nav2_bt_tree_id = hashlib.sha1(xml_content.encode()).hexdigest()[:16]
             return True
         except Exception as e:
@@ -1307,14 +1075,11 @@ class WebBridge(Node):
             return False
 
     def _on_nav2_bt_log(self, msg):
-        """Handle nav2 BehaviorTreeLog messages and emit bt_tree / bt_status events."""
-        # Discard messages buffered by DDS after the publisher has gone away.
         if not self._nav2_bt_publisher_active:
             return
         if not self._load_and_parse_bt_xml():
             return
 
-        # Build changes list and update local status tracking.
         changes = []
         has_running = False
         for change in msg.event_log:
@@ -1322,123 +1087,104 @@ class WebBridge(Node):
             uid = self._nav2_bt_name_to_uid.get(change.node_name)
             if uid is not None:
                 changes.append({
-                    'uid': uid,
-                    'name': change.node_name,
-                    'tag': '',
+                    'uid': uid, 'name': change.node_name,
+                    'tag': '', 'status': change.current_status,
                     'previous_status': change.previous_status,
-                    'status': change.current_status,
                 })
             if change.current_status == 'RUNNING':
                 has_running = True
 
-        # Detect navigation session start: emit bt_tree once per session so
-        # the UI receives the full tree structure.
         if has_running and not self._nav2_bt_session_active:
             self._nav2_bt_session_active = True
-            nodes_with_status = [
-                {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
-                for nd in self._nav2_bt_nodes_list
-            ]
             self._on_bt_event({
-                'type': 'bt_tree',
-                'timestamp': time.time(),
+                'type': 'bt_tree', 'timestamp': time.time(),
                 'tree_id': self._nav2_bt_tree_id,
                 'tree': self._nav2_bt_tree_structure,
-                'nodes': nodes_with_status,
+                'nodes': [
+                    {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
+                    for nd in self._nav2_bt_nodes_list
+                ],
             })
 
-        # Emit status changes
         if changes:
             self._on_bt_event({
-                'type': 'bt_status',
-                'timestamp': time.time(),
+                'type': 'bt_status', 'timestamp': time.time(),
                 'tree_id': self._nav2_bt_tree_id,
                 'changes': changes,
             })
 
     def _on_nav2_goal_status(self, msg):
-        """Detect nav2 goal completion/cancellation via action status."""
-        # action_msgs GoalStatus: ACCEPTED=1, EXECUTING=2, CANCELING=3
         has_active = any(s.status in (1, 2, 3) for s in msg.status_list)
-
         if self._nav2_bt_session_active and not has_active:
             self._nav2_bt_session_active = False
             self._nav2_bt_statuses.clear()
             if self._nav2_bt_tree_id:
-                nodes_idle = [
-                    {**nd, 'status': 'IDLE'}
-                    for nd in self._nav2_bt_nodes_list
-                ]
                 self._on_bt_event({
-                    'type': 'bt_tree',
-                    'timestamp': time.time(),
+                    'type': 'bt_tree', 'timestamp': time.time(),
                     'tree_id': self._nav2_bt_tree_id,
                     'tree': self._nav2_bt_tree_structure,
-                    'nodes': nodes_idle,
+                    'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
                 })
 
     def _on_nav2_bt_gone(self):
-        """Called when the /behavior_tree_log topic disappears from the ROS graph."""
         if self._nav2_bt_tree_id is None and not self._nav2_bt_publisher_active:
-            return  # Nothing was active, nothing to clear
-        self.get_logger().info("Nav2 BT disappeared from ROS graph — clearing BT state")
-        self._nav2_bt_publisher_active = False  # Gate out any DDS-buffered callbacks
-        self._nav2_bt_session_active = False
+            return
+        self.get_logger().info("Nav2 BT gone — clearing BT state")
+        self._nav2_bt_publisher_active = False
+        self._nav2_bt_session_active   = False
         self._nav2_bt_statuses.clear()
-        self._nav2_bt_tree_id = None
-        self._nav2_bt_tree_structure = None
-        self._nav2_bt_nodes_list = []
-        self._nav2_bt_name_to_uid = {}
+        self._nav2_bt_tree_id          = None
+        self._nav2_bt_tree_structure   = None
+        self._nav2_bt_nodes_list       = []
+        self._nav2_bt_name_to_uid      = {}
         self._on_bt_event({
-            'type': 'bt_tree',
-            'timestamp': time.time(),
-            'tree_id': None,
-            'tree': None,
-            'nodes': [],
+            'type': 'bt_tree', 'timestamp': time.time(),
+            'tree_id': None, 'tree': None, 'nodes': [],
         })
 
-    # Handle TF tree events
-    def _on_tf_tree_event(self, event):
-        """Forward tf_tree collector events to the websocket."""
-        if not self.ws or not self.loop:
-            return
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._send_queue.put(json.dumps(event)),
-                self.loop,
-            )
-        except Exception as e:
-            self.get_logger().error(f"Failed to queue tf_tree event: {e}")
+    def _build_startup_bt_state_event(self) -> dict:
+        src = self._cached_bt_tree_event
+        if src:
+            return {
+                'type': 'bt_state', 'timestamp': src.get('timestamp', time.time()),
+                'tree_id': src.get('tree_id'), 'tree': src.get('tree'),
+                'nodes': src.get('nodes', []),
+            }
+        if (
+            hasattr(self, '_nav2_bt_tree_id')
+            and self._nav2_bt_tree_id
+            and self._nav2_bt_tree_structure
+        ):
+            return {
+                'type': 'bt_state', 'timestamp': time.time(),
+                'tree_id': self._nav2_bt_tree_id,
+                'tree': self._nav2_bt_tree_structure,
+                'nodes': [
+                    {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
+                    for nd in self._nav2_bt_nodes_list
+                ],
+            }
+        return {
+            'type': 'bt_state', 'timestamp': time.time(),
+            'tree_id': None, 'tree': None, 'nodes': [],
+        }
 
-    # Handle ros2_control events (controllers_state / hardware_state)
-    def _on_ros2_control_event(self, event):
-        """Forward ros2_control collector events to the websocket."""
-        if not self.ws or not self.loop:
-            return
-        try:
-            asyncio.run_coroutine_threadsafe(
-                self._send_queue.put(json.dumps(event)),
-                self.loop,
-            )
-        except Exception as e:
-            self.get_logger().error(f"Failed to queue ros2_control event: {e}")
+    # ──────────────────────────────────────────────
+    # Cleanup
+    # ──────────────────────────────────────────────
 
     def destroy_node(self):
-        """Clean up resources before destroying the node."""
-        # Stop ros2_control collector
         self._ros2_control.destroy()
-
-        # Stop TF tree collector
         self._tf_tree.destroy()
-
-        # Stop BT collector
         if self._bt_collector:
             self._bt_collector.stop()
-        
         super().destroy_node()
 
 
-# Initialize ROS, create node, and run until shutdown
+# ──────────────────────────────────────────────
+# Entry point
+# ──────────────────────────────────────────────
+
 def main(args=None):
     rclpy.init(args=args)
     node = WebBridge()
@@ -1450,6 +1196,7 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+
 
 if __name__ == '__main__':
     main()
