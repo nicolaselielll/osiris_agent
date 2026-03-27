@@ -59,8 +59,8 @@ class WebBridge(Node):
 
         # WebSocket URL
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -173,7 +173,7 @@ class WebBridge(Node):
         self._init_nav2_bt_monitor()
 
         self.get_logger().info(
-            f"Osiris agent v{AGENT_VERSION} — graph_interval={_graph_interval}s, "
+            f"🚀 Osiris agent v{AGENT_VERSION} — graph_interval={_graph_interval}s, "
             f"topic_batch={self._topic_batch_size}"
         )
 
