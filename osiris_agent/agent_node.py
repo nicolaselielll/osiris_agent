@@ -173,7 +173,7 @@ class WebBridge(Node):
         self._init_nav2_bt_monitor()
 
         self.get_logger().info(
-            f"Osiris agent v{AGENT_VERSION} — graph_interval={_graph_interval}s, "
+            f"🚀 Osiris agent v{AGENT_VERSION} — graph_interval={_graph_interval}s, "
             f"topic_batch={self._topic_batch_size}"
         )
 
