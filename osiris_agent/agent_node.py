@@ -130,7 +130,13 @@ class WebBridge(Node):
         self._cached_bt_tree_event: dict | None = None
 
         # ── Telemetry ─────────────────────────────────────────────────────────
-        self._telemetry_enabled = True
+        self._telemetry_enabled   = True
+        self._cpu_history:         deque = deque(maxlen=15)
+        self._last_cpu_avg:        float | None = None
+        self._last_ram_percent:    float | None = None
+        self._last_disk_io                      = None
+        self._last_net_io                       = None
+        self._last_io_time:        float | None = None
 
         # ── Collectors ────────────────────────────────────────────────────────
         self._ros2_control = Ros2ControlCollector(
@@ -911,20 +917,100 @@ class WebBridge(Node):
         })
 
     def _get_telemetry_snapshot(self) -> dict:
+        # ── CPU: 15-sample rolling average + trend ────────────────────────────
+        self._cpu_history.append(psutil.cpu_percent(interval=None))
+        cpu_load = round(sum(self._cpu_history) / len(self._cpu_history), 1)
+        if self._last_cpu_avg is None:
+            cpu_trend = '→'
+        elif cpu_load > self._last_cpu_avg + 0.5:
+            cpu_trend = '↑'
+        elif cpu_load < self._last_cpu_avg - 0.5:
+            cpu_trend = '↓'
+        else:
+            cpu_trend = '→'
+        self._last_cpu_avg = cpu_load
+
+        # ── RAM: percent + trend ──────────────────────────────────────────────
+        vm = psutil.virtual_memory()
+        ram_percent = vm.percent
+        if self._last_ram_percent is None:
+            ram_trend = '→'
+        elif ram_percent > self._last_ram_percent + 0.5:
+            ram_trend = '↑'
+        elif ram_percent < self._last_ram_percent - 0.5:
+            ram_trend = '↓'
+        else:
+            ram_trend = '→'
+        self._last_ram_percent = ram_percent
+
+        # ── Disk usage + I/O rates ────────────────────────────────────────────
+        now = time.time()
+        disk_usage   = psutil.disk_usage('/')
+        disk_read_mbps  = 0.0
+        disk_write_mbps = 0.0
+        try:
+            disk_io = psutil.disk_io_counters()
+            if self._last_disk_io is not None and self._last_io_time is not None:
+                dt = now - self._last_io_time
+                if dt > 0:
+                    disk_read_mbps  = round(max(0.0, (disk_io.read_bytes  - self._last_disk_io.read_bytes)  / dt / (1024 * 1024)), 2)
+                    disk_write_mbps = round(max(0.0, (disk_io.write_bytes - self._last_disk_io.write_bytes) / dt / (1024 * 1024)), 2)
+            self._last_disk_io = disk_io
+        except Exception:
+            pass
+
+        # ── Network I/O rates ─────────────────────────────────────────────────
+        net_tx_mbps = 0.0
+        net_rx_mbps = 0.0
+        try:
+            net_io = psutil.net_io_counters()
+            if self._last_net_io is not None and self._last_io_time is not None:
+                dt = now - self._last_io_time
+                if dt > 0:
+                    net_tx_mbps = round(max(0.0, (net_io.bytes_sent - self._last_net_io.bytes_sent) / dt / (1024 * 1024)), 2)
+                    net_rx_mbps = round(max(0.0, (net_io.bytes_recv - self._last_net_io.bytes_recv) / dt / (1024 * 1024)), 2)
+            self._last_net_io = net_io
+        except Exception:
+            pass
+
+        self._last_io_time = now
+
+        # ── Temperature ───────────────────────────────────────────────────────
+        cpu_c = None
+        try:
+            temps = psutil.sensors_temperatures()
+            for key in ('coretemp', 'cpu-thermal', 'acpitz', 'k10temp', 'cpu_thermal'):
+                entries = temps.get(key)
+                if entries:
+                    cpu_c = round(entries[0].current, 1)
+                    break
+        except Exception:
+            pass
+
         return {
             'cpu': {
-                'percent': psutil.cpu_percent(interval=None),
-                'cores':   psutil.cpu_count(logical=False),
+                'load':  cpu_load,
+                'trend': cpu_trend,
             },
             'ram': {
-                'percent':  psutil.virtual_memory().percent,
-                'used_mb':  psutil.virtual_memory().used  / (1024 * 1024),
-                'total_mb': psutil.virtual_memory().total / (1024 * 1024),
+                'percent':  round(ram_percent, 1),
+                'used_mb':  round(vm.used  / (1024 * 1024), 1),
+                'total_mb': round(vm.total / (1024 * 1024), 1),
+                'trend':    ram_trend,
             },
             'disk': {
-                'percent':  psutil.disk_usage('/').percent,
-                'used_gb':  psutil.disk_usage('/').used  / (1024 ** 3),
-                'total_gb': psutil.disk_usage('/').total / (1024 ** 3),
+                'percent':    round(disk_usage.percent, 1),
+                'used_gb':    round(disk_usage.used  / (1024 ** 3), 2),
+                'total_gb':   round(disk_usage.total / (1024 ** 3), 2),
+                'read_mbps':  disk_read_mbps,
+                'write_mbps': disk_write_mbps,
+            },
+            'net': {
+                'tx_mbps': net_tx_mbps,
+                'rx_mbps': net_rx_mbps,
+            },
+            'temp': {
+                'cpu_c': cpu_c,
             },
         }
 
