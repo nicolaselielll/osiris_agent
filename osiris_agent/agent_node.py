@@ -134,6 +134,7 @@ class WebBridge(Node):
         self._last_disk_io      = None
         self._last_net_io       = None
         self._last_io_time:     float | None = None
+        self._cpu_history:      deque = deque(maxlen=900)  # 15 min at 1 Hz
         psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
 
         # ── Collectors ────────────────────────────────────────────────────────
@@ -915,16 +916,17 @@ class WebBridge(Node):
         })
 
     def _get_telemetry_snapshot(self) -> dict:
-        # ── CPU: instantaneous + load averages ───────────────────────────────
+        # ── CPU: instantaneous + rolling averages ─────────────────────────────
         cpu_now = round(psutil.cpu_percent(interval=None), 1)
-        cpu_count = os.cpu_count() or 1
-        try:
-            _load1, _load5, _load15 = psutil.getloadavg()
-            load1  = round(_load1  / cpu_count * 100, 1)
-            load5  = round(_load5  / cpu_count * 100, 1)
-            load15 = round(_load15 / cpu_count * 100, 1)
-        except AttributeError:
-            load1 = load5 = load15 = None
+        self._cpu_history.append(cpu_now)
+
+        def _rolling(n: int) -> float | None:
+            window = list(self._cpu_history)[-n:]
+            return round(sum(window) / len(window), 1) if window else None
+
+        load1  = _rolling(60)
+        load5  = _rolling(300)
+        load15 = _rolling(900)
 
         # ── RAM ───────────────────────────────────────────────────────────────
         vm = psutil.virtual_memory()
