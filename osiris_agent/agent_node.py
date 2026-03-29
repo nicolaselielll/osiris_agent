@@ -130,13 +130,10 @@ class WebBridge(Node):
         self._cached_bt_tree_event: dict | None = None
 
         # ── Telemetry ─────────────────────────────────────────────────────────
-        self._telemetry_enabled   = True
-        self._cpu_history:         deque = deque(maxlen=15)
-        self._last_cpu_avg:        float | None = None
-        self._last_ram_percent:    float | None = None
-        self._last_disk_io                      = None
-        self._last_net_io                       = None
-        self._last_io_time:        float | None = None
+        self._telemetry_enabled = True
+        self._last_disk_io      = None
+        self._last_net_io       = None
+        self._last_io_time:     float | None = None
 
         # ── Collectors ────────────────────────────────────────────────────────
         self._ros2_control = Ros2ControlCollector(
@@ -917,31 +914,16 @@ class WebBridge(Node):
         })
 
     def _get_telemetry_snapshot(self) -> dict:
-        # ── CPU: 15-sample rolling average + trend ────────────────────────────
-        self._cpu_history.append(psutil.cpu_percent(interval=None))
-        cpu_load = round(sum(self._cpu_history) / len(self._cpu_history), 1)
-        if self._last_cpu_avg is None:
-            cpu_trend = '→'
-        elif cpu_load > self._last_cpu_avg + 0.5:
-            cpu_trend = '↑'
-        elif cpu_load < self._last_cpu_avg - 0.5:
-            cpu_trend = '↓'
-        else:
-            cpu_trend = '→'
-        self._last_cpu_avg = cpu_load
+        # ── CPU: instantaneous + load averages ───────────────────────────────
+        cpu_now = round(psutil.cpu_percent(interval=None), 1)
+        try:
+            load1, load5, load15 = psutil.getloadavg()
+        except AttributeError:
+            load1 = load5 = load15 = None
 
-        # ── RAM: percent + trend ──────────────────────────────────────────────
+        # ── RAM ───────────────────────────────────────────────────────────────
         vm = psutil.virtual_memory()
         ram_percent = vm.percent
-        if self._last_ram_percent is None:
-            ram_trend = '→'
-        elif ram_percent > self._last_ram_percent + 0.5:
-            ram_trend = '↑'
-        elif ram_percent < self._last_ram_percent - 0.5:
-            ram_trend = '↓'
-        else:
-            ram_trend = '→'
-        self._last_ram_percent = ram_percent
 
         # ── Disk usage + I/O rates ────────────────────────────────────────────
         now = time.time()
@@ -989,14 +971,15 @@ class WebBridge(Node):
 
         return {
             'cpu': {
-                'load':  cpu_load,
-                'trend': cpu_trend,
+                'now':    cpu_now,
+                'load1':  round(load1,  2) if load1  is not None else None,
+                'load5':  round(load5,  2) if load5  is not None else None,
+                'load15': round(load15, 2) if load15 is not None else None,
             },
             'ram': {
                 'percent':  round(ram_percent, 1),
                 'used_mb':  round(vm.used  / (1024 * 1024), 1),
                 'total_mb': round(vm.total / (1024 * 1024), 1),
-                'trend':    ram_trend,
             },
             'disk': {
                 'percent':    round(disk_usage.percent, 1),
