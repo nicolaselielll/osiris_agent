@@ -134,6 +134,7 @@ class WebBridge(Node):
         self._last_disk_io      = None
         self._last_net_io       = None
         self._last_io_time:     float | None = None
+        psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
 
         # ── Collectors ────────────────────────────────────────────────────────
         self._ros2_control = Ros2ControlCollector(
@@ -916,8 +917,12 @@ class WebBridge(Node):
     def _get_telemetry_snapshot(self) -> dict:
         # ── CPU: instantaneous + load averages ───────────────────────────────
         cpu_now = round(psutil.cpu_percent(interval=None), 1)
+        cpu_count = os.cpu_count() or 1
         try:
-            load1, load5, load15 = psutil.getloadavg()
+            _load1, _load5, _load15 = psutil.getloadavg()
+            load1  = round(_load1  / cpu_count * 100, 1)
+            load5  = round(_load5  / cpu_count * 100, 1)
+            load15 = round(_load15 / cpu_count * 100, 1)
         except AttributeError:
             load1 = load5 = load15 = None
 
@@ -972,9 +977,9 @@ class WebBridge(Node):
         return {
             'cpu': {
                 'now':    cpu_now,
-                'load1':  round(load1,  2) if load1  is not None else None,
-                'load5':  round(load5,  2) if load5  is not None else None,
-                'load15': round(load15, 2) if load15 is not None else None,
+                'load1':  load1,
+                'load5':  load5,
+                'load15': load15,
             },
             'ram': {
                 'percent':  round(ram_percent, 1),
