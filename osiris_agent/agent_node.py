@@ -207,17 +207,22 @@ class WebBridge(Node):
 
     async def _client_loop(self):
         send_task = None
+        self.get_logger().info('Connecting to gateway...')
         try:
             async with websockets.connect(self.ws_url) as ws:
                 try:
                     auth_msg = await ws.recv()
                     auth_data = json.loads(auth_msg)
                 except Exception:
+                    self.get_logger().error('Failed to receive auth response from gateway')
                     return
 
                 if not auth_data or auth_data.get('type') != 'auth_success':
+                    error_msg = auth_data.get('message', 'unknown') if auth_data else 'no response'
+                    self.get_logger().error(f'Authentication failed: {error_msg}')
                     return
 
+                self.get_logger().info('Connected and authenticated to gateway')
                 self.ws = ws
                 send_task = asyncio.create_task(self._send_loop(ws))
 
@@ -230,6 +235,8 @@ class WebBridge(Node):
                     await send_task
                 except (asyncio.CancelledError, Exception):
                     pass
+            if self.ws is not None:
+                self.get_logger().warning('Disconnected from gateway')
             self.ws = None
 
     async def _send_loop(self, ws):
