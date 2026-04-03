@@ -56,11 +56,12 @@ class WebBridge(Node):
         self.declare_parameter('graph_check_interval',     GRAPH_CHECK_INTERVAL)
         self.declare_parameter('topic_batch_size',         TOPIC_BATCH_SIZE)
         self.declare_parameter('telemetry_interval',       TELEMETRY_INTERVAL)
+        self.declare_parameter('tf_tree_enabled',          False)
 
         # WebSocket URL
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -143,11 +144,12 @@ class WebBridge(Node):
             event_callback=self._on_ros2_control_event,
             logger=self.get_logger(),
         )
+        _tf_tree_enabled = self.get_parameter('tf_tree_enabled').get_parameter_value().bool_value
         self._tf_tree = TfTreeCollector(
             node=self,
             event_callback=self._on_tf_tree_event,
             logger=self.get_logger(),
-        )
+        ) if _tf_tree_enabled else None
 
         # ── Timers ───────────────────────────────────────────────────────────
         _graph_interval = self.get_parameter('graph_check_interval').get_parameter_value().double_value
@@ -316,7 +318,7 @@ class WebBridge(Node):
                 'telemetry':   self._get_telemetry_snapshot(),
                 'controllers': self._ros2_control.get_controllers_snapshot(),
                 'hardware':    self._ros2_control.get_hardware_snapshot(),
-                'tf_tree':     self._tf_tree.get_snapshot(),
+                'tf_tree':     self._tf_tree.get_snapshot() if self._tf_tree is not None else None,
             },
         }))
 
@@ -401,7 +403,8 @@ class WebBridge(Node):
             for fqn in current_nodes:
                 self._fetch_node_parameters_async(fqn)
             self._ros2_control.poll()
-            self._tf_tree.poll(force=True)
+            if self._tf_tree is not None:
+                self._tf_tree.poll(force=True)
             self._initial_scan_complete.set()
             return
 
@@ -531,7 +534,8 @@ class WebBridge(Node):
 
         # ── 11. Poll collectors (internally rate-limited) ─────────────────────
         self._ros2_control.poll()
-        self._tf_tree.poll()
+        if self._tf_tree is not None:
+            self._tf_tree.poll()
 
     # ──────────────────────────────────────────────
     # Initial full enrichment (called once on first tick)
@@ -1258,7 +1262,8 @@ class WebBridge(Node):
 
     def destroy_node(self):
         self._ros2_control.destroy()
-        self._tf_tree.destroy()
+        if self._tf_tree is not None:
+            self._tf_tree.destroy()
         if self._bt_collector:
             self._bt_collector.stop()
         super().destroy_node()

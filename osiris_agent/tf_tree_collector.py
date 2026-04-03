@@ -152,7 +152,7 @@ class TfTreeCollector:
             import tf2_ros
             self._tf_buffer = tf2_ros.Buffer()
             self._tf_listener = tf2_ros.TransformListener(
-                self._tf_buffer, self._node
+                self._tf_buffer, self._node, spin_thread=True
             )
             return True
         except Exception as e:
