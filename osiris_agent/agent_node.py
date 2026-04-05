@@ -349,6 +349,9 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
 
     def _check_graph_changes(self):
+        if self._first_graph_check_done:
+            return  # BISECT R1: skip all polling after first tick
+
         # ── 1. Node + topic queries (always, both cheap) ──────────────────────
         _t0 = time.time()
         node_pairs      = list(self.get_node_names_and_namespaces())
