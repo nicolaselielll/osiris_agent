@@ -350,8 +350,10 @@ class WebBridge(Node):
 
     def _check_graph_changes(self):
         # ── 1. Node + topic queries (always, both cheap) ──────────────────────
+        _t0 = time.time()
         node_pairs      = list(self.get_node_names_and_namespaces())
         topic_type_list = self.get_topic_names_and_types()
+        _t1 = time.time()
 
         current_nodes   = {self._node_full_name(n, ns) for n, ns in node_pairs}
         current_topics  = {t for t, _ in topic_type_list}
@@ -360,6 +362,10 @@ class WebBridge(Node):
             for t in current_topics
             if t.endswith('/_action/status')
         }
+        self.get_logger().info(
+            f"[poll] node+topic: {(_t1-_t0)*1000:.1f}ms "
+            f"({len(current_nodes)} nodes, {len(current_topics)} topics, {len(current_actions)} actions)"
+        )
 
         # ── 1b. Service scan — throttled to SERVICE_SCAN_INTERVAL ─────────────
         # get_service_names_and_types() enumerates every service in DDS and is
@@ -380,12 +386,17 @@ class WebBridge(Node):
                 self._service_rescan_ticks = 4
             elif self._service_rescan_ticks > 0:
                 self._service_rescan_ticks -= 1
+            _ts0 = time.time()
             service_type_list = self.get_service_names_and_types()
+            _ts1 = time.time()
             current_services = {
                 s: types[0] if types else 'unknown'
                 for s, types in service_type_list
                 if not any(s.startswith(p) for p in _SUPPRESSED_SERVICE_PREFIXES)
             }
+            self.get_logger().info(
+                f"[poll] service_scan: {(_ts1-_ts0)*1000:.1f}ms ({len(current_services)} services)"
+            )
         else:
             current_services = self._active_services
 
@@ -399,18 +410,26 @@ class WebBridge(Node):
             self._active_topics   = current_topics
             self._active_services = current_services
             self._active_actions  = current_actions
+            _te0 = time.time()
             self._do_full_initial_enrichment(topic_type_list, node_pairs)
+            _te1 = time.time()
             for fqn in current_nodes:
                 self._fetch_node_parameters_async(fqn)
             self._ros2_control.poll()
             if self._tf_tree is not None:
                 self._tf_tree.poll(force=True)
             self._initial_scan_complete.set()
+            self.get_logger().info(
+                f"[poll] first tick complete: {len(current_nodes)} nodes, {len(current_topics)} topics, "
+                f"{len(current_services)} services, {len(current_actions)} actions — "
+                f"node+topic={(_t1-_t0)*1000:.1f}ms enrichment={(_te1-_te0)*1000:.1f}ms"
+            )
             return
 
         # ── 2. Node events ────────────────────────────────────────────────────
         started_nodes = current_nodes - self._active_nodes
         if started_nodes:
+            self.get_logger().info(f"[poll] {len(started_nodes)} node(s) started: {sorted(started_nodes)}")
             # New nodes may subscribe to existing topics — queue all known topics
             # for re-enrichment so their memberships are reflected accurately.
             self._pending_topic_enrichment.update(self._active_topics)
@@ -422,6 +441,8 @@ class WebBridge(Node):
             })
 
         stopped_nodes = self._active_nodes - current_nodes
+        if stopped_nodes:
+            self.get_logger().info(f"[poll] {len(stopped_nodes)} node(s) stopped: {sorted(stopped_nodes)}")
         for fqn in stopped_nodes:
             # Re-enrich every topic this node was involved in so stale
             # publisher/subscriber entries are removed from the relations cache.
@@ -583,8 +604,14 @@ class WebBridge(Node):
         if not self._pending_topic_enrichment:
             return
 
+        _pending_before = len(self._pending_topic_enrichment)
+        _t0 = time.time()
         batch = set(list(self._pending_topic_enrichment)[:self._topic_batch_size])
         self._pending_topic_enrichment -= batch
+        self.get_logger().info(
+            f"[enrich] batch={len(batch)}, pending_before={_pending_before}, "
+            f"remaining={len(self._pending_topic_enrichment)}"
+        )
 
         # Reuse the already-fetched type list from Tier-1 when available,
         # avoiding a redundant global DDS query.
@@ -647,6 +674,8 @@ class WebBridge(Node):
                             })
                     elif old_pubs and not publishers:
                         self._on_nav2_bt_gone()
+
+        self.get_logger().info(f"[enrich] done in {(time.time()-_t0)*1000:.1f}ms")
 
     # ──────────────────────────────────────────────
     # Graph snapshot builders
@@ -741,9 +770,11 @@ class WebBridge(Node):
         if not self._graph_dirty or not self.ws or not self.loop:
             return
         self._graph_dirty = False
+        self.get_logger().debug("[flush] graph dirty, checking snapshots")
 
         nodes = self._get_nodes_with_relations()
         if nodes != self._last_sent_nodes:
+            self.get_logger().info(f"[flush] nodes changed ({len(nodes)} nodes)")
             self._last_sent_nodes = nodes.copy()
             self._enqueue({
                 'type': 'nodes', 'data': nodes, 'timestamp': time.time(),
@@ -751,6 +782,7 @@ class WebBridge(Node):
 
         topics = self._get_topics_with_relations()
         if topics != self._last_sent_topics:
+            self.get_logger().info(f"[flush] topics changed ({len(topics)} topics)")
             self._last_sent_topics = topics.copy()
             self._enqueue({
                 'type': 'topics', 'data': topics, 'timestamp': time.time(),
@@ -758,6 +790,7 @@ class WebBridge(Node):
 
         actions = self._get_actions_with_relations()
         if actions != self._last_sent_actions:
+            self.get_logger().info(f"[flush] actions changed ({len(actions)} actions)")
             self._last_sent_actions = actions.copy()
             self._enqueue({
                 'type': 'actions', 'data': actions, 'timestamp': time.time(),
@@ -765,6 +798,7 @@ class WebBridge(Node):
 
         services = self._get_services_with_relations()
         if services != self._last_sent_services:
+            self.get_logger().info(f"[flush] services changed ({len(services)} services)")
             self._last_sent_services = services.copy()
             self._enqueue({
                 'type': 'services', 'data': services, 'timestamp': time.time(),
@@ -862,7 +896,7 @@ class WebBridge(Node):
 
     def _refresh_empty_param_caches(self):
         """Retry parameter fetch for nodes that don't have cached params yet."""
-        for fqn in list(self._active_nodes):
+        for fqn in self._active_nodes:
             if not self._node_parameter_cache.get(fqn):
                 self._fetch_node_parameters_async(fqn)
 
@@ -912,6 +946,7 @@ class WebBridge(Node):
                         pass
                 self._node_parameter_cache[fqn] = params
                 self._graph_dirty = True
+                self.get_logger().debug(f"[params] cached {len(params)} params for {fqn}")
 
             get_future.add_done_callback(_on_get)
 
@@ -1182,6 +1217,7 @@ class WebBridge(Node):
                 has_running = True
 
         if has_running and not self._nav2_bt_session_active:
+            self.get_logger().info("[bt] navigation session started")
             self._nav2_bt_session_active = True
             self._on_bt_event({
                 'type': 'bt_tree', 'timestamp': time.time(),
@@ -1203,6 +1239,7 @@ class WebBridge(Node):
     def _on_nav2_goal_status(self, msg):
         has_active = any(s.status in (1, 2, 3) for s in msg.status_list)
         if self._nav2_bt_session_active and not has_active:
+            self.get_logger().info("[bt] navigation session ended")
             self._nav2_bt_session_active = False
             self._nav2_bt_statuses.clear()
             if self._nav2_bt_tree_id:
