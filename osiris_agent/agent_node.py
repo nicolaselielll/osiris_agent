@@ -74,6 +74,11 @@ class WebBridge(Node):
         self._topic_rate_history: dict[str, deque] = {}
         self._rate_history_depth = 8
 
+        # ── Lifecycle subscriptions (auto-detected) ───────────────────────────
+        self._lifecycle_subs: dict[str, rclpy.subscription.Subscription] = {}  # topic → sub
+        self._lifecycle_state_cache: dict[str, str] = {}   # node_fqn → state label
+        self._pending_lifecycle_fetches: set[str] = set()  # node_fqns with in-flight get_state calls
+
         # ── Existence caches (set of fully-qualified names) ───────────────────
         # Populated on first tick — NOT pre-populated here to avoid any DDS calls
         # during __init__ (which would contend Nav2's controller loop).
@@ -158,6 +163,8 @@ class WebBridge(Node):
         self.create_timer(_graph_interval,          self._check_graph_changes)
         self.create_timer(_telemetry_interval,       self._collect_telemetry)
         self.create_timer(PARAMETER_REFRESH_INTERVAL, self._refresh_empty_param_caches)
+        self.create_timer(5.0,                        self._retry_lifecycle_state_fetches)
+        self.create_timer(2.0,                        self._periodic_flush_graph)
 
         self._topic_batch_size = self.get_parameter('topic_batch_size').get_parameter_value().integer_value
 
@@ -418,6 +425,11 @@ class WebBridge(Node):
             _te1 = time.time()
             for fqn in current_nodes:
                 self._fetch_node_parameters_async(fqn)
+            for t in current_topics:
+                if t.endswith('/transition_event'):
+                    self._subscribe_lifecycle_topic(t)
+                    node_fqn = t[:-len('/transition_event')]
+                    self._fetch_lifecycle_state_async(node_fqn)
             self._ros2_control.poll()
             if self._tf_tree is not None:
                 self._tf_tree.poll(force=True)
@@ -467,6 +479,8 @@ class WebBridge(Node):
                 'type': 'topic_event', 'topic': t,
                 'event': 'created', 'timestamp': time.time(),
             })
+            if t.endswith('/transition_event'):
+                self._subscribe_lifecycle_topic(t)
             # Nav2 BT edge-case: /behavior_tree_log just appeared
             if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
                 if self.count_publishers(t) > 0:
@@ -487,6 +501,10 @@ class WebBridge(Node):
                 'type': 'topic_event', 'topic': t,
                 'event': 'destroyed', 'timestamp': time.time(),
             })
+            if t.endswith('/transition_event'):
+                lc_sub = self._lifecycle_subs.pop(t, None)
+                if lc_sub:
+                    self.destroy_subscription(lc_sub)
             if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
                 self._on_nav2_bt_gone()
 
@@ -693,6 +711,7 @@ class WebBridge(Node):
                 'actions':    [],
                 'services':   [],
                 'parameters': self._node_parameter_cache.get(fqn, {}),
+                'lifecycle_state': self._lifecycle_state_cache.get(fqn, None),
             }
 
         # Derive pub/sub per node from cached topic relations (zero DDS calls)
@@ -855,6 +874,89 @@ class WebBridge(Node):
                 asyncio.run_coroutine_threadsafe(
                     self._send_bridge_subscriptions(), self.loop
                 )
+
+    # ──────────────────────────────────────────────
+    # Lifecycle subscriptions (auto-detected managed nodes)
+    # ──────────────────────────────────────────────
+
+    def _subscribe_lifecycle_topic(self, topic: str):
+        """Subscribe to a /<node>/transition_event topic for a lifecycle-managed node."""
+        if topic in self._lifecycle_subs:
+            return
+        try:
+            from lifecycle_msgs.msg import TransitionEvent
+            node_fqn = topic[:-len('/transition_event')]
+            sub = self.create_subscription(
+                TransitionEvent,
+                topic,
+                lambda msg, n=node_fqn: self._on_lifecycle_transition(msg, n),
+                QoSProfile(depth=10),
+            )
+            self._lifecycle_subs[topic] = sub
+            self.get_logger().info(f'[lifecycle] subscribed to {topic}')
+        except Exception as e:
+            self.get_logger().debug(f'[lifecycle] could not subscribe to {topic}: {e}')
+
+    def _periodic_flush_graph(self):
+        """Periodically flush batched graph changes (lifecycle state, params, etc)."""
+        self._flush_graph_snapshots()
+
+    def _retry_lifecycle_state_fetches(self):
+        """Retry get_state queries for lifecycle nodes that haven't responded yet."""
+        if not self._first_graph_check_done:
+            return
+        for topic in list(self._lifecycle_subs):
+            node_fqn = topic[:-len('/transition_event')]
+            if node_fqn not in self._lifecycle_state_cache and node_fqn not in self._pending_lifecycle_fetches:
+                self._fetch_lifecycle_state_async(node_fqn)
+
+    def _fetch_lifecycle_state_async(self, node_fqn: str):
+        """Query /<node>/get_state service to populate lifecycle_state_cache."""
+        if node_fqn in self._lifecycle_state_cache:
+            return  # already known (populated by transition event or previous fetch)
+        if node_fqn in self._pending_lifecycle_fetches:
+            return  # call already in flight
+        try:
+            from lifecycle_msgs.srv import GetState
+        except ImportError:
+            return
+        client = self.create_client(GetState, f'{node_fqn}/get_state')
+        if not client.service_is_ready():
+            self.destroy_client(client)
+            return  # _retry_lifecycle_state_fetches will retry at next 5s tick
+        self._pending_lifecycle_fetches.add(node_fqn)
+        future = client.call_async(GetState.Request())
+
+        def _on_get_state(fut):
+            self._pending_lifecycle_fetches.discard(node_fqn)
+            self.destroy_client(client)
+            try:
+                resp = fut.result()
+                if resp is not None:
+                    self._lifecycle_state_cache[node_fqn] = resp.current_state.label
+                    self._graph_dirty = True  # Batched flush via _periodic_flush_graph timer
+                    self.get_logger().debug(
+                        f'[lifecycle] initial state for {node_fqn}: {resp.current_state.label}'
+                    )
+            except Exception as e:
+                self.get_logger().debug(f'[lifecycle] get_state failed for {node_fqn}: {e}')
+
+        future.add_done_callback(_on_get_state)
+
+    def _on_lifecycle_transition(self, msg, node_fqn: str):
+        self._lifecycle_state_cache[node_fqn] = msg.goal_state.label
+        self.get_logger().info(
+            f'[lifecycle] {node_fqn}: {msg.start_state.label} \u2192 {msg.goal_state.label} '
+            f'(transition: {msg.transition.label})'
+        )
+        self._send_event_and_update({
+            'type': 'lifecycle_event',
+            'node': node_fqn,
+            'transition': msg.transition.label,
+            'from_state': msg.start_state.label,
+            'to_state': msg.goal_state.label,
+            'timestamp': time.time(),
+        })
 
     def _on_topic_msg(self, msg, topic_name: str):
         if not self.ws or not self.loop:
