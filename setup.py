@@ -34,7 +34,7 @@ setup(
     },
     entry_points={
         'console_scripts': [
-            'osiris_node = osiris_agent.agent_node:main',
+            'osiris = osiris_agent.agent_node:main',
         ],
     },
 )
