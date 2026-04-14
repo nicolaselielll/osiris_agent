@@ -60,8 +60,8 @@ class WebBridge(Node):
 
         # WebSocket URL
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -1058,6 +1058,7 @@ class WebBridge(Node):
         future.add_done_callback(_on_list)
 
     def _collect_telemetry(self):
+        return  # BISECT R4a: disable telemetry
         if not self._telemetry_enabled or not self.ws or not self.loop:
             return
         self._enqueue({
@@ -1302,6 +1303,7 @@ class WebBridge(Node):
             return False
 
     def _on_nav2_bt_log(self, msg):
+        return  # BISECT R4b: disable BT log forwarding
         if not self._nav2_bt_publisher_active:
             return
         if not self._load_and_parse_bt_xml():
