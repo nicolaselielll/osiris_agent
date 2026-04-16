@@ -1,6 +1,6 @@
 """osiris_agent package initializer."""
 
-__version__ = '0.3.73'
+__version__ = '0.3.74'
 
 __all__ = [
     "agent_node",
