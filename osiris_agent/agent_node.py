@@ -1213,6 +1213,7 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
 
     def _init_nav2_bt_monitor(self):
+        return  # BT monitoring completely disabled — no subscriptions created
         try:
             from nav2_msgs.msg import BehaviorTreeLog
             from action_msgs.msg import GoalStatusArray
