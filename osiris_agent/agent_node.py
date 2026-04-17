@@ -29,8 +29,8 @@ class WebBridge(Node):
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
