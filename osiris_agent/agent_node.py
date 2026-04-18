@@ -8,7 +8,9 @@ import rclpy
 import websockets
 import json
 
+from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
+from rclpy.parameter import parameter_value_to_python
 
 from osiris_agent import __version__ as AGENT_VERSION
 
@@ -54,6 +56,11 @@ class WebBridge(Node):
         # ── Relation caches (populated by enrichment) ─────────────────────────
         self._topic_relations: dict[str, dict] = {}
 
+        # ── Parameters (lazy-loaded, async) ──────────────────────────────────
+        self._node_parameter_cache: dict[str, dict] = {}
+        self._pending_param_fetches: set[str] = set()
+        self._graph_dirty = False
+
         # ── First-tick gate ───────────────────────────────────────────────────
         self._first_graph_check_done = False
 
@@ -65,7 +72,7 @@ class WebBridge(Node):
         threading.Thread(target=self._run_ws_client, daemon=True).start()
 
         self.get_logger().info(
-            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4a: first-tick scan enabled"
+            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4b: first-tick scan + param fetch enabled"
         )
 
     # ──────────────────────────────────────────────
@@ -206,6 +213,8 @@ class WebBridge(Node):
         _te0 = time.time()
         self._do_full_initial_enrichment(topic_type_list, node_pairs)
         _te1 = time.time()
+        for fqn in current_nodes:
+            self._fetch_node_parameters_async(fqn)
         self.get_logger().info(
             f"[poll] first tick complete: {len(current_nodes)} nodes, {len(current_topics)} topics, "
             f"{len(current_services)} services, {len(current_actions)} actions — "
@@ -233,6 +242,68 @@ class WebBridge(Node):
                 'subscriber_infos': sub_infos,
                 'type': topic_type_map.get(topic, ['unknown'])[0],
             }
+
+    # ──────────────────────────────────────────────
+    # Parameters (async, lazy-loaded)
+    # ──────────────────────────────────────────────
+
+    def _refresh_empty_param_caches(self):
+        """Retry parameter fetch for nodes that don't have cached params yet."""
+        for fqn in self._active_nodes:
+            if not self._node_parameter_cache.get(fqn):
+                self._fetch_node_parameters_async(fqn)
+
+    def _fetch_node_parameters_async(self, fqn: str):
+        """Fetch parameters for *fqn* without blocking the executor.
+
+        Creates service clients, fires async calls, and stores results in
+        _node_parameter_cache when callbacks fire.  Safe to call from any
+        timer or graph-change callback.
+        """
+        if fqn in self._pending_param_fetches:
+            return
+
+        list_client = self.create_client(ListParameters, f"{fqn}/list_parameters")
+        if not list_client.service_is_ready():
+            self.destroy_client(list_client)
+            return
+
+        self._pending_param_fetches.add(fqn)
+        req = ListParameters.Request()
+        req.depth = 10
+        future = list_client.call_async(req)
+
+        def _on_list(fut):
+            self.destroy_client(list_client)
+            response = fut.result()
+            if response is None or not response.result.names:
+                self._pending_param_fetches.discard(fqn)
+                return
+            param_names = list(response.result.names)
+            get_client = self.create_client(GetParameters, f"{fqn}/get_parameters")
+            get_req = GetParameters.Request()
+            get_req.names = param_names
+            get_future = get_client.call_async(get_req)
+
+            def _on_get(gfut):
+                self.destroy_client(get_client)
+                self._pending_param_fetches.discard(fqn)
+                get_resp = gfut.result()
+                if get_resp is None:
+                    return
+                params = {}
+                for name, value in zip(param_names, get_resp.values):
+                    try:
+                        params[name] = parameter_value_to_python(value)
+                    except Exception:
+                        pass
+                self._node_parameter_cache[fqn] = params
+                self._graph_dirty = True
+                self.get_logger().debug(f"[params] cached {len(params)} params for {fqn}")
+
+            get_future.add_done_callback(_on_get)
+
+        future.add_done_callback(_on_list)
 
     # ──────────────────────────────────────────────
     # Helpers
