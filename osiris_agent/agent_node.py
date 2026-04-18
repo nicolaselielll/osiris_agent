@@ -15,8 +15,13 @@ from osiris_agent import __version__ as AGENT_VERSION
 # ──────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────
+GRAPH_CHECK_INTERVAL    = 2.0   # seconds between graph polls
+TOPIC_BATCH_SIZE        = 10    # max topics enriched per tick
 RECONNECT_INITIAL_DELAY = 1     # seconds
 RECONNECT_MAX_DELAY     = 30    # seconds
+
+# Services to suppress from graph output (internal ROS2 plumbing)
+_SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
 
 
 class WebBridge(Node):
@@ -32,14 +37,35 @@ class WebBridge(Node):
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
         # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
+        # Declare tunable parameters
+        self.declare_parameter('graph_check_interval', GRAPH_CHECK_INTERVAL)
+        self.declare_parameter('topic_batch_size',     TOPIC_BATCH_SIZE)
+
         self.ws   = None
         self.loop = None
         self._send_queue: asyncio.Queue | None = None
 
+        # ── Existence caches (set of fully-qualified names) ───────────────────
+        self._active_nodes:    set[str] = set()
+        self._active_topics:   set[str] = set()
+        self._active_services: dict[str, str] = {}
+        self._active_actions:  set[str] = set()
+
+        # ── Relation caches (populated by enrichment) ─────────────────────────
+        self._topic_relations: dict[str, dict] = {}
+
+        # ── First-tick gate ───────────────────────────────────────────────────
+        self._first_graph_check_done = False
+
+        # ── Timers ────────────────────────────────────────────────────────────
+        _graph_interval = self.get_parameter('graph_check_interval').get_parameter_value().double_value
+        self._topic_batch_size = self.get_parameter('topic_batch_size').get_parameter_value().integer_value
+        self.create_timer(_graph_interval, self._check_graph_changes)
+
         threading.Thread(target=self._run_ws_client, daemon=True).start()
 
         self.get_logger().info(
-            f"🚀 Osiris agent v{AGENT_VERSION} — bisect: minimal WS-only mode"
+            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4a: first-tick scan enabled"
         )
 
     # ──────────────────────────────────────────────
@@ -134,6 +160,88 @@ class WebBridge(Node):
             },
         }))
         self.get_logger().info("Sent initial_state (empty — bisect mode)")
+
+    # ──────────────────────────────────────────────
+    # Tier-1: cheap existence detection
+    # ──────────────────────────────────────────────
+
+    def _check_graph_changes(self):
+        if self._first_graph_check_done:
+            return  # BISECT R1: skip all polling after first tick
+
+        _t0 = time.time()
+        node_pairs      = list(self.get_node_names_and_namespaces())
+        topic_type_list = self.get_topic_names_and_types()
+        _t1 = time.time()
+
+        current_nodes   = {self._node_full_name(n, ns) for n, ns in node_pairs}
+        current_topics  = {t for t, _ in topic_type_list}
+        current_actions = {
+            t.replace('/_action/status', '')
+            for t in current_topics
+            if t.endswith('/_action/status')
+        }
+        self.get_logger().info(
+            f"[poll] node+topic: {(_t1-_t0)*1000:.1f}ms "
+            f"({len(current_nodes)} nodes, {len(current_topics)} topics, {len(current_actions)} actions)"
+        )
+
+        _ts0 = time.time()
+        service_type_list = self.get_service_names_and_types()
+        _ts1 = time.time()
+        current_services = {
+            s: types[0] if types else 'unknown'
+            for s, types in service_type_list
+            if not any(s.startswith(p) for p in _SUPPRESSED_SERVICE_PREFIXES)
+        }
+        self.get_logger().info(
+            f"[poll] service_scan: {(_ts1-_ts0)*1000:.1f}ms ({len(current_services)} services)"
+        )
+
+        self._first_graph_check_done = True
+        self._active_nodes    = current_nodes
+        self._active_topics   = current_topics
+        self._active_services = current_services
+        self._active_actions  = current_actions
+        _te0 = time.time()
+        self._do_full_initial_enrichment(topic_type_list, node_pairs)
+        _te1 = time.time()
+        self.get_logger().info(
+            f"[poll] first tick complete: {len(current_nodes)} nodes, {len(current_topics)} topics, "
+            f"{len(current_services)} services, {len(current_actions)} actions — "
+            f"node+topic={(_t1-_t0)*1000:.1f}ms enrichment={(_te1-_te0)*1000:.1f}ms"
+        )
+
+    # ──────────────────────────────────────────────
+    # Initial full enrichment (called once on first tick)
+    # ──────────────────────────────────────────────
+
+    def _do_full_initial_enrichment(self, topic_type_list, node_pairs):
+        topic_type_map = dict(topic_type_list)
+        for topic in self._active_topics:
+            try:
+                pub_infos = self.get_publishers_info_by_topic(topic)
+                sub_infos = self.get_subscriptions_info_by_topic(topic)
+            except Exception:
+                continue
+            publishers  = {self._node_full_name(p.node_name, p.node_namespace) for p in pub_infos}
+            subscribers = {self._node_full_name(s.node_name, s.node_namespace) for s in sub_infos}
+            self._topic_relations[topic] = {
+                'publishers':       publishers,
+                'subscribers':      subscribers,
+                'publisher_infos':  pub_infos,
+                'subscriber_infos': sub_infos,
+                'type': topic_type_map.get(topic, ['unknown'])[0],
+            }
+
+    # ──────────────────────────────────────────────
+    # Helpers
+    # ──────────────────────────────────────────────
+
+    @staticmethod
+    def _node_full_name(name: str, namespace: str) -> str:
+        ns = namespace if namespace.endswith('/') else namespace + '/'
+        return ns + name
 
     # ──────────────────────────────────────────────
     # Cleanup
