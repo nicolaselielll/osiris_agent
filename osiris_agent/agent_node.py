@@ -18,6 +18,7 @@ from rosidl_runtime_py import message_to_ordereddict
 from rosidl_runtime_py.utilities import get_message
 
 from osiris_agent import __version__ as AGENT_VERSION
+from .bt_collector import BTCollector
 from .ros2_control_collector import Ros2ControlCollector
 from .tf_tree_collector import TfTreeCollector
 
@@ -102,6 +103,9 @@ class WebBridge(Node):
         self._first_graph_check_done = False
         self._param_flush_pending = False
 
+        # ── BT state ─────────────────────────────────────────────────────────
+        self._cached_bt_tree_event: dict | None = None
+
         # ── Telemetry ─────────────────────────────────────────────────────────
         self._telemetry_enabled = True
         self._last_disk_io      = None
@@ -124,17 +128,34 @@ class WebBridge(Node):
         ) if _tf_tree_enabled else None
 
         # ── Timers ────────────────────────────────────────────────────────────
-        _graph_interval = self.get_parameter('graph_check_interval').get_parameter_value().double_value
+        _graph_interval     = self.get_parameter('graph_check_interval').get_parameter_value().double_value
+        _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
         self._topic_batch_size = self.get_parameter('topic_batch_size').get_parameter_value().integer_value
-        self.create_timer(_graph_interval, self._check_graph_changes)
-        # NOTE: _collect_telemetry and _refresh_empty_param_caches timers are
-        # NOT wired yet — held for bisect step 4e (enable polling).
+
+        self.create_timer(_graph_interval,            self._check_graph_changes)
+        self.create_timer(_telemetry_interval,         self._collect_telemetry)
+        self.create_timer(PARAMETER_REFRESH_INTERVAL,  self._refresh_empty_param_caches)
 
         # ── WebSocket thread ──────────────────────────────────────────────────
         threading.Thread(target=self._run_ws_client, daemon=True).start()
 
+        # ── Optional BT collectors ────────────────────────────────────────────
+        bt_enabled = os.environ.get(
+            'OSIRIS_BT_COLLECTOR_ENABLED', ''
+        ).lower() in ('true', '1', 'yes')
+        if bt_enabled:
+            self._bt_collector = BTCollector(
+                event_callback=self._on_bt_event,
+                logger=self.get_logger(),
+            )
+            self._bt_collector.start()
+        else:
+            self._bt_collector = None
+
+        self._init_nav2_bt_monitor()
+
         self.get_logger().info(
-            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4c: state hydration + collectors (inert)"
+            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4d: BT + timers (R1 still active)"
         )
 
     # ──────────────────────────────────────────────
@@ -268,6 +289,12 @@ class WebBridge(Node):
                 'tf_tree':     self._tf_tree.get_snapshot() if self._tf_tree is not None else None,
             },
         }))
+
+        await self._send_queue.put(json.dumps(self._build_startup_bt_state_event()))
+
+        if self._cached_bt_tree_event:
+            await self._send_queue.put(json.dumps(self._cached_bt_tree_event))
+            self._cached_bt_tree_event = None
 
         await self._send_bridge_subscriptions()
 
@@ -851,6 +878,202 @@ class WebBridge(Node):
     def _on_tf_tree_event(self, event: dict):
         self._enqueue(event)
 
+    def _on_bt_event(self, event: dict):
+        if event.get('type') == 'bt_tree':
+            self._cached_bt_tree_event = event if event.get('tree_id') else None
+        self._enqueue(event)
+
+    # ──────────────────────────────────────────────
+    # Nav2 BT monitoring
+    # ──────────────────────────────────────────────
+
+    def _init_nav2_bt_monitor(self):
+        try:
+            from nav2_msgs.msg import BehaviorTreeLog
+            from action_msgs.msg import GoalStatusArray
+            self._nav2_bt_statuses:        dict[str, str] = {}
+            self._nav2_bt_session_active   = False
+            self._nav2_bt_publisher_active = False
+            self._nav2_bt_tree_id          = None
+            self._nav2_bt_tree_structure   = None
+            self._nav2_bt_nodes_list:      list = []
+            self._nav2_bt_name_to_uid:     dict = {}
+            self.create_subscription(
+                BehaviorTreeLog, '/behavior_tree_log', self._on_nav2_bt_log, 10
+            )
+            self.create_subscription(
+                GoalStatusArray,
+                '/navigate_to_pose/_action/status',
+                self._on_nav2_goal_status,
+                10,
+            )
+            # If bt_navigator is already publishing, pre-parse the XML so
+            # the startup bt_state event includes the tree structure.
+            if self.count_publishers('/behavior_tree_log') > 0:
+                self._nav2_bt_publisher_active = True
+                self._load_and_parse_bt_xml()
+        except Exception as e:
+            self.get_logger().debug(f"Nav2 BT monitoring unavailable: {e}")
+
+    def _load_and_parse_bt_xml(self) -> bool:
+        if self._nav2_bt_tree_id is not None:
+            return True
+        import hashlib
+        import xml.etree.ElementTree as ET
+
+        xml_path = self._node_parameter_cache.get('/bt_navigator', {}).get(
+            'default_nav_to_pose_bt_xml', ''
+        )
+        if not xml_path:
+            try:
+                from ament_index_python.packages import get_package_share_directory
+                nav2_share = get_package_share_directory('nav2_bt_navigator')
+                xml_path = os.path.join(
+                    nav2_share, 'behavior_trees',
+                    'navigate_to_pose_w_replanning_and_recovery.xml',
+                )
+            except Exception:
+                return False
+
+        try:
+            with open(xml_path) as f:
+                xml_content = f.read()
+        except Exception as e:
+            self.get_logger().error(f"Cannot read BT XML '{xml_path}': {e}")
+            return False
+
+        try:
+            root_elem = ET.fromstring(xml_content)
+            bt_elem = root_elem.find('.//BehaviorTree')
+            if bt_elem is None:
+                return False
+
+            nodes_list: list = []
+            name_to_uid: dict = {}
+            uid_counter = [1]
+
+            def elem_to_node(elem):
+                name = elem.attrib.get('name', elem.attrib.get('ID', elem.tag))
+                uid = uid_counter[0]; uid_counter[0] += 1
+                name_to_uid[name] = uid
+                nodes_list.append({'uid': uid, 'name': name, 'tag': elem.tag})
+                node = {
+                    'tag': elem.tag, 'name': name, 'uid': uid,
+                    'attributes': dict(elem.attrib),
+                }
+                kids = [elem_to_node(c) for c in elem]
+                if kids:
+                    node['children'] = kids
+                return node
+
+            bt_children = list(bt_elem)
+            tree_structure = elem_to_node(bt_children[0]) if bt_children else {}
+            self._nav2_bt_tree_structure = tree_structure
+            self._nav2_bt_nodes_list     = nodes_list
+            self._nav2_bt_name_to_uid    = name_to_uid
+            self._nav2_bt_tree_id = hashlib.sha1(xml_content.encode()).hexdigest()[:16]
+            return True
+        except Exception as e:
+            self.get_logger().error(f"Failed to parse BT XML: {e}")
+            return False
+
+    def _on_nav2_bt_log(self, msg):
+        if not self._nav2_bt_publisher_active:
+            return
+        if not self._load_and_parse_bt_xml():
+            return
+
+        changes = []
+        has_running = False
+        for change in msg.event_log:
+            self._nav2_bt_statuses[change.node_name] = change.current_status
+            uid = self._nav2_bt_name_to_uid.get(change.node_name)
+            if uid is not None:
+                changes.append({
+                    'uid': uid, 'name': change.node_name,
+                    'tag': '', 'status': change.current_status,
+                    'previous_status': change.previous_status,
+                })
+            if change.current_status == 'RUNNING':
+                has_running = True
+
+        if has_running and not self._nav2_bt_session_active:
+            self.get_logger().info("[bt] navigation session started")
+            self._nav2_bt_session_active = True
+            self._on_bt_event({
+                'type': 'bt_tree', 'timestamp': time.time(),
+                'tree_id': self._nav2_bt_tree_id,
+                'tree': self._nav2_bt_tree_structure,
+                'nodes': [
+                    {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
+                    for nd in self._nav2_bt_nodes_list
+                ],
+            })
+
+        if changes:
+            self._on_bt_event({
+                'type': 'bt_status', 'timestamp': time.time(),
+                'tree_id': self._nav2_bt_tree_id,
+                'changes': changes,
+            })
+
+    def _on_nav2_goal_status(self, msg):
+        has_active = any(s.status in (1, 2, 3) for s in msg.status_list)
+        if self._nav2_bt_session_active and not has_active:
+            self.get_logger().info("[bt] navigation session ended")
+            self._nav2_bt_session_active = False
+            self._nav2_bt_statuses.clear()
+            if self._nav2_bt_tree_id:
+                self._on_bt_event({
+                    'type': 'bt_tree', 'timestamp': time.time(),
+                    'tree_id': self._nav2_bt_tree_id,
+                    'tree': self._nav2_bt_tree_structure,
+                    'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                })
+
+    def _on_nav2_bt_gone(self):
+        if self._nav2_bt_tree_id is None and not self._nav2_bt_publisher_active:
+            return
+        self.get_logger().info("Nav2 BT gone — clearing BT state")
+        self._nav2_bt_publisher_active = False
+        self._nav2_bt_session_active   = False
+        self._nav2_bt_statuses.clear()
+        self._nav2_bt_tree_id          = None
+        self._nav2_bt_tree_structure   = None
+        self._nav2_bt_nodes_list       = []
+        self._nav2_bt_name_to_uid      = {}
+        self._on_bt_event({
+            'type': 'bt_tree', 'timestamp': time.time(),
+            'tree_id': None, 'tree': None, 'nodes': [],
+        })
+
+    def _build_startup_bt_state_event(self) -> dict:
+        src = self._cached_bt_tree_event
+        if src:
+            return {
+                'type': 'bt_state', 'timestamp': src.get('timestamp', time.time()),
+                'tree_id': src.get('tree_id'), 'tree': src.get('tree'),
+                'nodes': src.get('nodes', []),
+            }
+        if (
+            hasattr(self, '_nav2_bt_tree_id')
+            and self._nav2_bt_tree_id
+            and self._nav2_bt_tree_structure
+        ):
+            return {
+                'type': 'bt_state', 'timestamp': time.time(),
+                'tree_id': self._nav2_bt_tree_id,
+                'tree': self._nav2_bt_tree_structure,
+                'nodes': [
+                    {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
+                    for nd in self._nav2_bt_nodes_list
+                ],
+            }
+        return {
+            'type': 'bt_state', 'timestamp': time.time(),
+            'tree_id': None, 'tree': None, 'nodes': [],
+        }
+
     # ──────────────────────────────────────────────
     # Cleanup
     # ──────────────────────────────────────────────
@@ -859,6 +1082,8 @@ class WebBridge(Node):
         self._ros2_control.destroy()
         if self._tf_tree is not None:
             self._tf_tree.destroy()
+        if self._bt_collector:
+            self._bt_collector.stop()
         super().destroy_node()
 
 
