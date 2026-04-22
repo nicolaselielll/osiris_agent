@@ -100,6 +100,7 @@ class WebBridge(Node):
         # ── Initial scan synchronization ──────────────────────────────────────
         self._initial_scan_complete = threading.Event()
         self._first_graph_check_done = False
+        self._param_flush_pending = False
 
         # ── Telemetry ─────────────────────────────────────────────────────────
         self._telemetry_enabled = True
@@ -636,6 +637,17 @@ class WebBridge(Node):
     # Parameters (async, lazy-loaded)
     # ──────────────────────────────────────────────
 
+    def _schedule_param_flush(self):
+        """Debounced flush: coalesces rapid param callbacks into a single nodes event."""
+        if self._param_flush_pending or not self.loop:
+            return
+        self._param_flush_pending = True
+        async def _do_flush():
+            await asyncio.sleep(0.5)
+            self._param_flush_pending = False
+            self._flush_graph_snapshots()
+        asyncio.run_coroutine_threadsafe(_do_flush(), self.loop)
+
     def _refresh_empty_param_caches(self):
         """Retry parameter fetch for nodes that don't have cached params yet."""
         for fqn in self._active_nodes:
@@ -689,7 +701,7 @@ class WebBridge(Node):
                 self._node_parameter_cache[fqn] = params
                 self._graph_dirty = True
                 self.get_logger().debug(f"[params] cached {len(params)} params for {fqn}")
-                self._flush_graph_snapshots()
+                self._schedule_param_flush()
 
             get_future.add_done_callback(_on_get)
 
