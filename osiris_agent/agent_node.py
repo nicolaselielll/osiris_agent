@@ -101,8 +101,6 @@ class WebBridge(Node):
         # ── Initial scan synchronization ──────────────────────────────────────
         self._initial_scan_complete = threading.Event()
         self._first_graph_check_done = False
-        self._param_flush_pending = False
-
         # ── BT state ─────────────────────────────────────────────────────────
         self._cached_bt_tree_event: dict | None = None
 
@@ -155,7 +153,7 @@ class WebBridge(Node):
         self._init_nav2_bt_monitor()
 
         self.get_logger().info(
-            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4d: BT + timers (R1 still active)"
+            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4e: full recurring poll (R1 removed)"
         )
 
     # ──────────────────────────────────────────────
@@ -317,9 +315,7 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
 
     def _check_graph_changes(self):
-        if self._first_graph_check_done:
-            return  # BISECT R1: skip all polling after first tick
-
+        # ── 1. Node + topic queries (always, both cheap) ──────────────────────
         _t0 = time.time()
         node_pairs      = list(self.get_node_names_and_namespaces())
         topic_type_list = self.get_topic_names_and_types()
@@ -337,37 +333,183 @@ class WebBridge(Node):
             f"({len(current_nodes)} nodes, {len(current_topics)} topics, {len(current_actions)} actions)"
         )
 
-        _ts0 = time.time()
-        service_type_list = self.get_service_names_and_types()
-        _ts1 = time.time()
-        current_services = {
-            s: types[0] if types else 'unknown'
-            for s, types in service_type_list
-            if not any(s.startswith(p) for p in _SUPPRESSED_SERVICE_PREFIXES)
-        }
-        self.get_logger().info(
-            f"[poll] service_scan: {(_ts1-_ts0)*1000:.1f}ms ({len(current_services)} services)"
+        # ── 1b. Service scan — throttled to SERVICE_SCAN_INTERVAL ─────────────
+        _now = time.time()
+        _nodes_stopped = self._first_graph_check_done and bool(self._active_nodes - current_nodes)
+        _do_service_scan = (
+            not self._first_graph_check_done
+            or _nodes_stopped
+            or self._service_rescan_ticks > 0
+            or (_now - self._last_service_scan) >= SERVICE_SCAN_INTERVAL
         )
+        if _do_service_scan:
+            self._last_service_scan = _now
+            if _nodes_stopped:
+                # Schedule follow-up scans to catch DDS endpoint lag.
+                self._service_rescan_ticks = 4
+            elif self._service_rescan_ticks > 0:
+                self._service_rescan_ticks -= 1
+            _ts0 = time.time()
+            service_type_list = self.get_service_names_and_types()
+            _ts1 = time.time()
+            current_services = {
+                s: types[0] if types else 'unknown'
+                for s, types in service_type_list
+                if not any(s.startswith(p) for p in _SUPPRESSED_SERVICE_PREFIXES)
+            }
+            self.get_logger().info(
+                f"[poll] service_scan: {(_ts1-_ts0)*1000:.1f}ms ({len(current_services)} services)"
+            )
+        else:
+            current_services = self._active_services
 
-        self._first_graph_check_done = True
+        # ── FIRST TICK: silently populate caches, no events ───────────────────
+        if not self._first_graph_check_done:
+            self._first_graph_check_done = True
+            self._active_nodes    = current_nodes
+            self._active_topics   = current_topics
+            self._active_services = current_services
+            self._active_actions  = current_actions
+            _te0 = time.time()
+            self._do_full_initial_enrichment(topic_type_list, node_pairs)
+            _te1 = time.time()
+            for fqn in current_nodes:
+                self._fetch_node_parameters_async(fqn)
+            self._ros2_control.poll()
+            if self._tf_tree is not None:
+                self._tf_tree.poll(force=True)
+            self._initial_scan_complete.set()
+            self.get_logger().info(
+                f"[poll] first tick complete: {len(current_nodes)} nodes, {len(current_topics)} topics, "
+                f"{len(current_services)} services, {len(current_actions)} actions — "
+                f"node+topic={(_t1-_t0)*1000:.1f}ms enrichment={(_te1-_te0)*1000:.1f}ms"
+            )
+            return
+
+        # ── 2. Node events ────────────────────────────────────────────────────
+        started_nodes = current_nodes - self._active_nodes
+        if started_nodes:
+            self.get_logger().info(f"[poll] {len(started_nodes)} node(s) started: {sorted(started_nodes)}")
+            self._pending_topic_enrichment.update(self._active_topics)
+        for fqn in started_nodes:
+            self._fetch_node_parameters_async(fqn)
+            self._send_event_and_update({
+                'type': 'node_event', 'node': fqn,
+                'event': 'started', 'timestamp': time.time(),
+            })
+
+        stopped_nodes = self._active_nodes - current_nodes
+        if stopped_nodes:
+            self.get_logger().info(f"[poll] {len(stopped_nodes)} node(s) stopped: {sorted(stopped_nodes)}")
+        for fqn in stopped_nodes:
+            for topic, rel in self._topic_relations.items():
+                if fqn in rel.get('publishers', set()) or fqn in rel.get('subscribers', set()):
+                    self._pending_topic_enrichment.add(topic)
+            self._node_parameter_cache.pop(fqn, None)
+            self._pending_param_fetches.discard(fqn)
+            self._send_event_and_update({
+                'type': 'node_event', 'node': fqn,
+                'event': 'stopped', 'timestamp': time.time(),
+            })
+
+        # ── 3. Topic events ───────────────────────────────────────────────────
+        for t in current_topics - self._active_topics:
+            self._pending_topic_enrichment.add(t)
+            self._send_event_and_update({
+                'type': 'topic_event', 'topic': t,
+                'event': 'created', 'timestamp': time.time(),
+            })
+            # Nav2 BT edge-case: /behavior_tree_log just appeared
+            if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                if self.count_publishers(t) > 0:
+                    self._nav2_bt_publisher_active = True
+                    if self._load_and_parse_bt_xml():
+                        self._on_bt_event({
+                            'type': 'bt_tree', 'timestamp': time.time(),
+                            'tree_id': self._nav2_bt_tree_id,
+                            'tree': self._nav2_bt_tree_structure,
+                            'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                        })
+
+        for t in self._active_topics - current_topics:
+            self._topic_relations.pop(t, None)
+            self._topic_counts.pop(t, None)
+            self._pending_topic_enrichment.discard(t)
+            self._send_event_and_update({
+                'type': 'topic_event', 'topic': t,
+                'event': 'destroyed', 'timestamp': time.time(),
+            })
+            if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                self._on_nav2_bt_gone()
+
+        # ── 4. Service events (only every SERVICE_SCAN_INTERVAL) ──────────────
+        if _do_service_scan:
+            for s in set(current_services) - set(self._active_services):
+                self._send_event_and_update({
+                    'type': 'service_event', 'service': s,
+                    'event': 'created', 'timestamp': time.time(),
+                })
+
+            for s in set(self._active_services) - set(current_services):
+                self._send_event_and_update({
+                    'type': 'service_event', 'service': s,
+                    'event': 'destroyed', 'timestamp': time.time(),
+                })
+
+        # ── 5. Action events ──────────────────────────────────────────────────
+        for a in current_actions - self._active_actions:
+            self._send_event_and_update({
+                'type': 'action_event', 'action': a,
+                'event': 'created', 'timestamp': time.time(),
+            })
+
+        for a in self._active_actions - current_actions:
+            self._send_event_and_update({
+                'type': 'action_event', 'action': a,
+                'event': 'destroyed', 'timestamp': time.time(),
+            })
+
+        # ── 6. Update existence caches ────────────────────────────────────────
         self._active_nodes    = current_nodes
         self._active_topics   = current_topics
-        self._active_services = current_services
+        if _do_service_scan:
+            self._active_services = current_services
         self._active_actions  = current_actions
-        _te0 = time.time()
-        self._do_full_initial_enrichment(topic_type_list, node_pairs)
-        _te1 = time.time()
-        for fqn in current_nodes:
-            self._fetch_node_parameters_async(fqn)
+
+        # ── 7. Tier-2: batched relation enrichment ────────────────────────────
+        self._enrich_pending_relations(topic_type_list)
+
+        # ── 9. Nav2 BT publisher liveness check ──────────────────────────────
+        if hasattr(self, '_nav2_bt_publisher_active'):
+            bt_rel = self._topic_relations.get('/behavior_tree_log', {})
+            bt_pubs = bt_rel.get('publishers', set()) & current_nodes
+            if self._nav2_bt_publisher_active and not bt_pubs:
+                self._on_nav2_bt_gone()
+            elif self._nav2_bt_publisher_active and bt_pubs and self._nav2_bt_tree_id is None:
+                if self._load_and_parse_bt_xml():
+                    self._on_bt_event({
+                        'type': 'bt_tree', 'timestamp': time.time(),
+                        'tree_id': self._nav2_bt_tree_id,
+                        'tree': self._nav2_bt_tree_structure,
+                        'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                    })
+            elif not self._nav2_bt_publisher_active and bt_pubs:
+                self._nav2_bt_publisher_active = True
+                if self._load_and_parse_bt_xml():
+                    self._on_bt_event({
+                        'type': 'bt_tree', 'timestamp': time.time(),
+                        'tree_id': self._nav2_bt_tree_id,
+                        'tree': self._nav2_bt_tree_structure,
+                        'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                    })
+
+        # ── 10. Flush graph snapshots if anything changed ─────────────────────
+        self._flush_graph_snapshots()
+
+        # ── 11. Poll collectors ───────────────────────────────────────────────
         self._ros2_control.poll()
         if self._tf_tree is not None:
-            self._tf_tree.poll(force=True)
-        self._initial_scan_complete.set()
-        self.get_logger().info(
-            f"[poll] first tick complete: {len(current_nodes)} nodes, {len(current_topics)} topics, "
-            f"{len(current_services)} services, {len(current_actions)} actions — "
-            f"node+topic={(_t1-_t0)*1000:.1f}ms enrichment={(_te1-_te0)*1000:.1f}ms"
-        )
+            self._tf_tree.poll()
 
     # ──────────────────────────────────────────────
     # Initial full enrichment (called once on first tick)
@@ -450,6 +592,21 @@ class WebBridge(Node):
                         'type': 'topic_event', 'topic': topic, 'node': fqn,
                         'event': 'unsubscribed', 'timestamp': time.time(),
                     })
+
+                # Nav2 BT: publisher appeared/vanished on /behavior_tree_log
+                if topic == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                    old_pubs = old['publishers']
+                    if publishers and not old_pubs:
+                        self._nav2_bt_publisher_active = True
+                        if self._load_and_parse_bt_xml():
+                            self._on_bt_event({
+                                'type': 'bt_tree', 'timestamp': time.time(),
+                                'tree_id': self._nav2_bt_tree_id,
+                                'tree': self._nav2_bt_tree_structure,
+                                'nodes': [{**nd, 'status': 'IDLE'} for nd in self._nav2_bt_nodes_list],
+                            })
+                    elif old_pubs and not publishers:
+                        self._on_nav2_bt_gone()
 
         self.get_logger().info(f"[enrich] done in {(time.time()-_t0)*1000:.1f}ms")
 
@@ -664,17 +821,6 @@ class WebBridge(Node):
     # Parameters (async, lazy-loaded)
     # ──────────────────────────────────────────────
 
-    def _schedule_param_flush(self):
-        """Debounced flush: coalesces rapid param callbacks into a single nodes event."""
-        if self._param_flush_pending or not self.loop:
-            return
-        self._param_flush_pending = True
-        async def _do_flush():
-            await asyncio.sleep(0.5)
-            self._param_flush_pending = False
-            self._flush_graph_snapshots()
-        asyncio.run_coroutine_threadsafe(_do_flush(), self.loop)
-
     def _refresh_empty_param_caches(self):
         """Retry parameter fetch for nodes that don't have cached params yet."""
         for fqn in self._active_nodes:
@@ -728,7 +874,6 @@ class WebBridge(Node):
                 self._node_parameter_cache[fqn] = params
                 self._graph_dirty = True
                 self.get_logger().debug(f"[params] cached {len(params)} params for {fqn}")
-                self._schedule_param_flush()
 
             get_future.add_done_callback(_on_get)
 
