@@ -6,7 +6,7 @@ long_description = (HERE / "README.md").read_text(encoding="utf-8")
 
 setup(
     name='osiris_agent',
-    version='0.3.83',
+    version='0.3.84',
     description='OSIRIS agent for ROS2/Humble',
     long_description=long_description,
     long_description_content_type="text/markdown",
@@ -14,6 +14,9 @@ setup(
     author='Nicolas Tuomaala',
     author_email='nicolas.tuomaala00@gmail.com',
     packages=find_packages(),
+    package_data={
+        'osiris_agent': ['bin/graph_watcher'],
+    },
     license='Apache-2.0',
     classifiers=[
         'Development Status :: 4 - Beta',

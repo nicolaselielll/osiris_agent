@@ -12,6 +12,7 @@ import json
 
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
+from std_msgs.msg import Empty as EmptyMsg
 from rclpy.parameter import parameter_value_to_python
 from rclpy.qos import QoSProfile
 from rosidl_runtime_py import message_to_ordereddict
@@ -54,8 +55,8 @@ class WebBridge(Node):
         self.declare_parameter('tf_tree_enabled',      False)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -93,6 +94,7 @@ class WebBridge(Node):
         self._last_sent_actions:  dict | None = None
         self._last_sent_services: dict | None = None
         self._graph_dirty = False
+        self._graph_debounce_timer: threading.Timer | None = None
 
         # ── Service scan throttle ─────────────────────────────────────────────
         self._last_service_scan: float = 0.0
@@ -126,7 +128,14 @@ class WebBridge(Node):
         _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
         self._topic_batch_size = self.get_parameter('topic_batch_size').get_parameter_value().integer_value
 
-        self.create_timer(_graph_interval,            self._check_graph_changes)
+        # Subscribe to C++ graph watcher events (event-driven, reliable).
+        # When the C++ watcher is running it fires _check_graph_changes immediately
+        # on every DDS graph change. The recurring timer is a fallback for when the
+        # watcher is not deployed — it keeps the agent working normally in that case.
+        self.create_subscription(
+            EmptyMsg, '/osiris/graph_changed',
+            self._on_graph_changed, 10,
+        )
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
         self.create_timer(PARAMETER_REFRESH_INTERVAL,  self._refresh_empty_param_caches)
 
@@ -149,7 +158,7 @@ class WebBridge(Node):
         self._init_nav2_bt_monitor()
 
         self.get_logger().info(
-            f"🚀 Osiris agent v{AGENT_VERSION} — bisect 4e: full recurring poll (R1 removed)"
+            f"🚀 Osiris agent v{AGENT_VERSION} — event based graph monitoring"
         )
 
     # ──────────────────────────────────────────────
@@ -814,6 +823,24 @@ class WebBridge(Node):
         )
 
     # ──────────────────────────────────────────────
+    # C++ graph watcher integration
+    # ──────────────────────────────────────────────
+
+    def _on_graph_changed(self, _msg: EmptyMsg):
+        """Debounced callback fired by the C++ osiris_graph_watcher node.
+
+        Resets a 1s one-shot timer on every incoming event.  Only after 1s of
+        silence (no further graph events) is _check_graph_changes actually called.
+        This avoids a flurry of checks during rapid startup churn.
+        """
+        if self._graph_debounce_timer is not None:
+            self._graph_debounce_timer.cancel()
+        self._graph_debounce_timer = threading.Timer(1.0, self._check_graph_changes)
+        self._graph_debounce_timer.daemon = True
+        self._graph_debounce_timer.start()
+        self.get_logger().debug("[graph] C++ watcher fired — debounce reset")
+
+    # ──────────────────────────────────────────────
     # Parameters (async, lazy-loaded)
     # ──────────────────────────────────────────────
 
@@ -1228,6 +1255,34 @@ class WebBridge(Node):
 
 
 def main(args=None):
+    import shutil
+    import subprocess
+    import importlib.resources
+
+    # Locate the graph_watcher binary:
+    # 1. Prefer PATH (colcon dev workspace with source install/setup.bash)
+    # 2. Fall back to the binary bundled inside the pip package (osiris_agent/bin/)
+    _watcher_proc = None
+    _watcher_bin = shutil.which('graph_watcher')
+    if _watcher_bin is None:
+        try:
+            _pkg_bin = importlib.resources.files('osiris_agent').joinpath('bin/graph_watcher')
+            _watcher_bin = str(_pkg_bin) if _pkg_bin.is_file() else None  # type: ignore[attr-defined]
+        except Exception:
+            _watcher_bin = None
+
+    if _watcher_bin:
+        _watcher_proc = subprocess.Popen(
+            [_watcher_bin],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    else:
+        import logging
+        logging.getLogger(__name__).warning(
+            "osiris_graph_watcher not found — graph events will not be available."
+        )
+
     rclpy.init(args=args)
     node = WebBridge()
     try:
@@ -1238,6 +1293,9 @@ def main(args=None):
         node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
+        if _watcher_proc is not None:
+            _watcher_proc.terminate()
+            _watcher_proc.wait(timeout=3)
 
 
 if __name__ == '__main__':
