@@ -54,8 +54,8 @@ class WebBridge(Node):
         self.declare_parameter('tf_tree_enabled',      False)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -113,11 +113,7 @@ class WebBridge(Node):
         psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
 
         # ── Collectors ────────────────────────────────────────────────────────
-        self._ros2_control = Ros2ControlCollector(
-            node=self,
-            event_callback=self._on_ros2_control_event,
-            logger=self.get_logger(),
-        )
+        # self._ros2_control disabled — BISECT 4g
         _tf_tree_enabled = self.get_parameter('tf_tree_enabled').get_parameter_value().bool_value
         self._tf_tree = TfTreeCollector(
             node=self,
@@ -282,8 +278,8 @@ class WebBridge(Node):
                 'actions':     actions,
                 'services':    services,
                 'telemetry':   self._get_telemetry_snapshot(),
-                'controllers': self._ros2_control.get_controllers_snapshot(),
-                'hardware':    self._ros2_control.get_hardware_snapshot(),
+                'controllers': [],
+                'hardware':    [],
                 'tf_tree':     self._tf_tree.get_snapshot() if self._tf_tree is not None else None,
             },
         }))
@@ -375,7 +371,7 @@ class WebBridge(Node):
             _te1 = time.time()
             for fqn in current_nodes:
                 self._fetch_node_parameters_async(fqn)
-            self._ros2_control.poll()
+            # self._ros2_control.poll()  # BISECT 4g: disabled
             if self._tf_tree is not None:
                 self._tf_tree.poll(force=True)
             self._initial_scan_complete.set()
@@ -476,8 +472,8 @@ class WebBridge(Node):
             self._active_services = current_services
         self._active_actions  = current_actions
 
-        # ── 7. Tier-2: batched relation enrichment ────────────────────────────
-        self._enrich_pending_relations(topic_type_list)
+        # ── 7. Tier-2: batched relation enrichment — BISECT 4f: DISABLED ────────
+        # self._enrich_pending_relations(topic_type_list)
 
         # ── 9. Nav2 BT publisher liveness check ──────────────────────────────
         if hasattr(self, '_nav2_bt_publisher_active'):
@@ -507,7 +503,7 @@ class WebBridge(Node):
         self._flush_graph_snapshots()
 
         # ── 11. Poll collectors ───────────────────────────────────────────────
-        self._ros2_control.poll()
+        # self._ros2_control.poll()  # BISECT 4g: disabled
         if self._tf_tree is not None:
             self._tf_tree.poll()
 
@@ -1224,7 +1220,6 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
 
     def destroy_node(self):
-        self._ros2_control.destroy()
         if self._tf_tree is not None:
             self._tf_tree.destroy()
         if self._bt_collector:
