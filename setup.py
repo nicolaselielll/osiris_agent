@@ -1,12 +1,20 @@
-from setuptools import setup, find_packages
 import pathlib
+import re
+
+from setuptools import setup, find_packages
 
 HERE = pathlib.Path(__file__).parent
 long_description = (HERE / "README.md").read_text(encoding="utf-8")
+init_text = (HERE / "osiris_agent" / "__init__.py").read_text(encoding="utf-8")
+version_match = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", init_text)
+if version_match is None:
+    raise RuntimeError("Could not determine osiris_agent version from __init__.py")
+
+PACKAGE_VERSION = version_match.group(1)
 
 setup(
     name='osiris_agent',
-    version='0.3.88',
+    version=PACKAGE_VERSION,
     description='OSIRIS agent for ROS2/Humble',
     long_description=long_description,
     long_description_content_type="text/markdown",
