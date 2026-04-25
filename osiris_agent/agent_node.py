@@ -14,7 +14,7 @@ from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from std_msgs.msg import Empty as EmptyMsg
 from rclpy.parameter import parameter_value_to_python
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
 from rosidl_runtime_py import message_to_ordereddict
 from rosidl_runtime_py.utilities import get_message
 
@@ -40,8 +40,9 @@ _SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
 
 class WebBridge(Node):
 
-    def __init__(self):
+    def __init__(self, watcher_proc=None):
         super().__init__('osiris_node')
+        self._watcher_proc = watcher_proc
 
         auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
         if not auth_token:
@@ -126,13 +127,17 @@ class WebBridge(Node):
         _graph_interval     = self.get_parameter('graph_check_interval').get_parameter_value().double_value
         _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
 
-        # Subscribe to C++ graph watcher events (event-driven, reliable).
-        # Graph watcher subscription — event-driven polls.
-        # The one-shot startup timer guarantees an initial scan even when the
-        # C++ watcher binary is unavailable (e.g. pip install without binary).
+        # Subscribe to C++ graph watcher events — use TRANSIENT_LOCAL to match
+        # the publisher's QoS, so the last stored event is replayed if it was
+        # published before this subscription connected (e.g. during startup).
+        _gw_qos = QoSProfile(
+            depth=1,
+            durability=DurabilityPolicy.TRANSIENT_LOCAL,
+            reliability=ReliabilityPolicy.RELIABLE,
+        )
         self.create_subscription(
             EmptyMsg, '/osiris/graph_changed',
-            self._on_graph_changed, 10,
+            self._on_graph_changed, _gw_qos,
         )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
@@ -156,8 +161,12 @@ class WebBridge(Node):
 
         self._init_nav2_bt_monitor()
 
+        _watcher_status = (
+            f'pid={watcher_proc.pid}' if watcher_proc is not None else 'not started'
+        )
         self.get_logger().info(
-            f"🚀 Osiris agent v{AGENT_VERSION} — event based graph monitoring"
+            f"🚀 Osiris agent v{AGENT_VERSION} — event based graph monitoring "
+            f"(graph_watcher {_watcher_status})"
         )
 
     # ──────────────────────────────────────────────
@@ -833,6 +842,7 @@ class WebBridge(Node):
         check fires within 2s even if events keep arriving continuously (e.g.
         during Nav2 startup or active navigation churn).
         """
+        self.get_logger().info("[graph] event received")
         now = time.time()
         if self._graph_debounce_timer is not None:
             self._graph_debounce_timer.cancel()
@@ -859,6 +869,17 @@ class WebBridge(Node):
     def _do_startup_check(self):
         """One-shot timer: run the initial graph scan then cancel itself."""
         self._startup_check_timer.cancel()
+        if self._watcher_proc is not None:
+            rc = self._watcher_proc.poll()
+            if rc is not None:
+                self.get_logger().error(
+                    f"[graph] graph_watcher exited unexpectedly (rc={rc}) — "
+                    "no graph events will be received"
+                )
+            else:
+                self.get_logger().info(
+                    f"[graph] graph_watcher healthy (pid={self._watcher_proc.pid})"
+                )
         if not self._first_graph_check_done:
             self._check_graph_changes()
 
@@ -1295,8 +1316,9 @@ def main(args=None):
         _watcher_proc = subprocess.Popen(
             [_watcher_bin],
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
+        print(f'[osiris] graph_watcher started: {_watcher_bin} (pid={_watcher_proc.pid})', flush=True)
     else:
         import logging
         logging.getLogger(__name__).warning(
@@ -1304,7 +1326,18 @@ def main(args=None):
         )
 
     rclpy.init(args=args)
-    node = WebBridge()
+    node = WebBridge(watcher_proc=_watcher_proc)
+
+    # Forward graph_watcher stderr to the ROS logger so crashes are visible.
+    if _watcher_proc and _watcher_proc.stderr:
+        def _forward_watcher_stderr():
+            ros_log = node.get_logger()
+            for line in _watcher_proc.stderr:
+                decoded = line.decode().rstrip()
+                if decoded:
+                    ros_log.info(f'[gw] {decoded}')
+        threading.Thread(target=_forward_watcher_stderr, daemon=True).start()
+
     try:
         rclpy.spin(node)
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
