@@ -2,11 +2,6 @@
 
 # Usage: ./publish.sh 0.1.4
 
-set -euo pipefail
-
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
-
 if [ -z "$1" ]; then
   echo "Usage: ./publish.sh <version>"
   exit 1
@@ -14,25 +9,8 @@ fi
 
 V=$1
 
-# Update version in osiris_agent/__init__.py (single source of truth)
-"$PYTHON_BIN" - "$V" "$SCRIPT_DIR/osiris_agent/__init__.py" <<'PY'
-import pathlib
-import re
-import sys
-
-version = sys.argv[1]
-path = pathlib.Path(sys.argv[2])
-text = path.read_text(encoding="utf-8")
-updated, count = re.subn(
-  r"__version__\s*=\s*['\"][^'\"]+['\"]",
-  f"__version__ = '{version}'",
-  text,
-  count=1,
-)
-if count != 1:
-  raise SystemExit(f"Failed to update __version__ in {path}")
-path.write_text(updated, encoding="utf-8")
-PY
+# Update version in setup.py
+sed -i '' "s/version='.*'/version='$V'/" setup.py
 
 # Commit and tag
 git add .
@@ -45,6 +23,7 @@ git push origin "v$V"
 rm -rf dist build *.egg-info
 
 # Build the C++ graph_watcher binary from source using the system ROS2 installation
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 ROS_SETUP="/opt/ros/humble/setup.bash"
 
 if [ ! -f "$ROS_SETUP" ]; then
@@ -80,10 +59,10 @@ if command -v file >/dev/null 2>&1; then
   fi
 fi
 
-"$PYTHON_BIN" -m build
+python3.12 -m build
 export TWINE_USERNAME=__token__
 export TWINE_PASSWORD=$(grep PYPI_API_TOKEN .env | cut -d= -f2)
-"$PYTHON_BIN" -m twine upload dist/*
+python3.12 -m twine upload dist/*
 unset TWINE_PASSWORD TWINE_USERNAME
 
 echo "✅ Published version $V to PyPI"
