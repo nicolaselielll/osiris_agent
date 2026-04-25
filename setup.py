@@ -6,7 +6,7 @@ long_description = (HERE / "README.md").read_text(encoding="utf-8")
 
 setup(
     name='osiris_agent',
-    version='0.3.84',
+    version='0.3.85',
     description='OSIRIS agent for ROS2/Humble',
     long_description=long_description,
     long_description_content_type="text/markdown",
