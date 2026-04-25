@@ -1308,6 +1308,14 @@ def main(args=None):
         except Exception:
             _watcher_bin = None
 
+    if _watcher_bin and sys.platform != 'linux':
+        import logging
+        logging.getLogger(__name__).warning(
+            f"graph_watcher is a Linux binary and cannot run on {sys.platform} — "
+            "graph events will not be available."
+        )
+        _watcher_bin = None
+
     if _watcher_bin:
         # Sanity-check: reject non-ELF binaries (e.g. a macOS Mach-O that
         # accidentally ended up in the PyPI wheel) before trying to run them.
