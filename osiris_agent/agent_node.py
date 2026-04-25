@@ -14,7 +14,7 @@ from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from std_msgs.msg import Empty as EmptyMsg
 from rclpy.parameter import parameter_value_to_python
-from rclpy.qos import QoSProfile, DurabilityPolicy, ReliabilityPolicy
+from rclpy.qos import QoSProfile
 from rosidl_runtime_py import message_to_ordereddict
 from rosidl_runtime_py.utilities import get_message
 
@@ -127,17 +127,15 @@ class WebBridge(Node):
         _graph_interval     = self.get_parameter('graph_check_interval').get_parameter_value().double_value
         _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
 
-        # Subscribe to C++ graph watcher events — use TRANSIENT_LOCAL to match
-        # the publisher's QoS, so the last stored event is replayed if it was
-        # published before this subscription connected (e.g. during startup).
-        _gw_qos = QoSProfile(
-            depth=1,
-            durability=DurabilityPolicy.TRANSIENT_LOCAL,
-            reliability=ReliabilityPolicy.RELIABLE,
-        )
+        # Subscribe to C++ graph watcher events — event-driven polls.
+        # The one-shot startup timer guarantees an initial scan even when the
+        # C++ watcher binary is unavailable (e.g. pip install without binary).
+        # Use VOLATILE (default) depth=10: the startup timer handles initial state,
+        # and live events are reliably received without TRANSIENT_LOCAL replay
+        # which would race with the 1s startup timer on a background thread.
         self.create_subscription(
             EmptyMsg, '/osiris/graph_changed',
-            self._on_graph_changed, _gw_qos,
+            self._on_graph_changed, 10,
         )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
@@ -1308,6 +1306,24 @@ def main(args=None):
             _pkg_bin = importlib.resources.files('osiris_agent').joinpath('bin/graph_watcher')
             _watcher_bin = str(_pkg_bin) if _pkg_bin.is_file() else None  # type: ignore[attr-defined]
         except Exception:
+            _watcher_bin = None
+
+    if _watcher_bin:
+        # Sanity-check: reject non-ELF binaries (e.g. a macOS Mach-O that
+        # accidentally ended up in the PyPI wheel) before trying to run them.
+        _watcher_bin_ok = False
+        try:
+            with open(_watcher_bin, 'rb') as _f:
+                _watcher_bin_ok = _f.read(4) == b'\x7fELF'
+        except Exception:
+            pass
+        if not _watcher_bin_ok:
+            import logging
+            logging.getLogger(__name__).error(
+                f"osiris_graph_watcher binary at '{_watcher_bin}' is not a Linux ELF "
+                "(wrong platform — was a macOS binary published by mistake?). "
+                "Graph events will not be available."
+            )
             _watcher_bin = None
 
     if _watcher_bin:

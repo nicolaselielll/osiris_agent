@@ -45,6 +45,20 @@ if [ ! -f "$SCRIPT_DIR/osiris_agent/bin/graph_watcher" ]; then
   exit 1
 fi
 
+# Verify the binary is a Linux ELF, not a macOS Mach-O.
+# On Mac the 'file' command is available; use it to catch the wrong binary.
+_BIN="$SCRIPT_DIR/osiris_agent/bin/graph_watcher"
+if command -v file >/dev/null 2>&1; then
+  _FILE_OUTPUT="$(file "$_BIN")"
+  if echo "$_FILE_OUTPUT" | grep -q "ELF"; then
+    echo "✅ Binary is Linux ELF: $_FILE_OUTPUT"
+  else
+    echo "❌ Binary does not appear to be a Linux ELF: $_FILE_OUTPUT"
+    echo "   Copy the Linux-built binary from your ROS2 machine before publishing."
+    exit 1
+  fi
+fi
+
 python3.12 -m build
 export TWINE_USERNAME=__token__
 export TWINE_PASSWORD=$(grep PYPI_API_TOKEN .env | cut -d= -f2)
