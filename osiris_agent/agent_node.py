@@ -53,8 +53,8 @@ class WebBridge(Node):
         self.declare_parameter('tf_tree_enabled',      False)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -127,13 +127,14 @@ class WebBridge(Node):
         _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
 
         # Subscribe to C++ graph watcher events (event-driven, reliable).
-        # When the C++ watcher is running it fires _check_graph_changes immediately
-        # on every DDS graph change. The recurring timer is a fallback for when the
-        # watcher is not deployed — it keeps the agent working normally in that case.
+        # Graph watcher subscription — event-driven polls.
+        # The one-shot startup timer guarantees an initial scan even when the
+        # C++ watcher binary is unavailable (e.g. pip install without binary).
         self.create_subscription(
             EmptyMsg, '/osiris/graph_changed',
             self._on_graph_changed, 10,
         )
+        self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
         self.create_timer(PARAMETER_REFRESH_INTERVAL,  self._refresh_empty_param_caches)
 
@@ -854,6 +855,12 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
     # Parameters (async, lazy-loaded)
     # ──────────────────────────────────────────────
+
+    def _do_startup_check(self):
+        """One-shot timer: run the initial graph scan then cancel itself."""
+        self._startup_check_timer.cancel()
+        if not self._first_graph_check_done:
+            self._check_graph_changes()
 
     def _refresh_empty_param_caches(self):
         """Retry parameter fetch for nodes that don't have cached params yet."""

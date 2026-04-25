@@ -40,6 +40,11 @@ else
   echo "✅ Built and bundled graph_watcher binary"
 fi
 
+if [ ! -f "$SCRIPT_DIR/osiris_agent/bin/graph_watcher" ]; then
+  echo "❌ graph_watcher binary missing — aborting. Build it on a Linux+ROS2 machine and copy to osiris_agent/bin/"
+  exit 1
+fi
+
 python3.12 -m build
 export TWINE_USERNAME=__token__
 export TWINE_PASSWORD=$(grep PYPI_API_TOKEN .env | cut -d= -f2)
