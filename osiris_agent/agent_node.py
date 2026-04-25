@@ -27,7 +27,6 @@ from .tf_tree_collector import TfTreeCollector
 # Constants
 # ──────────────────────────────────────────────
 GRAPH_CHECK_INTERVAL       = 2.0   # seconds between graph polls
-TOPIC_BATCH_SIZE           = 10    # max topics enriched (deep-scan) per tick
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
 SERVICE_SCAN_INTERVAL      = 30.0  # seconds between service graph scans
 PARAMETER_REFRESH_INTERVAL = 60.0  # seconds between retries for nodes with no params yet
@@ -50,7 +49,6 @@ class WebBridge(Node):
 
         # Declare tunable parameters
         self.declare_parameter('graph_check_interval', GRAPH_CHECK_INTERVAL)
-        self.declare_parameter('topic_batch_size',     TOPIC_BATCH_SIZE)
         self.declare_parameter('telemetry_interval',   TELEMETRY_INTERVAL)
         self.declare_parameter('tf_tree_enabled',      False)
 
@@ -95,6 +93,7 @@ class WebBridge(Node):
         self._last_sent_services: dict | None = None
         self._graph_dirty = False
         self._graph_debounce_timer: threading.Timer | None = None
+        self._graph_debounce_start: float | None = None
 
         # ── Service scan throttle ─────────────────────────────────────────────
         self._last_service_scan: float = 0.0
@@ -126,7 +125,6 @@ class WebBridge(Node):
         # ── Timers ────────────────────────────────────────────────────────────
         _graph_interval     = self.get_parameter('graph_check_interval').get_parameter_value().double_value
         _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
-        self._topic_batch_size = self.get_parameter('topic_batch_size').get_parameter_value().integer_value
 
         # Subscribe to C++ graph watcher events (event-driven, reliable).
         # When the C++ watcher is running it fires _check_graph_changes immediately
@@ -340,10 +338,12 @@ class WebBridge(Node):
 
         # ── 1b. Service scan — throttled to SERVICE_SCAN_INTERVAL ─────────────
         _now = time.time()
-        _nodes_stopped = self._first_graph_check_done and bool(self._active_nodes - current_nodes)
+        _nodes_stopped  = self._first_graph_check_done and bool(self._active_nodes - current_nodes)
+        _nodes_started  = self._first_graph_check_done and bool(current_nodes - self._active_nodes)
         _do_service_scan = (
             not self._first_graph_check_done
             or _nodes_stopped
+            or _nodes_started
             or self._service_rescan_ticks > 0
             or (_now - self._last_service_scan) >= SERVICE_SCAN_INTERVAL
         )
@@ -481,8 +481,20 @@ class WebBridge(Node):
             self._active_services = current_services
         self._active_actions  = current_actions
 
-        # ── 7. Tier-2: batched relation enrichment — BISECT 4f: DISABLED ────────
-        # self._enrich_pending_relations(topic_type_list)
+        # ── 7. Re-enrich only topics whose pub/sub count changed ─────────────
+        # count_publishers/count_subscribers are O(1) — use them to cheaply
+        # detect which topics actually changed before doing expensive enrichment.
+        for topic in list(self._active_topics):
+            try:
+                n_pub = self.count_publishers(topic)
+                n_sub = self.count_subscribers(topic)
+            except Exception:
+                continue
+            if self._topic_counts.get(topic) != (n_pub, n_sub):
+                self._pending_topic_enrichment.add(topic)
+
+        if self._pending_topic_enrichment:
+            self._enrich_pending_relations(topic_type_list)
 
         # ── 9. Nav2 BT publisher liveness check ──────────────────────────────
         if hasattr(self, '_nav2_bt_publisher_active'):
@@ -548,14 +560,10 @@ class WebBridge(Node):
         if not self._pending_topic_enrichment:
             return
 
-        _pending_before = len(self._pending_topic_enrichment)
+        batch = set(self._pending_topic_enrichment)
+        self._pending_topic_enrichment.clear()
         _t0 = time.time()
-        batch = set(list(self._pending_topic_enrichment)[:self._topic_batch_size])
-        self._pending_topic_enrichment -= batch
-        self.get_logger().info(
-            f"[enrich] batch={len(batch)}, pending_before={_pending_before}, "
-            f"remaining={len(self._pending_topic_enrichment)}"
-        )
+        self.get_logger().info(f"[enrich] {len(batch)} topics")
 
         if topic_type_list is not None:
             topic_type_map = dict(topic_type_list)
@@ -706,39 +714,30 @@ class WebBridge(Node):
         if not self._graph_dirty or not self.ws or not self.loop:
             return
         self._graph_dirty = False
-        self.get_logger().debug("[flush] graph dirty, checking snapshots")
 
         nodes = self._get_nodes_with_relations()
         if nodes != self._last_sent_nodes:
-            self.get_logger().info(f"[flush] nodes changed ({len(nodes)} nodes)")
+            self.get_logger().info(f"[flush] nodes ({len(nodes)} nodes)")
             self._last_sent_nodes = nodes.copy()
-            self._enqueue({
-                'type': 'nodes', 'data': nodes, 'timestamp': time.time(),
-            })
+            self._enqueue({'type': 'nodes', 'data': nodes, 'timestamp': time.time()})
 
         topics = self._get_topics_with_relations()
         if topics != self._last_sent_topics:
-            self.get_logger().info(f"[flush] topics changed ({len(topics)} topics)")
+            self.get_logger().info(f"[flush] topics ({len(topics)} topics)")
             self._last_sent_topics = topics.copy()
-            self._enqueue({
-                'type': 'topics', 'data': topics, 'timestamp': time.time(),
-            })
+            self._enqueue({'type': 'topics', 'data': topics, 'timestamp': time.time()})
 
         actions = self._get_actions_with_relations()
         if actions != self._last_sent_actions:
-            self.get_logger().info(f"[flush] actions changed ({len(actions)} actions)")
+            self.get_logger().info(f"[flush] actions ({len(actions)} actions)")
             self._last_sent_actions = actions.copy()
-            self._enqueue({
-                'type': 'actions', 'data': actions, 'timestamp': time.time(),
-            })
+            self._enqueue({'type': 'actions', 'data': actions, 'timestamp': time.time()})
 
         services = self._get_services_with_relations()
         if services != self._last_sent_services:
-            self.get_logger().info(f"[flush] services changed ({len(services)} services)")
+            self.get_logger().info(f"[flush] services ({len(services)} services)")
             self._last_sent_services = services.copy()
-            self._enqueue({
-                'type': 'services', 'data': services, 'timestamp': time.time(),
-            })
+            self._enqueue({'type': 'services', 'data': services, 'timestamp': time.time()})
 
     # ──────────────────────────────────────────────
     # Topic subscriptions (gateway-requested)
@@ -829,16 +828,28 @@ class WebBridge(Node):
     def _on_graph_changed(self, _msg: EmptyMsg):
         """Debounced callback fired by the C++ osiris_graph_watcher node.
 
-        Resets a 1s one-shot timer on every incoming event.  Only after 1s of
-        silence (no further graph events) is _check_graph_changes actually called.
-        This avoids a flurry of checks during rapid startup churn.
+        Resets a 1s one-shot timer on every incoming event, but guarantees the
+        check fires within 2s even if events keep arriving continuously (e.g.
+        during Nav2 startup or active navigation churn).
         """
+        now = time.time()
         if self._graph_debounce_timer is not None:
             self._graph_debounce_timer.cancel()
-        self._graph_debounce_timer = threading.Timer(1.0, self._check_graph_changes)
+        # If we've been debouncing for longer than 2s without firing, run now.
+        if self._graph_debounce_start is not None and (now - self._graph_debounce_start) >= 2.0:
+            self._graph_debounce_start = None
+            self._check_graph_changes()
+            return
+        if self._graph_debounce_start is None:
+            self._graph_debounce_start = now
+        self._graph_debounce_timer = threading.Timer(1.0, self._debounce_fire)
         self._graph_debounce_timer.daemon = True
         self._graph_debounce_timer.start()
-        self.get_logger().debug("[graph] C++ watcher fired — debounce reset")
+
+    def _debounce_fire(self):
+        self.get_logger().info("[graph] watcher triggered poll")
+        self._graph_debounce_start = None
+        self._check_graph_changes()
 
     # ──────────────────────────────────────────────
     # Parameters (async, lazy-loaded)
