@@ -1290,6 +1290,8 @@ def main(args=None):
             _watcher_bin = None
 
     if _watcher_bin:
+        import stat
+        os.chmod(_watcher_bin, os.stat(_watcher_bin).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
         _watcher_proc = subprocess.Popen(
             [_watcher_bin],
             stdout=subprocess.DEVNULL,
