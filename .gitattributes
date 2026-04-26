@@ -1,0 +1,3 @@
+# Treat pre-built binaries as binary to prevent git from applying
+# line-ending or encoding conversions that corrupt ELF files.
+osiris_agent/bin/* binary
