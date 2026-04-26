@@ -104,6 +104,7 @@ class WebBridge(Node):
         # ── Initial scan synchronization ──────────────────────────────────────
         self._initial_scan_complete = threading.Event()
         self._first_graph_check_done = False
+        self._graph_check_lock = threading.Lock()  # serializes concurrent _check_graph_changes calls
         # ── BT state ─────────────────────────────────────────────────────────
         self._cached_bt_tree_event: dict | None = None
 
@@ -327,6 +328,14 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
 
     def _check_graph_changes(self):
+        if not self._graph_check_lock.acquire(blocking=False):
+            return  # another poll is already in progress — skip this one
+        try:
+            self._check_graph_changes_locked()
+        finally:
+            self._graph_check_lock.release()
+
+    def _check_graph_changes_locked(self):
         # ── 1. Node + topic queries (always, both cheap) ──────────────────────
         _t0 = time.time()
         node_pairs      = list(self.get_node_names_and_namespaces())
@@ -857,13 +866,24 @@ class WebBridge(Node):
         self._graph_debounce_timer.start()
 
     def _debounce_fire(self):
+        """Called from threading.Timer — schedule poll on the ROS executor thread."""
         self.get_logger().info("[graph] watcher triggered poll")
         self._graph_debounce_start = None
-        self._check_graph_changes()
+        # Avoid calling _check_graph_changes directly from a timer thread;
+        # post it to the ROS executor thread via a one-shot timer.
+        self._debounce_ros_timer = self.create_timer(0.0, self._debounce_poll_once)
 
     # ──────────────────────────────────────────────
     # Parameters (async, lazy-loaded)
     # ──────────────────────────────────────────────
+
+    def _debounce_poll_once(self):
+        """One-shot ROS timer callback — cancel self then run the graph poll."""
+        t = getattr(self, '_debounce_ros_timer', None)
+        if t is not None:
+            t.cancel()
+            self._debounce_ros_timer = None
+        self._check_graph_changes()
 
     def _do_startup_check(self):
         """One-shot timer: run the initial graph scan then cancel itself."""
