@@ -1293,19 +1293,27 @@ class WebBridge(Node):
 
 
 def main(args=None):
+    import platform
     import shutil
     import subprocess
     import importlib.resources
 
     # Locate the graph_watcher binary:
     # 1. Prefer PATH (colcon dev workspace with source install/setup.bash)
-    # 2. Fall back to the binary bundled inside the pip package (osiris_agent/bin/)
+    # 2. Fall back to arch-specific binary bundled in the pip package:
+    #    bin/graph_watcher_x86_64  or  bin/graph_watcher_aarch64
+    # 3. Fall back to bin/graph_watcher (legacy / colcon-installed generic name)
     _watcher_proc = None
     _watcher_bin = shutil.which('graph_watcher')
     if _watcher_bin is None:
         try:
-            _pkg_bin = importlib.resources.files('osiris_agent').joinpath('bin/graph_watcher')
-            _watcher_bin = str(_pkg_bin) if _pkg_bin.is_file() else None  # type: ignore[attr-defined]
+            _arch = platform.machine()  # 'x86_64' or 'aarch64'
+            _pkg = importlib.resources.files('osiris_agent')
+            for _name in (f'bin/graph_watcher_{_arch}', 'bin/graph_watcher'):
+                _candidate = _pkg.joinpath(_name)
+                if _candidate.is_file():  # type: ignore[attr-defined]
+                    _watcher_bin = str(_candidate)
+                    break
         except Exception:
             _watcher_bin = None
 
