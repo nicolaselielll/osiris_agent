@@ -55,8 +55,8 @@ class WebBridge(Node):
         self.declare_parameter('tf_tree_enabled',      False)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -95,7 +95,6 @@ class WebBridge(Node):
         self._last_sent_services: dict | None = None
         self._graph_dirty = False
         self._graph_debounce_timer: threading.Timer | None = None
-        self._graph_debounce_start: float | None = None
 
         # ── Service scan throttle ─────────────────────────────────────────────
         self._last_service_scan: float = 0.0
@@ -105,6 +104,7 @@ class WebBridge(Node):
         self._initial_scan_complete = threading.Event()
         self._first_graph_check_done = False
         self._graph_check_lock = threading.Lock()  # serializes concurrent _check_graph_changes calls
+        self._param_fetch_timer = None  # one-shot timer for delayed initial param fetch
         # ── BT state ─────────────────────────────────────────────────────────
         self._cached_bt_tree_event: dict | None = None
 
@@ -141,7 +141,8 @@ class WebBridge(Node):
         )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
-        self.create_timer(PARAMETER_REFRESH_INTERVAL,  self._refresh_empty_param_caches)
+        # BISECT: parameter fetching disabled
+        # self.create_timer(PARAMETER_REFRESH_INTERVAL,  self._refresh_empty_param_caches)
 
         # ── WebSocket thread ──────────────────────────────────────────────────
         threading.Thread(target=self._run_ws_client, daemon=True).start()
@@ -355,36 +356,37 @@ class WebBridge(Node):
         )
 
         # ── 1b. Service scan — throttled to SERVICE_SCAN_INTERVAL ─────────────
+        # BISECT: service scanning disabled
         _now = time.time()
         _nodes_stopped  = self._first_graph_check_done and bool(self._active_nodes - current_nodes)
         _nodes_started  = self._first_graph_check_done and bool(current_nodes - self._active_nodes)
-        _do_service_scan = (
-            not self._first_graph_check_done
-            or _nodes_stopped
-            or _nodes_started
-            or self._service_rescan_ticks > 0
-            or (_now - self._last_service_scan) >= SERVICE_SCAN_INTERVAL
-        )
-        if _do_service_scan:
-            self._last_service_scan = _now
-            if _nodes_stopped:
-                # Schedule follow-up scans to catch DDS endpoint lag.
-                self._service_rescan_ticks = 4
-            elif self._service_rescan_ticks > 0:
-                self._service_rescan_ticks -= 1
-            _ts0 = time.time()
-            service_type_list = self.get_service_names_and_types()
-            _ts1 = time.time()
-            current_services = {
-                s: types[0] if types else 'unknown'
-                for s, types in service_type_list
-                if not any(s.startswith(p) for p in _SUPPRESSED_SERVICE_PREFIXES)
-            }
-            self.get_logger().info(
-                f"[poll] service_scan: {(_ts1-_ts0)*1000:.1f}ms ({len(current_services)} services)"
-            )
-        else:
-            current_services = self._active_services
+        _do_service_scan = False
+        # _do_service_scan = (
+        #     not self._first_graph_check_done
+        #     or _nodes_stopped
+        #     or _nodes_started
+        #     or self._service_rescan_ticks > 0
+        #     or (_now - self._last_service_scan) >= SERVICE_SCAN_INTERVAL
+        # )
+        # if _do_service_scan:
+        #     self._last_service_scan = _now
+        #     if _nodes_stopped:
+        #         self._service_rescan_ticks = 4
+        #     elif self._service_rescan_ticks > 0:
+        #         self._service_rescan_ticks -= 1
+        #     _ts0 = time.time()
+        #     service_type_list = self.get_service_names_and_types()
+        #     _ts1 = time.time()
+        #     current_services = {
+        #         s: types[0] if types else 'unknown'
+        #         for s, types in service_type_list
+        #         if not any(s.startswith(p) for p in _SUPPRESSED_SERVICE_PREFIXES)
+        #     }
+        #     self.get_logger().info(
+        #         f"[poll] service_scan: {(_ts1-_ts0)*1000:.1f}ms ({len(current_services)} services)"
+        #     )
+        # else:
+        current_services = self._active_services
 
         # ── FIRST TICK: silently populate caches, no events ───────────────────
         if not self._first_graph_check_done:
@@ -394,10 +396,14 @@ class WebBridge(Node):
             self._active_services = current_services
             self._active_actions  = current_actions
             _te0 = time.time()
-            self._do_full_initial_enrichment(topic_type_list, node_pairs)
+            # BISECT: enrichment disabled
+            # self._do_full_initial_enrichment(topic_type_list, node_pairs)
             _te1 = time.time()
-            for fqn in current_nodes:
-                self._fetch_node_parameters_async(fqn)
+            # BISECT: parameter fetching disabled
+            # def _fetch_all_params_delayed():
+            #     for fqn in list(current_nodes):
+            #         self._fetch_node_parameters_async(fqn)
+            # self._param_fetch_timer = self.create_timer(5.0, lambda: (self._cancel_param_fetch_timer(), _fetch_all_params_delayed()))
             # self._ros2_control.poll()  # BISECT 4g: disabled
             if self._tf_tree is not None:
                 self._tf_tree.poll(force=True)
@@ -415,7 +421,8 @@ class WebBridge(Node):
             self.get_logger().info(f"[poll] {len(started_nodes)} node(s) started: {sorted(started_nodes)}")
             self._pending_topic_enrichment.update(self._active_topics)
         for fqn in started_nodes:
-            self._fetch_node_parameters_async(fqn)
+            # BISECT: parameter fetching disabled
+            # self._fetch_node_parameters_async(fqn)
             self._send_event_and_update({
                 'type': 'node_event', 'node': fqn,
                 'event': 'started', 'timestamp': time.time(),
@@ -466,18 +473,18 @@ class WebBridge(Node):
                 self._on_nav2_bt_gone()
 
         # ── 4. Service events (only every SERVICE_SCAN_INTERVAL) ──────────────
-        if _do_service_scan:
-            for s in set(current_services) - set(self._active_services):
-                self._send_event_and_update({
-                    'type': 'service_event', 'service': s,
-                    'event': 'created', 'timestamp': time.time(),
-                })
-
-            for s in set(self._active_services) - set(current_services):
-                self._send_event_and_update({
-                    'type': 'service_event', 'service': s,
-                    'event': 'destroyed', 'timestamp': time.time(),
-                })
+        # BISECT: service scanning disabled
+        # if _do_service_scan:
+        #     for s in set(current_services) - set(self._active_services):
+        #         self._send_event_and_update({
+        #             'type': 'service_event', 'service': s,
+        #             'event': 'created', 'timestamp': time.time(),
+        #         })
+        #     for s in set(self._active_services) - set(current_services):
+        #         self._send_event_and_update({
+        #             'type': 'service_event', 'service': s,
+        #             'event': 'destroyed', 'timestamp': time.time(),
+        #         })
 
         # ── 5. Action events ──────────────────────────────────────────────────
         for a in current_actions - self._active_actions:
@@ -495,24 +502,24 @@ class WebBridge(Node):
         # ── 6. Update existence caches ────────────────────────────────────────
         self._active_nodes    = current_nodes
         self._active_topics   = current_topics
-        if _do_service_scan:
-            self._active_services = current_services
+        # BISECT: service scanning disabled — don't update _active_services
+        # if _do_service_scan:
+        #     self._active_services = current_services
         self._active_actions  = current_actions
 
         # ── 7. Re-enrich only topics whose pub/sub count changed ─────────────
         # count_publishers/count_subscribers are O(1) — use them to cheaply
         # detect which topics actually changed before doing expensive enrichment.
-        for topic in list(self._active_topics):
-            try:
-                n_pub = self.count_publishers(topic)
-                n_sub = self.count_subscribers(topic)
-            except Exception:
-                continue
-            if self._topic_counts.get(topic) != (n_pub, n_sub):
-                self._pending_topic_enrichment.add(topic)
-
-        if self._pending_topic_enrichment:
-            self._enrich_pending_relations(topic_type_list)
+        # Skip enrichment entirely while a navigation session is active — firing
+        # 200+ DDS pub/sub queries during navigation saturates the middleware and
+        # causes the BT planner action server to miss its acknowledgement window.
+        # BISECT: enrichment disabled
+        # _nav_active = getattr(self, '_nav2_bt_session_active', False)
+        # if not _nav_active:
+        #     for topic in list(self._active_topics):
+        #         ...
+        # if self._pending_topic_enrichment and not _nav_active:
+        #     self._enrich_pending_relations(topic_type_list)
 
         # ── 9. Nav2 BT publisher liveness check ──────────────────────────────
         if hasattr(self, '_nav2_bt_publisher_active'):
@@ -686,7 +693,8 @@ class WebBridge(Node):
 
     def _get_topics_with_relations(self) -> dict:
         result = {}
-        for topic, rel in self._topic_relations.items():
+        for topic in self._active_topics:
+            rel = self._topic_relations.get(topic, {})
             result[topic] = {
                 'type': rel.get('type', 'unknown'),
                 'publishers': [
@@ -708,14 +716,13 @@ class WebBridge(Node):
 
     def _get_actions_with_relations(self) -> dict:
         result = {}
-        for topic, rel in self._topic_relations.items():
-            if topic.endswith('/_action/status') and rel['publishers']:
-                action = topic.replace('/_action/status', '')
-                providers = [
-                    self._node_full_name(p.node_name, p.node_namespace)
-                    for p in rel.get('publisher_infos', [])
-                ]
-                result[action] = {'providers': providers}
+        for action in self._active_actions:
+            rel = self._topic_relations.get(f'{action}/_action/status', {})
+            providers = [
+                self._node_full_name(p.node_name, p.node_namespace)
+                for p in rel.get('publisher_infos', [])
+            ]
+            result[action] = {'providers': providers}
         return result
 
     def _get_services_with_relations(self) -> dict:
@@ -851,16 +858,8 @@ class WebBridge(Node):
         during Nav2 startup or active navigation churn).
         """
         self.get_logger().info("[graph] event received")
-        now = time.time()
         if self._graph_debounce_timer is not None:
             self._graph_debounce_timer.cancel()
-        # If we've been debouncing for longer than 2s without firing, run now.
-        if self._graph_debounce_start is not None and (now - self._graph_debounce_start) >= 2.0:
-            self._graph_debounce_start = None
-            self._check_graph_changes()
-            return
-        if self._graph_debounce_start is None:
-            self._graph_debounce_start = now
         self._graph_debounce_timer = threading.Timer(1.0, self._debounce_fire)
         self._graph_debounce_timer.daemon = True
         self._graph_debounce_timer.start()
@@ -868,7 +867,6 @@ class WebBridge(Node):
     def _debounce_fire(self):
         """Called from threading.Timer — run the graph poll directly."""
         self.get_logger().info("[graph] watcher triggered poll")
-        self._graph_debounce_start = None
         self._check_graph_changes()
 
     # ──────────────────────────────────────────────
@@ -892,11 +890,19 @@ class WebBridge(Node):
         if not self._first_graph_check_done:
             self._check_graph_changes()
 
+    def _cancel_param_fetch_timer(self):
+        """Cancel the one-shot delayed param-fetch timer after it fires."""
+        t = self._param_fetch_timer
+        if t is not None:
+            t.cancel()
+            self._param_fetch_timer = None
+
     def _refresh_empty_param_caches(self):
         """Retry parameter fetch for nodes that don't have cached params yet."""
-        for fqn in self._active_nodes:
-            if not self._node_parameter_cache.get(fqn):
-                self._fetch_node_parameters_async(fqn)
+        # BISECT: parameter fetching disabled
+        # for fqn in self._active_nodes:
+        #     if not self._node_parameter_cache.get(fqn):
+        #         self._fetch_node_parameters_async(fqn)
 
     def _fetch_node_parameters_async(self, fqn: str):
         """Fetch parameters for *fqn* without blocking the executor.
