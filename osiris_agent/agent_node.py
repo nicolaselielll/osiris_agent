@@ -11,6 +11,7 @@ import rclpy
 import websockets
 import json
 
+from rcl_interfaces.msg import ParameterEvent
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from std_msgs.msg import Empty as EmptyMsg
@@ -30,7 +31,6 @@ from .tf_tree_collector import TfTreeCollector
 GRAPH_CHECK_INTERVAL       = 2.0   # seconds between graph polls
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
 SERVICE_SCAN_INTERVAL      = 30.0  # seconds between service graph scans
-PARAMETER_REFRESH_INTERVAL = 60.0  # seconds between retries for nodes with no params yet
 MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
 RECONNECT_MAX_DELAY        = 30    # seconds
@@ -85,8 +85,9 @@ class WebBridge(Node):
         self._pending_topic_enrichment: set[str] = set()
 
         # ── Parameters (lazy-loaded, async) ──────────────────────────────────
-        self._node_parameter_cache: dict[str, dict] = {}
+        self._node_parameter_cache: dict[str, dict | None] = {}  # None = not yet fetched, {} = fetched but empty
         self._pending_param_fetches: set[str] = set()
+        self._nodes_no_param_service: set[str] = set()  # nodes whose list_parameters was never ready
 
         # ── Snapshot & dirty-flag ─────────────────────────────────────────────
         self._last_sent_nodes:    dict | None = None
@@ -139,9 +140,12 @@ class WebBridge(Node):
             EmptyMsg, '/osiris/graph_changed',
             self._on_graph_changed, 10,
         )
+        self.create_subscription(
+            ParameterEvent, '/parameter_events',
+            self._on_parameter_event, 100,
+        )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
-        self.create_timer(PARAMETER_REFRESH_INTERVAL,  self._refresh_empty_param_caches)
 
         # ── WebSocket thread ──────────────────────────────────────────────────
         threading.Thread(target=self._run_ws_client, daemon=True).start()
@@ -420,6 +424,7 @@ class WebBridge(Node):
             self.get_logger().info(f"[poll] {len(started_nodes)} node(s) started: {sorted(started_nodes)}")
             self._pending_topic_enrichment.update(self._active_topics)
         for fqn in started_nodes:
+            self._nodes_no_param_service.discard(fqn)  # allow retry after restart
             self._fetch_node_parameters_async(fqn)
             self._send_event_and_update({
                 'type': 'node_event', 'node': fqn,
@@ -837,13 +842,16 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
 
     def _on_graph_changed(self, _msg: EmptyMsg):
-        """Debounced callback fired by the C++ osiris_graph_watcher node.
-
-        Resets a 1s one-shot timer on every incoming event, but guarantees the
-        check fires within 2s even if events keep arriving continuously (e.g.
-        during Nav2 startup or active navigation churn).
-        """
+        """Debounced callback fired by the C++ osiris_graph_watcher node."""
         self.get_logger().info("[graph] event received")
+        self._trigger_graph_poll()
+
+    def _trigger_graph_poll(self):
+        """Single debounced entry point for all graph poll triggers.
+
+        Resets a 1s one-shot timer on every call so rapid bursts coalesce
+        into a single poll.
+        """
         if self._graph_debounce_timer is not None:
             self._graph_debounce_timer.cancel()
         self._graph_debounce_timer = threading.Timer(1.0, self._debounce_fire)
@@ -883,11 +891,23 @@ class WebBridge(Node):
             t.cancel()
             self._param_fetch_timer = None
 
-    def _refresh_empty_param_caches(self):
-        """Retry parameter fetch for nodes that don't have cached params yet."""
-        for fqn in self._active_nodes:
-            if not self._node_parameter_cache.get(fqn):
-                self._fetch_node_parameters_async(fqn)
+    def _on_parameter_event(self, msg: ParameterEvent):
+        """React to parameter changes published by any node on /parameter_events."""
+        fqn = msg.node
+        if fqn not in self._active_nodes:
+            return
+        cache = dict(self._node_parameter_cache.get(fqn) or {})
+        for param in list(msg.new_parameters) + list(msg.changed_parameters):
+            try:
+                cache[param.name] = parameter_value_to_python(param.value)
+            except Exception:
+                pass
+        for param in msg.deleted_parameters:
+            cache.pop(param.name, None)
+        if cache != self._node_parameter_cache.get(fqn):
+            self._node_parameter_cache[fqn] = cache
+            self.get_logger().debug(f'[params] updated {len(cache)} params for {fqn} via /parameter_events')
+            self._trigger_graph_poll()
 
     def _fetch_node_parameters_async(self, fqn: str):
         """Fetch parameters for *fqn* without blocking the executor.
@@ -902,6 +922,7 @@ class WebBridge(Node):
         list_client = self.create_client(ListParameters, f"{fqn}/list_parameters")
         if not list_client.service_is_ready():
             self.destroy_client(list_client)
+            self._nodes_no_param_service.add(fqn)
             return
 
         self._pending_param_fetches.add(fqn)
@@ -914,6 +935,7 @@ class WebBridge(Node):
             response = fut.result()
             if response is None or not response.result.names:
                 self._pending_param_fetches.discard(fqn)
+                self._node_parameter_cache[fqn] = {}  # fetched but empty — stop retrying
                 return
             param_names = list(response.result.names)
             get_client = self.create_client(GetParameters, f"{fqn}/get_parameters")
