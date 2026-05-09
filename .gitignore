@@ -1,5 +1,7 @@
 .venv/
 build/
+install/
+log/
 dist/
 *.egg-info/
 __pycache__/

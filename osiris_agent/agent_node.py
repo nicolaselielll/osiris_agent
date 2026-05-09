@@ -1,5 +1,6 @@
 import asyncio
 import os
+import platform
 import random
 import sys
 import threading
@@ -11,6 +12,7 @@ import rclpy
 import websockets
 import json
 
+from rcl_interfaces.msg import ParameterEvent
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from std_msgs.msg import Empty as EmptyMsg
@@ -30,7 +32,6 @@ from .tf_tree_collector import TfTreeCollector
 GRAPH_CHECK_INTERVAL       = 2.0   # seconds between graph polls
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
 SERVICE_SCAN_INTERVAL      = 30.0  # seconds between service graph scans
-PARAMETER_REFRESH_INTERVAL = 60.0  # seconds between retries for nodes with no params yet
 MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
 RECONNECT_MAX_DELAY        = 30    # seconds
@@ -53,10 +54,11 @@ class WebBridge(Node):
         self.declare_parameter('graph_check_interval', GRAPH_CHECK_INTERVAL)
         self.declare_parameter('telemetry_interval',   TELEMETRY_INTERVAL)
         self.declare_parameter('tf_tree_enabled',      False)
+        self.declare_parameter('battery_topic',        '/battery_state')
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -75,6 +77,12 @@ class WebBridge(Node):
         self._active_services: dict[str, str] = {}
         self._active_actions:  set[str] = set()
 
+        # ── Action type cache ─────────────────────────────────────────────────
+        # None  = fetch attempted but failed (package not installed, etc.)
+        # dict  = { goal_type, result_type, feedback_type,
+        #           goal_fields, result_fields, feedback_fields }
+        self._action_type_cache: dict[str, dict | None] = {}
+
         # ── Count sentinels (cheap change detection) ─────────────────────────
         self._topic_counts: dict[str, tuple[int, int]] = {}  # topic → (pub_n, sub_n)
 
@@ -85,8 +93,14 @@ class WebBridge(Node):
         self._pending_topic_enrichment: set[str] = set()
 
         # ── Parameters (lazy-loaded, async) ──────────────────────────────────
-        self._node_parameter_cache: dict[str, dict] = {}
+        self._node_parameter_cache: dict[str, dict | None] = {}  # None = not yet fetched, {} = fetched but empty
         self._pending_param_fetches: set[str] = set()
+        self._nodes_no_param_service: set[str] = set()  # nodes whose list_parameters was never ready
+
+        # ── Lifecycle subscriptions (auto-detected managed nodes) ─────────────
+        self._lifecycle_subs: dict[str, rclpy.subscription.Subscription] = {}  # topic → sub
+        self._lifecycle_state_cache: dict[str, str] = {}   # node_fqn → state label
+        self._pending_lifecycle_fetches: set[str] = set()  # node_fqns with in-flight get_state calls
 
         # ── Snapshot & dirty-flag ─────────────────────────────────────────────
         self._last_sent_nodes:    dict | None = None
@@ -95,7 +109,6 @@ class WebBridge(Node):
         self._last_sent_services: dict | None = None
         self._graph_dirty = False
         self._graph_debounce_timer: threading.Timer | None = None
-        self._graph_debounce_start: float | None = None
 
         # ── Service scan throttle ─────────────────────────────────────────────
         self._last_service_scan: float = 0.0
@@ -105,19 +118,29 @@ class WebBridge(Node):
         self._initial_scan_complete = threading.Event()
         self._first_graph_check_done = False
         self._graph_check_lock = threading.Lock()  # serializes concurrent _check_graph_changes calls
+        self._param_fetch_timer = None  # one-shot timer for delayed initial param fetch
         # ── BT state ─────────────────────────────────────────────────────────
         self._cached_bt_tree_event: dict | None = None
 
         # ── Telemetry ─────────────────────────────────────────────────────────
-        self._telemetry_enabled = True
         self._last_disk_io      = None
         self._last_net_io       = None
         self._last_io_time:     float | None = None
-        self._cpu_history:      deque = deque(maxlen=900)  # 15 min at 1 Hz
+        self._last_battery_state: dict | None = None
         psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
 
         # ── Collectors ────────────────────────────────────────────────────────
-        # self._ros2_control disabled — BISECT 4g
+        ros2_control_enabled = os.environ.get(
+            'OSIRIS_ROS2_CONTROL_ENABLED', ''
+        ).lower() in ('true', '1', 'yes')
+        if ros2_control_enabled:
+            self._ros2_control = Ros2ControlCollector(
+                node=self,
+                event_callback=self._on_ros2_control_event,
+                logger=self.get_logger(),
+            )
+        else:
+            self._ros2_control = None
         _tf_tree_enabled = self.get_parameter('tf_tree_enabled').get_parameter_value().bool_value
         self._tf_tree = TfTreeCollector(
             node=self,
@@ -139,9 +162,24 @@ class WebBridge(Node):
             EmptyMsg, '/osiris/graph_changed',
             self._on_graph_changed, 10,
         )
+        self.create_subscription(
+            ParameterEvent, '/parameter_events',
+            self._on_parameter_event, 100,
+        )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
-        self.create_timer(PARAMETER_REFRESH_INTERVAL,  self._refresh_empty_param_caches)
+
+        # ── Battery state subscription ────────────────────────────────────────
+        _battery_topic = self.get_parameter('battery_topic').get_parameter_value().string_value
+        try:
+            from sensor_msgs.msg import BatteryState as BatteryStateMsg
+            self.create_subscription(
+                BatteryStateMsg, _battery_topic,
+                self._on_battery_state, 10,
+            )
+            self.get_logger().info(f'Battery state subscription active on {_battery_topic}')
+        except Exception as e:
+            self.get_logger().warning(f'Battery state monitoring unavailable: {e}')
 
         # ── WebSocket thread ──────────────────────────────────────────────────
         threading.Thread(target=self._run_ws_client, daemon=True).start()
@@ -252,10 +290,6 @@ class WebBridge(Node):
                 topic = data.get('topic')
                 if topic:
                     self._unsubscribe_from_topic(topic)
-            elif msg_type == 'start_telemetry':
-                self._telemetry_enabled = True
-            elif msg_type == 'stop_telemetry':
-                self._telemetry_enabled = False
             elif msg_type == 'error':
                 self.get_logger().warning(f"Gateway error: {data.get('message', '')}")
 
@@ -271,10 +305,17 @@ class WebBridge(Node):
         self._last_sent_services = None
         self._graph_dirty        = True
 
-        nodes    = self._get_nodes_with_relations()
-        topics   = self._get_topics_with_relations()
-        actions  = self._get_actions_with_relations()
-        services = self._get_services_with_relations()
+        nodes       = self._get_nodes_with_relations()
+        topics      = self._get_topics_with_relations()
+        actions     = self._get_actions_with_relations()
+        services    = self._get_services_with_relations()
+        controllers = self._ros2_control.get_controllers_snapshot() if self._ros2_control is not None else []
+        hardware    = self._ros2_control.get_hardware_snapshot() if self._ros2_control is not None else []
+        telemetry   = self._get_telemetry_snapshot()
+        tf_tree     = self._tf_tree.get_snapshot() if self._tf_tree is not None else None
+        bt_state    = self._build_startup_bt_state_event()
+        bt          = self._bt_snapshot_from_state_event(bt_state)
+        initial_timestamp = time.time()
 
         self._last_sent_nodes    = nodes.copy()
         self._last_sent_topics   = topics.copy()
@@ -288,20 +329,25 @@ class WebBridge(Node):
 
         await self._send_queue.put(json.dumps({
             'type': 'initial_state',
-            'timestamp': time.time(),
+            'timestamp': initial_timestamp,
             'data': {
-                'nodes':       nodes,
-                'topics':      topics,
-                'actions':     actions,
-                'services':    services,
-                'telemetry':   self._get_telemetry_snapshot(),
-                'controllers': [],
-                'hardware':    [],
-                'tf_tree':     self._tf_tree.get_snapshot() if self._tf_tree is not None else None,
+                'timestamp': initial_timestamp,
+                'graph': {
+                    'nodes':       nodes,
+                    'topics':      topics,
+                    'actions':     actions,
+                    'services':    services,
+                    'controllers': controllers,
+                    'hardware':    hardware,
+                },
+                'meta':      self._get_initial_state_meta(telemetry),
+                'telemetry': telemetry,
+                'tf_tree':   tf_tree,
+                'bt':        bt,
             },
         }))
 
-        await self._send_queue.put(json.dumps(self._build_startup_bt_state_event()))
+        await self._send_queue.put(json.dumps(bt_state))
 
         if self._cached_bt_tree_event:
             await self._send_queue.put(json.dumps(self._cached_bt_tree_event))
@@ -341,6 +387,9 @@ class WebBridge(Node):
         node_pairs      = list(self.get_node_names_and_namespaces())
         topic_type_list = self.get_topic_names_and_types()
         _t1 = time.time()
+
+        # Build a flat map for O(1) type lookup throughout this method
+        topic_type_map = {t: types for t, types in topic_type_list}
 
         current_nodes   = {self._node_full_name(n, ns) for n, ns in node_pairs}
         current_topics  = {t for t, _ in topic_type_list}
@@ -396,9 +445,22 @@ class WebBridge(Node):
             _te0 = time.time()
             self._do_full_initial_enrichment(topic_type_list, node_pairs)
             _te1 = time.time()
-            for fqn in current_nodes:
-                self._fetch_node_parameters_async(fqn)
-            # self._ros2_control.poll()  # BISECT 4g: disabled
+            # Stagger parameter fetches: fire them on the ROS executor thread
+            # 5 s after the first tick so we don't hammer lifecycle nodes that
+            # are still in the middle of configuring/activating.
+            def _fetch_all_params_delayed():
+                for fqn in list(current_nodes):
+                    self._fetch_node_parameters_async(fqn)
+            self._param_fetch_timer = self.create_timer(5.0, lambda: (self._cancel_param_fetch_timer(), _fetch_all_params_delayed()))
+            for _t in current_topics:
+                if _t.endswith('/transition_event'):
+                    self._subscribe_lifecycle_topic(_t)
+                    self._fetch_lifecycle_state_async(_t[:-len('/transition_event')])
+            # Resolve action types for all actions already live at startup
+            for a in current_actions:
+                self._fetch_action_types(a, topic_type_map)
+            if self._ros2_control is not None:
+                self._ros2_control.poll(force=True)
             if self._tf_tree is not None:
                 self._tf_tree.poll(force=True)
             self._initial_scan_complete.set()
@@ -415,7 +477,9 @@ class WebBridge(Node):
             self.get_logger().info(f"[poll] {len(started_nodes)} node(s) started: {sorted(started_nodes)}")
             self._pending_topic_enrichment.update(self._active_topics)
         for fqn in started_nodes:
+            self._nodes_no_param_service.discard(fqn)  # allow retry after restart
             self._fetch_node_parameters_async(fqn)
+            self._fetch_lifecycle_state_async(fqn)
             self._send_event_and_update({
                 'type': 'node_event', 'node': fqn,
                 'event': 'started', 'timestamp': time.time(),
@@ -430,6 +494,8 @@ class WebBridge(Node):
                     self._pending_topic_enrichment.add(topic)
             self._node_parameter_cache.pop(fqn, None)
             self._pending_param_fetches.discard(fqn)
+            self._lifecycle_state_cache.pop(fqn, None)
+            self._pending_lifecycle_fetches.discard(fqn)
             self._send_event_and_update({
                 'type': 'node_event', 'node': fqn,
                 'event': 'stopped', 'timestamp': time.time(),
@@ -442,6 +508,8 @@ class WebBridge(Node):
                 'type': 'topic_event', 'topic': t,
                 'event': 'created', 'timestamp': time.time(),
             })
+            if t.endswith('/transition_event'):
+                self._subscribe_lifecycle_topic(t)
             # Nav2 BT edge-case: /behavior_tree_log just appeared
             if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
                 if self.count_publishers(t) > 0:
@@ -462,6 +530,10 @@ class WebBridge(Node):
                 'type': 'topic_event', 'topic': t,
                 'event': 'destroyed', 'timestamp': time.time(),
             })
+            if t.endswith('/transition_event'):
+                lc_sub = self._lifecycle_subs.pop(t, None)
+                if lc_sub:
+                    self.destroy_subscription(lc_sub)
             if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
                 self._on_nav2_bt_gone()
 
@@ -472,7 +544,6 @@ class WebBridge(Node):
                     'type': 'service_event', 'service': s,
                     'event': 'created', 'timestamp': time.time(),
                 })
-
             for s in set(self._active_services) - set(current_services):
                 self._send_event_and_update({
                     'type': 'service_event', 'service': s,
@@ -481,12 +552,14 @@ class WebBridge(Node):
 
         # ── 5. Action events ──────────────────────────────────────────────────
         for a in current_actions - self._active_actions:
+            self._fetch_action_types(a, topic_type_map)
             self._send_event_and_update({
                 'type': 'action_event', 'action': a,
                 'event': 'created', 'timestamp': time.time(),
             })
 
         for a in self._active_actions - current_actions:
+            self._action_type_cache.pop(a, None)
             self._send_event_and_update({
                 'type': 'action_event', 'action': a,
                 'event': 'destroyed', 'timestamp': time.time(),
@@ -500,19 +573,13 @@ class WebBridge(Node):
         self._active_actions  = current_actions
 
         # ── 7. Re-enrich only topics whose pub/sub count changed ─────────────
-        # count_publishers/count_subscribers are O(1) — use them to cheaply
-        # detect which topics actually changed before doing expensive enrichment.
-        for topic in list(self._active_topics):
-            try:
-                n_pub = self.count_publishers(topic)
-                n_sub = self.count_subscribers(topic)
-            except Exception:
-                continue
-            if self._topic_counts.get(topic) != (n_pub, n_sub):
-                self._pending_topic_enrichment.add(topic)
-
         if self._pending_topic_enrichment:
             self._enrich_pending_relations(topic_type_list)
+
+        # ── 8. Retry action type resolution for any unresolved actions ────────
+        for a in current_actions:
+            if a not in self._action_type_cache:
+                self._fetch_action_types(a, topic_type_map)
 
         # ── 9. Nav2 BT publisher liveness check ──────────────────────────────
         if hasattr(self, '_nav2_bt_publisher_active'):
@@ -542,7 +609,8 @@ class WebBridge(Node):
         self._flush_graph_snapshots()
 
         # ── 11. Poll collectors ───────────────────────────────────────────────
-        # self._ros2_control.poll()  # BISECT 4g: disabled
+        if self._ros2_control is not None:
+            self._ros2_control.poll()
         if self._tf_tree is not None:
             self._tf_tree.poll()
 
@@ -654,6 +722,7 @@ class WebBridge(Node):
                 'actions':    [],
                 'services':   [],
                 'parameters': self._node_parameter_cache.get(fqn, {}),
+                'lifecycle_state': self._lifecycle_state_cache.get(fqn, None),
             }
 
         for topic, rel in self._topic_relations.items():
@@ -686,7 +755,8 @@ class WebBridge(Node):
 
     def _get_topics_with_relations(self) -> dict:
         result = {}
-        for topic, rel in self._topic_relations.items():
+        for topic in self._active_topics:
+            rel = self._topic_relations.get(topic, {})
             result[topic] = {
                 'type': rel.get('type', 'unknown'),
                 'publishers': [
@@ -708,14 +778,16 @@ class WebBridge(Node):
 
     def _get_actions_with_relations(self) -> dict:
         result = {}
-        for topic, rel in self._topic_relations.items():
-            if topic.endswith('/_action/status') and rel['publishers']:
-                action = topic.replace('/_action/status', '')
-                providers = [
-                    self._node_full_name(p.node_name, p.node_namespace)
-                    for p in rel.get('publisher_infos', [])
-                ]
-                result[action] = {'providers': providers}
+        for action in self._active_actions:
+            rel = self._topic_relations.get(f'{action}/_action/status', {})
+            providers = [
+                self._node_full_name(p.node_name, p.node_namespace)
+                for p in rel.get('publisher_infos', [])
+            ]
+            result[action] = {
+                'providers': providers,
+                **(self._action_type_cache.get(action) or {}),
+            }
         return result
 
     def _get_services_with_relations(self) -> dict:
@@ -840,50 +912,106 @@ class WebBridge(Node):
         )
 
     # ──────────────────────────────────────────────
+    # Lifecycle (managed nodes)
+    # ──────────────────────────────────────────────
+
+    def _subscribe_lifecycle_topic(self, topic: str):
+        """Subscribe to a /<node>/transition_event topic."""
+        if topic in self._lifecycle_subs:
+            return
+        try:
+            from lifecycle_msgs.msg import TransitionEvent
+            node_fqn = topic[:-len('/transition_event')]
+            sub = self.create_subscription(
+                TransitionEvent,
+                topic,
+                lambda msg, n=node_fqn: self._on_lifecycle_transition(msg, n),
+                QoSProfile(depth=10),
+            )
+            self._lifecycle_subs[topic] = sub
+            self.get_logger().info(f'[lifecycle] subscribed to {topic}')
+        except Exception as e:
+            self.get_logger().debug(f'[lifecycle] could not subscribe to {topic}: {e}')
+
+    def _fetch_lifecycle_state_async(self, node_fqn: str):
+        """Query /<node>/get_state to populate _lifecycle_state_cache."""
+        if node_fqn in self._lifecycle_state_cache:
+            return
+        if node_fqn in self._pending_lifecycle_fetches:
+            return
+        try:
+            from lifecycle_msgs.srv import GetState
+        except ImportError:
+            return
+        client = self.create_client(GetState, f'{node_fqn}/get_state')
+        if not client.service_is_ready():
+            self.destroy_client(client)
+            return
+        self._pending_lifecycle_fetches.add(node_fqn)
+        future = client.call_async(GetState.Request())
+
+        def _on_get_state(fut):
+            self._pending_lifecycle_fetches.discard(node_fqn)
+            self.destroy_client(client)
+            try:
+                resp = fut.result()
+                if resp is not None:
+                    self._lifecycle_state_cache[node_fqn] = resp.current_state.label
+                    self._graph_dirty = True
+                    self.get_logger().debug(
+                        f'[lifecycle] initial state for {node_fqn}: {resp.current_state.label}'
+                    )
+            except Exception as e:
+                self.get_logger().debug(f'[lifecycle] get_state failed for {node_fqn}: {e}')
+
+        future.add_done_callback(_on_get_state)
+
+    def _on_lifecycle_transition(self, msg, node_fqn: str):
+        self._lifecycle_state_cache[node_fqn] = msg.goal_state.label
+        self.get_logger().info(
+            f'[lifecycle] {node_fqn}: {msg.start_state.label} → {msg.goal_state.label} '
+            f'(transition: {msg.transition.label})'
+        )
+        self._enqueue({
+            'type': 'lifecycle_event',
+            'node': node_fqn,
+            'transition': msg.transition.label,
+            'from_state': msg.start_state.label,
+            'to_state': msg.goal_state.label,
+            'timestamp': time.time(),
+        })
+        self._graph_dirty = True
+        self._trigger_graph_poll()
+
+    # ──────────────────────────────────────────────
     # C++ graph watcher integration
     # ──────────────────────────────────────────────
 
     def _on_graph_changed(self, _msg: EmptyMsg):
-        """Debounced callback fired by the C++ osiris_graph_watcher node.
-
-        Resets a 1s one-shot timer on every incoming event, but guarantees the
-        check fires within 2s even if events keep arriving continuously (e.g.
-        during Nav2 startup or active navigation churn).
-        """
+        """Debounced callback fired by the C++ osiris_graph_watcher node."""
         self.get_logger().info("[graph] event received")
-        now = time.time()
+        self._trigger_graph_poll()
+
+    def _trigger_graph_poll(self):
+        """Single debounced entry point for all graph poll triggers.
+
+        Resets a 1s one-shot timer on every call so rapid bursts coalesce
+        into a single poll.
+        """
         if self._graph_debounce_timer is not None:
             self._graph_debounce_timer.cancel()
-        # If we've been debouncing for longer than 2s without firing, run now.
-        if self._graph_debounce_start is not None and (now - self._graph_debounce_start) >= 2.0:
-            self._graph_debounce_start = None
-            self._check_graph_changes()
-            return
-        if self._graph_debounce_start is None:
-            self._graph_debounce_start = now
         self._graph_debounce_timer = threading.Timer(1.0, self._debounce_fire)
         self._graph_debounce_timer.daemon = True
         self._graph_debounce_timer.start()
 
     def _debounce_fire(self):
-        """Called from threading.Timer — schedule poll on the ROS executor thread."""
+        """Called from threading.Timer — run the graph poll directly."""
         self.get_logger().info("[graph] watcher triggered poll")
-        self._graph_debounce_start = None
-        # Avoid calling _check_graph_changes directly from a timer thread;
-        # post it to the ROS executor thread via a one-shot timer.
-        self._debounce_ros_timer = self.create_timer(0.0, self._debounce_poll_once)
+        self._check_graph_changes()
 
     # ──────────────────────────────────────────────
     # Parameters (async, lazy-loaded)
     # ──────────────────────────────────────────────
-
-    def _debounce_poll_once(self):
-        """One-shot ROS timer callback — cancel self then run the graph poll."""
-        t = getattr(self, '_debounce_ros_timer', None)
-        if t is not None:
-            t.cancel()
-            self._debounce_ros_timer = None
-        self._check_graph_changes()
 
     def _do_startup_check(self):
         """One-shot timer: run the initial graph scan then cancel itself."""
@@ -902,11 +1030,92 @@ class WebBridge(Node):
         if not self._first_graph_check_done:
             self._check_graph_changes()
 
-    def _refresh_empty_param_caches(self):
-        """Retry parameter fetch for nodes that don't have cached params yet."""
-        for fqn in self._active_nodes:
-            if not self._node_parameter_cache.get(fqn):
-                self._fetch_node_parameters_async(fqn)
+    def _cancel_param_fetch_timer(self):
+        """Cancel the one-shot delayed param-fetch timer after it fires."""
+        t = self._param_fetch_timer
+        if t is not None:
+            t.cancel()
+            self._param_fetch_timer = None
+
+    def _on_parameter_event(self, msg: ParameterEvent):
+        """React to parameter changes published by any node on /parameter_events."""
+        fqn = msg.node
+        if fqn not in self._active_nodes:
+            return
+        cache = dict(self._node_parameter_cache.get(fqn) or {})
+        for param in list(msg.new_parameters) + list(msg.changed_parameters):
+            try:
+                cache[param.name] = parameter_value_to_python(param.value)
+            except Exception:
+                pass
+        for param in msg.deleted_parameters:
+            cache.pop(param.name, None)
+        if cache != self._node_parameter_cache.get(fqn):
+            self._node_parameter_cache[fqn] = cache
+            self.get_logger().debug(f'[params] updated {len(cache)} params for {fqn} via /parameter_events')
+            self._trigger_graph_poll()
+
+    def _fetch_action_types(self, action_name: str, topic_type_map: dict) -> bool:
+        """Resolve and cache goal/result/feedback types for an action server.
+
+        Looks up the [action]/_action/feedback topic type, strips the
+        _FeedbackMessage suffix to derive the base action type, then imports
+        the _Goal / _Result / _Feedback message classes to introspect fields.
+
+        Returns True if types were resolved and enqueued, False if not yet
+        available (e.g. the feedback topic hasn't appeared in DDS yet).
+        """
+        if action_name in self._action_type_cache:
+            return self._action_type_cache[action_name] is not None
+
+        feedback_topic = f'{action_name}/_action/feedback'
+        types_list = topic_type_map.get(feedback_topic)
+        if not types_list:
+            return False
+
+        feedback_msg_type = types_list[0]
+        if not feedback_msg_type.endswith('_FeedbackMessage'):
+            return False
+
+        base_type = feedback_msg_type[:-len('_FeedbackMessage')]
+
+        try:
+            # base_type is e.g. 'nav2_msgs/action/NavigateToPose'
+            # Action sub-types (Goal/Result/Feedback) are nested on the action
+            # class itself — get_message() only handles message types, not actions.
+            import importlib
+            pkg, _, action_name_part = base_type.split('/', 2)
+            # action_name_part may be 'action/NavigateToPose' — take just the class name
+            class_name = action_name_part.split('/')[-1]
+            action_mod = importlib.import_module(f'{pkg}.action')
+            action_cls = getattr(action_mod, class_name)
+
+            goal_cls     = action_cls.Goal
+            result_cls   = action_cls.Result
+            feedback_cls = action_cls.Feedback
+
+            def _fields(cls):
+                try:
+                    return dict(cls.get_fields_and_field_types())
+                except Exception:
+                    return {}
+
+            type_info = {
+                'goal_type':       f'{base_type}_Goal',
+                'result_type':     f'{base_type}_Result',
+                'feedback_type':   f'{base_type}_Feedback',
+                'goal_fields':     _fields(goal_cls),
+                'result_fields':   _fields(result_cls),
+                'feedback_fields': _fields(feedback_cls),
+            }
+            self._action_type_cache[action_name] = type_info
+            self.get_logger().info(f'[actions] resolved types for {action_name}: {base_type}')
+            self._graph_dirty = True
+            return True
+        except Exception as e:
+            self.get_logger().warning(f'[actions] failed to resolve types for {action_name}: {e}')
+            self._action_type_cache[action_name] = None  # mark failed — avoid retry spam
+            return False
 
     def _fetch_node_parameters_async(self, fqn: str):
         """Fetch parameters for *fqn* without blocking the executor.
@@ -921,6 +1130,7 @@ class WebBridge(Node):
         list_client = self.create_client(ListParameters, f"{fqn}/list_parameters")
         if not list_client.service_is_ready():
             self.destroy_client(list_client)
+            self._nodes_no_param_service.add(fqn)
             return
 
         self._pending_param_fetches.add(fqn)
@@ -933,6 +1143,7 @@ class WebBridge(Node):
             response = fut.result()
             if response is None or not response.result.names:
                 self._pending_param_fetches.discard(fqn)
+                self._node_parameter_cache[fqn] = {}  # fetched but empty — stop retrying
                 return
             param_names = list(response.result.names)
             get_client = self.create_client(GetParameters, f"{fqn}/get_parameters")
@@ -965,7 +1176,7 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
 
     def _collect_telemetry(self):
-        if not self._telemetry_enabled or not self.ws or not self.loop:
+        if not self.ws or not self.loop:
             return
         self._enqueue({
             'type': 'telemetry',
@@ -973,17 +1184,21 @@ class WebBridge(Node):
             'timestamp': time.time(),
         })
 
+    def _on_battery_state(self, msg) -> None:
+        """Cache the latest BatteryState message for inclusion in telemetry snapshots."""
+        try:
+            self._last_battery_state = {
+                'percent':  round(float(msg.percentage) * 100.0, 1) if msg.percentage == msg.percentage else None,  # NaN guard
+                'voltage':  round(float(msg.voltage), 3)  if msg.voltage  == msg.voltage  else None,
+                'current':  round(float(msg.current), 3)  if msg.current  == msg.current  else None,
+                'status':   int(msg.power_supply_status),
+                'present':  bool(msg.present),
+            }
+        except Exception:
+            pass
+
     def _get_telemetry_snapshot(self) -> dict:
         cpu_now = round(psutil.cpu_percent(interval=None), 1)
-        self._cpu_history.append(cpu_now)
-
-        def _rolling(n: int) -> float | None:
-            window = list(self._cpu_history)[-n:]
-            return round(sum(window) / len(window), 1) if window else None
-
-        load1  = _rolling(60)
-        load5  = _rolling(300)
-        load15 = _rolling(900)
 
         vm = psutil.virtual_memory()
         ram_percent = vm.percent
@@ -1031,10 +1246,9 @@ class WebBridge(Node):
 
         return {
             'cpu': {
-                'now':    cpu_now,
-                'load1':  load1,
-                'load5':  load5,
-                'load15': load15,
+                'now':       cpu_now,
+                'throttling': None,
+                'temp':      cpu_c,
             },
             'ram': {
                 'percent':  round(ram_percent, 1),
@@ -1052,9 +1266,60 @@ class WebBridge(Node):
                 'tx_mbps': net_tx_mbps,
                 'rx_mbps': net_rx_mbps,
             },
-            'temp': {
-                'cpu_c': cpu_c,
-            },
+            'battery': self._last_battery_state,
+        }
+
+    def _get_cpu_model(self) -> str | None:
+        try:
+            if os.path.exists('/proc/cpuinfo'):
+                with open('/proc/cpuinfo') as f:
+                    for line in f:
+                        if line.lower().startswith(('model name', 'hardware', 'processor')):
+                            _, value = line.split(':', 1)
+                            value = value.strip()
+                            if value:
+                                return value
+        except Exception:
+            pass
+
+        cpu_model = platform.processor() or platform.machine()
+        return cpu_model or None
+
+    def _get_robot_model(self) -> str | None:
+        for env_name in ('OSIRIS_ROBOT_MODEL', 'ROBOT_MODEL'):
+            value = os.environ.get(env_name)
+            if value:
+                return value
+
+        for path in ('/proc/device-tree/model', '/sys/firmware/devicetree/base/model'):
+            try:
+                if os.path.exists(path):
+                    with open(path, 'rb') as f:
+                        value = f.read().decode(errors='ignore').strip('\x00\n ')
+                        if value:
+                            return value
+            except Exception:
+                pass
+        return None
+
+    def _get_initial_state_meta(self, telemetry: dict | None = None) -> dict:
+        ram_total_mb = None
+        try:
+            ram_total_mb = telemetry.get('ram', {}).get('total_mb') if telemetry else None
+            if ram_total_mb is None:
+                ram_total_mb = round(psutil.virtual_memory().total / (1024 * 1024), 1)
+        except Exception:
+            pass
+
+        return {
+            'agentVersion': AGENT_VERSION,
+            'ros_distro': os.environ.get('ROS_DISTRO'),
+            'cpu_model': self._get_cpu_model(),
+            'cpu_cores': psutil.cpu_count(logical=False),
+            'cpu_threads': psutil.cpu_count(logical=True),
+            'ram_total_mb': ram_total_mb,
+            'arch': platform.machine() or None,
+            'robot_model': self._get_robot_model(),
         }
 
     # ──────────────────────────────────────────────
@@ -1300,11 +1565,26 @@ class WebBridge(Node):
             'tree_id': None, 'tree': None, 'nodes': [],
         }
 
+    def _bt_snapshot_from_state_event(self, src: dict) -> dict:
+        return {
+            'timestamp': src.get('timestamp', time.time()),
+            'tree_id': src.get('tree_id'),
+            'tree': src.get('tree'),
+            'nodes': src.get('nodes', []),
+        }
+
     # ──────────────────────────────────────────────
     # Cleanup
     # ──────────────────────────────────────────────
 
     def destroy_node(self):
+        # Cancel pending debounce timer so it doesn't fire after shutdown.
+        if self._graph_debounce_timer is not None:
+            try:
+                self._graph_debounce_timer.cancel()
+            except Exception:
+                pass
+            self._graph_debounce_timer = None
         if self._tf_tree is not None:
             self._tf_tree.destroy()
         if self._bt_collector:
@@ -1313,7 +1593,6 @@ class WebBridge(Node):
 
 
 def main(args=None):
-    import platform
     import shutil
     import subprocess
     import importlib.resources
@@ -1382,13 +1661,25 @@ def main(args=None):
     node = WebBridge(watcher_proc=_watcher_proc)
 
     # Forward graph_watcher stderr to the ROS logger so crashes are visible.
+    # Suppress rclcpp signal-handler lines (pure noise) and fall back to plain
+    # stderr once rclpy is shutting down to avoid publishing on an invalid context.
     if _watcher_proc and _watcher_proc.stderr:
         def _forward_watcher_stderr():
             ros_log = node.get_logger()
             for line in _watcher_proc.stderr:
                 decoded = line.decode().rstrip()
-                if decoded:
-                    ros_log.info(f'[gw] {decoded}')
+                if not decoded:
+                    continue
+                # rclcpp prints these on SIGINT/SIGTERM — informational noise.
+                if 'signal_handler(' in decoded:
+                    continue
+                if rclpy.ok():
+                    try:
+                        ros_log.info(f'[gw] {decoded}')
+                        continue
+                    except Exception:
+                        pass
+                print(f'[gw] {decoded}', file=sys.stderr, flush=True)
         threading.Thread(target=_forward_watcher_stderr, daemon=True).start()
 
     try:
@@ -1396,12 +1687,29 @@ def main(args=None):
     except (KeyboardInterrupt, rclpy.executors.ExternalShutdownException):
         pass
     finally:
-        node.destroy_node()
-        if rclpy.ok():
-            rclpy.shutdown()
+        # Stop the C++ watcher first so its stderr pipe closes and the
+        # forwarder thread exits before we tear down the rclpy context.
         if _watcher_proc is not None:
-            _watcher_proc.terminate()
-            _watcher_proc.wait(timeout=3)
+            try:
+                _watcher_proc.terminate()
+                _watcher_proc.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                _watcher_proc.kill()
+                try:
+                    _watcher_proc.wait(timeout=2)
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            node.destroy_node()
+        except Exception:
+            pass
+        if rclpy.ok():
+            try:
+                rclpy.shutdown()
+            except Exception:
+                pass
 
 
 if __name__ == '__main__':
