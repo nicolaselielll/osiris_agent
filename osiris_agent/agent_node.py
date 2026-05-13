@@ -55,8 +55,9 @@ class WebBridge(Node):
         # Declare tunable parameters
         self.declare_parameter('graph_check_interval', GRAPH_CHECK_INTERVAL)
         self.declare_parameter('telemetry_interval',   TELEMETRY_INTERVAL)
-        self.declare_parameter('tf_tree_enabled',      False)
-        self.declare_parameter('battery_topic',        '/battery_state')
+        self.declare_parameter('tf_tree_enabled',        False)
+        self.declare_parameter('ros2_control_enabled',   False)
+        self.declare_parameter('battery_topic',          '/battery_state')
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -138,9 +139,7 @@ class WebBridge(Node):
         psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
 
         # ── Collectors ────────────────────────────────────────────────────────
-        ros2_control_enabled = os.environ.get(
-            'OSIRIS_ROS2_CONTROL_ENABLED', ''
-        ).lower() in ('true', '1', 'yes')
+        ros2_control_enabled = self.get_parameter('ros2_control_enabled').get_parameter_value().bool_value
         if ros2_control_enabled:
             self._ros2_control = Ros2ControlCollector(
                 node=self,
@@ -460,6 +459,7 @@ class WebBridge(Node):
             def _fetch_all_params_delayed():
                 for fqn in list(current_nodes):
                     self._fetch_node_parameters_async(fqn)
+                    self._fetch_lifecycle_state_async(fqn)
             self._param_fetch_timer = self.create_timer(5.0, lambda: (self._cancel_param_fetch_timer(), _fetch_all_params_delayed()))
             for _t in current_topics:
                 if _t.endswith('/transition_event'):
