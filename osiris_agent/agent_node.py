@@ -31,6 +31,7 @@ from .tf_tree_collector import TfTreeCollector
 # ──────────────────────────────────────────────
 GRAPH_CHECK_INTERVAL       = 2.0   # seconds between graph polls
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
+TF_TREE_INTERVAL           = 0.2   # seconds between tf_tree polls (5 Hz)
 SERVICE_SCAN_INTERVAL      = 30.0  # seconds between service graph scans
 MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
@@ -39,6 +40,7 @@ RECONNECT_MAX_DELAY        = 30    # seconds
 # Services to suppress from graph output (internal ROS2 plumbing)
 _SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
 
+ACTION_FEEDBACK_MIN_INTERVAL = 0.2  # seconds between forwarded feedback messages per action (5 Hz cap)
 
 class WebBridge(Node):
 
@@ -82,6 +84,12 @@ class WebBridge(Node):
         # dict  = { goal_type, result_type, feedback_type,
         #           goal_fields, result_fields, feedback_fields }
         self._action_type_cache: dict[str, dict | None] = {}
+
+        # ── Action monitoring (status + feedback) ─────────────────────────────
+        self._action_status_subs:       dict[str, rclpy.subscription.Subscription] = {}
+        self._action_feedback_subs:     dict[str, rclpy.subscription.Subscription] = {}
+        self._action_goal_states:       dict[str, dict[str, int]] = {}  # action → {uuid_hex → status_int}
+        self._action_feedback_throttle: dict[str, float] = {}           # action → last_sent_time
 
         # ── Count sentinels (cheap change detection) ─────────────────────────
         self._topic_counts: dict[str, tuple[int, int]] = {}  # topic → (pub_n, sub_n)
@@ -168,6 +176,7 @@ class WebBridge(Node):
         )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
         self.create_timer(_telemetry_interval,         self._collect_telemetry)
+        self.create_timer(TF_TREE_INTERVAL,             self._poll_tf_tree)
 
         # ── Battery state subscription ────────────────────────────────────────
         _battery_topic = self.get_parameter('battery_topic').get_parameter_value().string_value
@@ -456,9 +465,10 @@ class WebBridge(Node):
                 if _t.endswith('/transition_event'):
                     self._subscribe_lifecycle_topic(_t)
                     self._fetch_lifecycle_state_async(_t[:-len('/transition_event')])
-            # Resolve action types for all actions already live at startup
+            # Resolve action types and subscribe monitoring for all actions at startup
             for a in current_actions:
                 self._fetch_action_types(a, topic_type_map)
+                self._subscribe_action_status(a)
             if self._ros2_control is not None:
                 self._ros2_control.poll(force=True)
             if self._tf_tree is not None:
@@ -476,18 +486,16 @@ class WebBridge(Node):
         if started_nodes:
             self.get_logger().info(f"[poll] {len(started_nodes)} node(s) started: {sorted(started_nodes)}")
             self._pending_topic_enrichment.update(self._active_topics)
+            self._graph_dirty = True
         for fqn in started_nodes:
             self._nodes_no_param_service.discard(fqn)  # allow retry after restart
             self._fetch_node_parameters_async(fqn)
             self._fetch_lifecycle_state_async(fqn)
-            self._send_event_and_update({
-                'type': 'node_event', 'node': fqn,
-                'event': 'started', 'timestamp': time.time(),
-            })
 
         stopped_nodes = self._active_nodes - current_nodes
         if stopped_nodes:
             self.get_logger().info(f"[poll] {len(stopped_nodes)} node(s) stopped: {sorted(stopped_nodes)}")
+            self._graph_dirty = True
         for fqn in stopped_nodes:
             for topic, rel in self._topic_relations.items():
                 if fqn in rel.get('publishers', set()) or fqn in rel.get('subscribers', set()):
@@ -496,18 +504,11 @@ class WebBridge(Node):
             self._pending_param_fetches.discard(fqn)
             self._lifecycle_state_cache.pop(fqn, None)
             self._pending_lifecycle_fetches.discard(fqn)
-            self._send_event_and_update({
-                'type': 'node_event', 'node': fqn,
-                'event': 'stopped', 'timestamp': time.time(),
-            })
 
         # ── 3. Topic events ───────────────────────────────────────────────────
         for t in current_topics - self._active_topics:
             self._pending_topic_enrichment.add(t)
-            self._send_event_and_update({
-                'type': 'topic_event', 'topic': t,
-                'event': 'created', 'timestamp': time.time(),
-            })
+            self._graph_dirty = True
             if t.endswith('/transition_event'):
                 self._subscribe_lifecycle_topic(t)
             # Nav2 BT edge-case: /behavior_tree_log just appeared
@@ -526,10 +527,7 @@ class WebBridge(Node):
             self._topic_relations.pop(t, None)
             self._topic_counts.pop(t, None)
             self._pending_topic_enrichment.discard(t)
-            self._send_event_and_update({
-                'type': 'topic_event', 'topic': t,
-                'event': 'destroyed', 'timestamp': time.time(),
-            })
+            self._graph_dirty = True
             if t.endswith('/transition_event'):
                 lc_sub = self._lifecycle_subs.pop(t, None)
                 if lc_sub:
@@ -537,33 +535,21 @@ class WebBridge(Node):
             if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
                 self._on_nav2_bt_gone()
 
-        # ── 4. Service events (only every SERVICE_SCAN_INTERVAL) ──────────────
+        # ── 4. Service changes (only every SERVICE_SCAN_INTERVAL) ─────────────
         if _do_service_scan:
-            for s in set(current_services) - set(self._active_services):
-                self._send_event_and_update({
-                    'type': 'service_event', 'service': s,
-                    'event': 'created', 'timestamp': time.time(),
-                })
-            for s in set(self._active_services) - set(current_services):
-                self._send_event_and_update({
-                    'type': 'service_event', 'service': s,
-                    'event': 'destroyed', 'timestamp': time.time(),
-                })
+            if set(current_services) != set(self._active_services):
+                self._graph_dirty = True
 
         # ── 5. Action events ──────────────────────────────────────────────────
         for a in current_actions - self._active_actions:
             self._fetch_action_types(a, topic_type_map)
-            self._send_event_and_update({
-                'type': 'action_event', 'action': a,
-                'event': 'created', 'timestamp': time.time(),
-            })
+            self._subscribe_action_status(a)
+            self._graph_dirty = True
 
         for a in self._active_actions - current_actions:
             self._action_type_cache.pop(a, None)
-            self._send_event_and_update({
-                'type': 'action_event', 'action': a,
-                'event': 'destroyed', 'timestamp': time.time(),
-            })
+            self._unsubscribe_action_monitoring(a)
+            self._graph_dirty = True
 
         # ── 6. Update existence caches ────────────────────────────────────────
         self._active_nodes    = current_nodes
@@ -680,17 +666,8 @@ class WebBridge(Node):
             self._topic_counts[topic] = (len(pub_infos), len(sub_infos))
 
             if old is not None:
-                old_subs = old['subscribers']
-                for fqn in subscribers - old_subs:
-                    self._send_event_and_update({
-                        'type': 'topic_event', 'topic': topic, 'node': fqn,
-                        'event': 'subscribed', 'timestamp': time.time(),
-                    })
-                for fqn in old_subs - subscribers:
-                    self._send_event_and_update({
-                        'type': 'topic_event', 'topic': topic, 'node': fqn,
-                        'event': 'unsubscribed', 'timestamp': time.time(),
-                    })
+                if subscribers != old['subscribers']:
+                    self._graph_dirty = True
 
                 # Nav2 BT: publisher appeared/vanished on /behavior_tree_log
                 if topic == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
@@ -984,6 +961,83 @@ class WebBridge(Node):
         self._trigger_graph_poll()
 
     # ──────────────────────────────────────────────
+    # Action monitoring (status + feedback)
+    # ──────────────────────────────────────────────
+
+    def _subscribe_action_status(self, action_name: str):
+        if action_name in self._action_status_subs:
+            return
+        try:
+            from action_msgs.msg import GoalStatusArray
+            sub = self.create_subscription(
+                GoalStatusArray,
+                f'{action_name}/_action/status',
+                lambda msg, a=action_name: self._on_action_status(msg, a),
+                QoSProfile(depth=10),
+            )
+            self._action_status_subs[action_name] = sub
+            self.get_logger().info(f'[actions] subscribed to status for {action_name}')
+        except Exception as e:
+            self.get_logger().warning(f'[actions] failed to subscribe to status for {action_name}: {e}')
+
+    def _subscribe_action_feedback(self, action_name: str, feedback_msg_cls):
+        if action_name in self._action_feedback_subs:
+            return
+        try:
+            sub = self.create_subscription(
+                feedback_msg_cls,
+                f'{action_name}/_action/feedback',
+                lambda msg, a=action_name: self._on_action_feedback(msg, a),
+                QoSProfile(depth=10),
+            )
+            self._action_feedback_subs[action_name] = sub
+            self.get_logger().info(f'[actions] subscribed to feedback for {action_name}')
+        except Exception as e:
+            self.get_logger().warning(f'[actions] failed to subscribe to feedback for {action_name}: {e}')
+
+    def _unsubscribe_action_monitoring(self, action_name: str):
+        sub = self._action_status_subs.pop(action_name, None)
+        if sub:
+            self.destroy_subscription(sub)
+        sub = self._action_feedback_subs.pop(action_name, None)
+        if sub:
+            self.destroy_subscription(sub)
+        self._action_goal_states.pop(action_name, None)
+        self._action_feedback_throttle.pop(action_name, None)
+
+    def _on_action_status(self, msg, action_name: str):
+        prev = self._action_goal_states.get(action_name, {})
+        current = {bytes(s.goal_info.goal_id.uuid).hex(): s.status for s in msg.status_list}
+        for uuid_hex, status in current.items():
+            if uuid_hex not in prev or prev[uuid_hex] != status:
+                self._enqueue({
+                    'type': 'goal_event',
+                    'action': action_name,
+                    'goal_id': uuid_hex,
+                    'status': status,
+                    'timestamp': time.time(),
+                })
+        self._action_goal_states[action_name] = current
+
+    def _on_action_feedback(self, msg, action_name: str):
+        now = time.time()
+        if now - self._action_feedback_throttle.get(action_name, 0.0) < ACTION_FEEDBACK_MIN_INTERVAL:
+            return
+        self._action_feedback_throttle[action_name] = now
+        try:
+            feedback_data = message_to_ordereddict(msg.feedback)
+        except Exception as e:
+            self.get_logger().warning(f'[actions] feedback serialization failed for {action_name}: {e}')
+            return
+        self._enqueue({
+            'type': 'action_feedback',
+            'action': action_name,
+            'goal_id': bytes(msg.goal_id.uuid).hex(),
+            'feedback': feedback_data,
+            'timestamp': now,
+        })
+
+    # ──────────────────────────────────────────────
     # C++ graph watcher integration
     # ──────────────────────────────────────────────
 
@@ -1089,6 +1143,10 @@ class WebBridge(Node):
             class_name = action_name_part.split('/')[-1]
             action_mod = importlib.import_module(f'{pkg}.action')
             action_cls = getattr(action_mod, class_name)
+            # Use get_message() for the _FeedbackMessage type — it IS a standalone message
+            # type (unlike _Goal/_Result/_Feedback which are nested). The type string
+            # comes directly from the topic registry so it's always correct.
+            feedback_msg_cls = get_message(feedback_msg_type)
 
             goal_cls     = action_cls.Goal
             result_cls   = action_cls.Result
@@ -1111,6 +1169,7 @@ class WebBridge(Node):
             self._action_type_cache[action_name] = type_info
             self.get_logger().info(f'[actions] resolved types for {action_name}: {base_type}')
             self._graph_dirty = True
+            self._subscribe_action_feedback(action_name, feedback_msg_cls)
             return True
         except Exception as e:
             self.get_logger().warning(f'[actions] failed to resolve types for {action_name}: {e}')
@@ -1343,14 +1402,6 @@ class WebBridge(Node):
             'liveliness':  qos.liveliness.name  if hasattr(qos.liveliness,  'name') else str(qos.liveliness),
         }
 
-    def _send_event_and_update(self, event: dict, log: str = ''):
-        """Queue an event to the WS send loop and mark the graph dirty."""
-        if log:
-            self.get_logger().debug(log)
-        if event:
-            self._enqueue(event)
-        self._graph_dirty = True
-
     def _enqueue(self, payload: dict):
         """Thread-safe enqueue to the asyncio send queue."""
         if self.ws and self.loop:
@@ -1362,6 +1413,11 @@ class WebBridge(Node):
     # ──────────────────────────────────────────────
     # Collector event handlers
     # ──────────────────────────────────────────────
+
+    def _poll_tf_tree(self):
+        """Periodic 1 Hz timer callback to keep tf_tree updates flowing."""
+        if self._tf_tree is not None:
+            self._tf_tree.poll()
 
     def _on_ros2_control_event(self, event: dict):
         self._enqueue(event)
@@ -1382,7 +1438,8 @@ class WebBridge(Node):
         try:
             from nav2_msgs.msg import BehaviorTreeLog
             from action_msgs.msg import GoalStatusArray
-            self._nav2_bt_statuses:        dict[str, str] = {}
+            self._nav2_bt_statuses:           dict[str, str] = {}
+            self._nav2_bt_last_sent_statuses:  dict[str, str] = {}  # what client currently has
             self._nav2_bt_session_active   = False
             self._nav2_bt_publisher_active = False
             self._nav2_bt_tree_id          = None
@@ -1474,32 +1531,45 @@ class WebBridge(Node):
         if not self._load_and_parse_bt_xml():
             return
 
-        changes = []
+        # Collapse all transitions in this log tick to the final status per node.
+        # The event_log can contain multiple entries for the same node (e.g.
+        # RUNNING → FAILURE → IDLE) — only the last one matters to the client.
         has_running = False
+        final_per_node: dict[str, str] = {}  # node_name → final status this tick
         for change in msg.event_log:
             self._nav2_bt_statuses[change.node_name] = change.current_status
-            uid = self._nav2_bt_name_to_uid.get(change.node_name)
-            if uid is not None:
-                changes.append({
-                    'uid': uid, 'name': change.node_name,
-                    'tag': '', 'status': change.current_status,
-                    'previous_status': change.previous_status,
-                })
+            final_per_node[change.node_name] = change.current_status
             if change.current_status == 'RUNNING':
                 has_running = True
 
         if has_running and not self._nav2_bt_session_active:
             self.get_logger().info("[bt] navigation session started")
             self._nav2_bt_session_active = True
+            # Full tree send — sync last-sent cache
+            self._nav2_bt_last_sent_statuses = {
+                nd['name']: self._nav2_bt_statuses.get(nd['name'], 'IDLE')
+                for nd in self._nav2_bt_nodes_list
+            }
             self._on_bt_event({
                 'type': 'bt_tree', 'timestamp': time.time(),
                 'tree_id': self._nav2_bt_tree_id,
                 'tree': self._nav2_bt_tree_structure,
                 'nodes': [
-                    {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
+                    {**nd, 'status': self._nav2_bt_last_sent_statuses.get(nd['name'], 'IDLE')}
                     for nd in self._nav2_bt_nodes_list
                 ],
             })
+            return  # full tree already sent; skip bt_status this tick
+
+        # Only send nodes whose final status this tick differs from what client has
+        changes = []
+        for node_name, status in final_per_node.items():
+            if self._nav2_bt_last_sent_statuses.get(node_name) == status:
+                continue
+            uid = self._nav2_bt_name_to_uid.get(node_name)
+            if uid is not None:
+                changes.append({'uid': uid, 'name': node_name, 'tag': '', 'status': status})
+                self._nav2_bt_last_sent_statuses[node_name] = status
 
         if changes:
             self._on_bt_event({
@@ -1529,6 +1599,7 @@ class WebBridge(Node):
         self._nav2_bt_publisher_active = False
         self._nav2_bt_session_active   = False
         self._nav2_bt_statuses.clear()
+        self._nav2_bt_last_sent_statuses.clear()
         self._nav2_bt_tree_id          = None
         self._nav2_bt_tree_structure   = None
         self._nav2_bt_nodes_list       = []
