@@ -58,6 +58,7 @@ class WebBridge(Node):
         self.declare_parameter('bt_host',                '127.0.0.1')
         self.declare_parameter('bt_server_port',         1667)
         self.declare_parameter('bt_publisher_port',      1668)
+        self.declare_parameter('bt_collector_enabled',   False)
 
         self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
 
@@ -188,9 +189,7 @@ class WebBridge(Node):
         threading.Thread(target=self._run_ws_client, daemon=True).start()
 
         # ── Optional BT collectors ────────────────────────────────────────────
-        bt_enabled = os.environ.get(
-            'OSIRIS_BT_COLLECTOR_ENABLED', ''
-        ).lower() in ('true', '1', 'yes')
+        bt_enabled = self.get_parameter('bt_collector_enabled').get_parameter_value().bool_value
         if bt_enabled:
             self._bt_collector = BTCollector(
                 event_callback=self._on_bt_event,
