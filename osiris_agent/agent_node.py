@@ -29,7 +29,6 @@ from .tf_tree_collector import TfTreeCollector
 # ──────────────────────────────────────────────
 # Constants
 # ──────────────────────────────────────────────
-GRAPH_CHECK_INTERVAL       = 2.0   # seconds between graph polls
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
 TF_TREE_INTERVAL           = 0.2   # seconds between tf_tree polls (5 Hz)
 SERVICE_SCAN_INTERVAL      = 30.0  # seconds between service graph scans
@@ -53,8 +52,6 @@ class WebBridge(Node):
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
 
         # Declare tunable parameters
-        self.declare_parameter('graph_check_interval', GRAPH_CHECK_INTERVAL)
-        self.declare_parameter('telemetry_interval',   TELEMETRY_INTERVAL)
         self.declare_parameter('tf_tree_enabled',        False)
         self.declare_parameter('ros2_control_enabled',   False)
         self.declare_parameter('battery_topic',          '/battery_state')
@@ -157,9 +154,6 @@ class WebBridge(Node):
         ) if _tf_tree_enabled else None
 
         # ── Timers ────────────────────────────────────────────────────────────
-        _graph_interval     = self.get_parameter('graph_check_interval').get_parameter_value().double_value
-        _telemetry_interval = self.get_parameter('telemetry_interval').get_parameter_value().double_value
-
         # Subscribe to C++ graph watcher events — event-driven polls.
         # The one-shot startup timer guarantees an initial scan even when the
         # C++ watcher binary is unavailable (e.g. pip install without binary).
@@ -175,7 +169,7 @@ class WebBridge(Node):
             self._on_parameter_event, 100,
         )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
-        self.create_timer(_telemetry_interval,         self._collect_telemetry)
+        self.create_timer(TELEMETRY_INTERVAL,           self._collect_telemetry)
         self.create_timer(TF_TREE_INTERVAL,             self._poll_tf_tree)
 
         # ── Battery state subscription ────────────────────────────────────────
