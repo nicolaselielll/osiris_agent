@@ -30,7 +30,6 @@ from .tf_tree_collector import TfTreeCollector
 # Constants
 # ──────────────────────────────────────────────
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
-TF_TREE_INTERVAL           = 0.2   # seconds between tf_tree polls (5 Hz)
 MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
 RECONNECT_MAX_DELAY        = 30    # seconds
@@ -58,6 +57,7 @@ class WebBridge(Node):
         self.declare_parameter('bt_host',               '127.0.0.1')
         self.declare_parameter('bt_server_port',         1667)
         self.declare_parameter('bt_publisher_port',      1668)
+        self.declare_parameter('tf_tree_poll_interval',   0.2)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -170,8 +170,9 @@ class WebBridge(Node):
             self._on_parameter_event, 100,
         )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
+        _tf_tree_poll_interval = self.get_parameter('tf_tree_poll_interval').get_parameter_value().double_value
         self.create_timer(TELEMETRY_INTERVAL,          self._collect_telemetry)
-        self.create_timer(TF_TREE_INTERVAL,             self._poll_tf_tree)
+        self.create_timer(_tf_tree_poll_interval,      self._poll_tf_tree)
 
         # ── Battery state subscription ────────────────────────────────────────
         _battery_topic = self.get_parameter('battery_topic').get_parameter_value().string_value
