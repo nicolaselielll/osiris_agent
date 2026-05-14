@@ -151,13 +151,8 @@ class TfTreeCollector:
         try:
             import tf2_ros
             self._tf_buffer = tf2_ros.Buffer()
-            # spin_thread=False: the node is already being spun by rclpy.spin()
-            # in the main thread. Using spin_thread=True would add the node to a
-            # second SingleThreadedExecutor that competes with the main executor,
-            # causing the main executor to be starved when the TF timer fires at
-            # 5 Hz — which manifests as telemetry stopping and the graph resetting.
             self._tf_listener = tf2_ros.TransformListener(
-                self._tf_buffer, self._node, spin_thread=False
+                self._tf_buffer, self._node, spin_thread=True
             )
             return True
         except Exception as e:

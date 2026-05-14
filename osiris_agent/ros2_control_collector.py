@@ -80,11 +80,11 @@ class Ros2ControlCollector:
 
     def get_controllers_snapshot(self):
         """Return last known controllers state (for initial_state)."""
-        return self._last_sent_controllers if self._last_sent_controllers is not None else []
+        return self._last_sent_controllers
 
     def get_hardware_snapshot(self):
         """Return last known hardware state (for initial_state)."""
-        return self._last_sent_hardware if self._last_sent_hardware is not None else []
+        return self._last_sent_hardware
 
     # ------------------------------------------------------------------
     # Internals
