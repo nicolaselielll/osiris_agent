@@ -58,10 +58,11 @@ class WebBridge(Node):
         self.declare_parameter('tf_tree_enabled',        False)
         self.declare_parameter('ros2_control_enabled',   False)
         self.declare_parameter('battery_topic',          '/battery_state')
+        self.declare_parameter('bt_host',                '127.0.0.1')
+        self.declare_parameter('bt_server_port',         1667)
+        self.declare_parameter('bt_publisher_port',      1668)
 
-        base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        self.ws_url = f'wss://osiris-gateway.fly.dev?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -199,6 +200,9 @@ class WebBridge(Node):
         if bt_enabled:
             self._bt_collector = BTCollector(
                 event_callback=self._on_bt_event,
+                host=self.get_parameter('bt_host').get_parameter_value().string_value,
+                server_port=self.get_parameter('bt_server_port').get_parameter_value().integer_value,
+                publisher_port=self.get_parameter('bt_publisher_port').get_parameter_value().integer_value,
                 logger=self.get_logger(),
             )
             self._bt_collector.start()
@@ -1345,11 +1349,6 @@ class WebBridge(Node):
         return cpu_model or None
 
     def _get_robot_model(self) -> str | None:
-        for env_name in ('OSIRIS_ROBOT_MODEL', 'ROBOT_MODEL'):
-            value = os.environ.get(env_name)
-            if value:
-                return value
-
         for path in ('/proc/device-tree/model', '/sys/firmware/devicetree/base/model'):
             try:
                 if os.path.exists(path):
