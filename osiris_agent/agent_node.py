@@ -31,7 +31,6 @@ from .tf_tree_collector import TfTreeCollector
 # ──────────────────────────────────────────────
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
 TF_TREE_INTERVAL           = 0.2   # seconds between tf_tree polls (5 Hz)
-SERVICE_SCAN_INTERVAL      = 30.0  # seconds between service graph scans
 MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
 RECONNECT_MAX_DELAY        = 30    # seconds
@@ -121,7 +120,6 @@ class WebBridge(Node):
         self._graph_debounce_timer: threading.Timer | None = None
 
         # ── Service scan throttle ─────────────────────────────────────────────
-        self._last_service_scan: float = 0.0
         self._service_rescan_ticks: int = 0
 
         # ── Initial scan synchronization ──────────────────────────────────────
@@ -410,8 +408,7 @@ class WebBridge(Node):
             f"({len(current_nodes)} nodes, {len(current_topics)} topics, {len(current_actions)} actions)"
         )
 
-        # ── 1b. Service scan — throttled to SERVICE_SCAN_INTERVAL ─────────────
-        _now = time.time()
+        # ── 1b. Service scan ─── on node changes and follow-up ticks only ────────
         _nodes_stopped  = self._first_graph_check_done and bool(self._active_nodes - current_nodes)
         _nodes_started  = self._first_graph_check_done and bool(current_nodes - self._active_nodes)
         _do_service_scan = (
@@ -419,10 +416,8 @@ class WebBridge(Node):
             or _nodes_stopped
             or _nodes_started
             or self._service_rescan_ticks > 0
-            or (_now - self._last_service_scan) >= SERVICE_SCAN_INTERVAL
         )
         if _do_service_scan:
-            self._last_service_scan = _now
             if _nodes_stopped:
                 # Schedule follow-up scans to catch DDS endpoint lag.
                 self._service_rescan_ticks = 4
@@ -534,7 +529,7 @@ class WebBridge(Node):
             if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
                 self._on_nav2_bt_gone()
 
-        # ── 4. Service changes (only every SERVICE_SCAN_INTERVAL) ─────────────
+        # ── 4. Service changes ─────────────────────────────────────────────────────────────
         if _do_service_scan:
             if set(current_services) != set(self._active_services):
                 self._graph_dirty = True
