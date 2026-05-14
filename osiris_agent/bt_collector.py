@@ -10,7 +10,6 @@ Events are forwarded to the WebBridge for transmission over WebSocket.
 """
 
 import json
-import os
 import struct
 import threading
 import time
@@ -94,16 +93,15 @@ class BTCollector:
         
         Args:
             event_callback: Function to call with parsed events (dict)
-            host: Groot2 host address (default: from BT_HOST env or 127.0.0.1)
-            server_port: Groot2 server port (default: from BT_SERVER_PORT env or 1667)
-            publisher_port: Groot2 publisher port (default: from BT_PUBLISHER_PORT env or 1668)
+            host: Groot2 host address (default: 127.0.0.1)
+            server_port: Groot2 server port (default: 1667)
+            publisher_port: Groot2 publisher port (default: 1668)
             logger: Optional logger (uses print if None)
         """
         self._event_callback = event_callback
-        # Read from environment variables with fallback to defaults
-        self._host = host or os.environ.get('OSIRIS_BT_HOST', DEFAULT_HOST)
-        self._server_port = server_port or int(os.environ.get('OSIRIS_BT_SERVER_PORT', str(DEFAULT_SERVER_PORT)))
-        self._publisher_port = publisher_port or int(os.environ.get('OSIRIS_BT_PUBLISHER_PORT', str(DEFAULT_PUBLISHER_PORT)))
+        self._host = host if host is not None else DEFAULT_HOST
+        self._server_port = server_port if server_port is not None else DEFAULT_SERVER_PORT
+        self._publisher_port = publisher_port if publisher_port is not None else DEFAULT_PUBLISHER_PORT
         self._logger = logger
         
         self._running = False
