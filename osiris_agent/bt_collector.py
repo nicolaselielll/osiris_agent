@@ -26,8 +26,8 @@ DEFAULT_PUBLISHER_PORT = 1668  # PUB/SUB for breakpoint notifications only
 DEFAULT_HOST = "127.0.0.1"
 
 # ZMQ timeouts
-ZMQ_RECV_TIMEOUT_MS = 2000
-ZMQ_RECONNECT_INTERVAL = 2.0
+ZMQ_RECV_TIMEOUT_MS = 500
+ZMQ_RECONNECT_INTERVAL = 0.5
 STATUS_POLL_INTERVAL = 0.1  # Poll for status every 100ms
 
 
@@ -196,15 +196,15 @@ class BTCollector:
                         tree_received = self._request_tree_structure(req_socket)
                         if not tree_received:
                             # No tree yet, wait and retry
-                            time.sleep(1.0)
+                            time.sleep(ZMQ_RECONNECT_INTERVAL)
                             continue
-                        # Immediately try to fetch current statuses so the initial tree event can include them
+                        # Silently fetch current statuses to embed in the initial bt_tree event.
+                        # suppress_event=True prevents a bt_status from firing before bt_tree.
                         try:
-                            self._poll_status(req_socket)
+                            self._poll_status(req_socket, suppress_event=True)
                         except Exception:
-                            # ignore timeout/errors here; we'll keep trying in the main loop
                             pass
-                        # emit bt_tree now with status merged into nodes (if available)
+                        # emit bt_tree now with status merged into nodes (guaranteed before any bt_status)
                         if self._current_tree:
                             self._log_info("Sending initial tree event with statuses")
                             self._emit_current_tree_event()
@@ -226,7 +226,7 @@ class BTCollector:
                         self._emit_bt_gone_event()
                         self._current_tree = None
                         self._last_statuses.clear()
-                    time.sleep(1.0)
+                    time.sleep(ZMQ_RECONNECT_INTERVAL)
                     
                 except zmq.ZMQError as e:
                     if "current state" in str(e):
@@ -242,7 +242,7 @@ class BTCollector:
                             self._emit_bt_gone_event()
                             self._current_tree = None
                             self._last_statuses.clear()
-                        time.sleep(1.0)
+                        time.sleep(ZMQ_RECONNECT_INTERVAL)
                     else:
                         self._log_error(f"ZMQ error: {e}")
                         time.sleep(0.5)
@@ -254,7 +254,7 @@ class BTCollector:
         finally:
             req_socket.close()
 
-    def _poll_status(self, socket: zmq.Socket):
+    def _poll_status(self, socket: zmq.Socket, suppress_event: bool = False):
         """Poll for status update via REQ/REP."""
         # Send STATUS request: protocol=2, type='S'
         protocol = 2
@@ -274,7 +274,7 @@ class BTCollector:
                 )
                 if self._request_tree_structure(socket):
                     self._emit_current_tree_event()
-            self._handle_status_message(parts, resp_tree_id)
+            self._handle_status_message(parts, resp_tree_id, suppress_event=suppress_event)
 
     def _extract_tree_id_from_header(self, hdr: bytes) -> Optional[str]:
         """
@@ -485,7 +485,7 @@ class BTCollector:
         for child in elem:
             self._extract_nodes_from_xml(child, tree, nodes_list)
 
-    def _handle_status_message(self, parts: list, tree_id: Optional[str] = None):
+    def _handle_status_message(self, parts: list, tree_id: Optional[str] = None, suppress_event: bool = False):
         """
         Parse status update message from Groot2 REQ/REP response.
         
@@ -534,7 +534,7 @@ class BTCollector:
                         'status': status_str
                     })
             
-            if changes:
+            if changes and not suppress_event:
                 event = {
                     'type': 'bt_status',
                     'timestamp': time.time(),
