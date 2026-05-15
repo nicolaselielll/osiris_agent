@@ -58,6 +58,7 @@ class WebBridge(Node):
         self.declare_parameter('bt_server_port',         1667)
         self.declare_parameter('bt_publisher_port',      1668)
         self.declare_parameter('tf_tree_poll_interval',   0.2)
+        self.declare_parameter('graph_debounce_interval',   1.0)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -1044,12 +1045,13 @@ class WebBridge(Node):
     def _trigger_graph_poll(self):
         """Single debounced entry point for all graph poll triggers.
 
-        Resets a 1s one-shot timer on every call so rapid bursts coalesce
+        Resets a one-shot timer on every call so rapid bursts coalesce
         into a single poll.
         """
         if self._graph_debounce_timer is not None:
             self._graph_debounce_timer.cancel()
-        self._graph_debounce_timer = threading.Timer(1.0, self._debounce_fire)
+        _interval = self.get_parameter('graph_debounce_interval').get_parameter_value().double_value
+        self._graph_debounce_timer = threading.Timer(_interval, self._debounce_fire)
         self._graph_debounce_timer.daemon = True
         self._graph_debounce_timer.start()
 
