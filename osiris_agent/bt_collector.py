@@ -112,19 +112,28 @@ class BTCollector:
         self._last_statuses: Dict[int, str] = {}
 
     def _log_info(self, msg: str):
-        pass  # Logging disabled
+        if self._logger:
+            self._logger.info(f'[bt] {msg}')
+        else:
+            print(f"[BTCollector] {msg}")
 
     def _log_debug(self, msg: str):
-        pass  # Logging disabled
+        if self._logger:
+            self._logger.debug(f'[bt] {msg}')
+        else:
+            print(f"[BTCollector DEBUG] {msg}")
 
     def _log_error(self, msg: str):
         if self._logger:
-            self._logger.error(msg)
+            self._logger.error(f'[bt] {msg}')
         else:
             print(f"[BTCollector ERROR] {msg}")
 
     def _log_warn(self, msg: str):
-        pass  # Logging disabled
+        if self._logger:
+            self._logger.warning(f'[bt] {msg}')
+        else:
+            print(f"[BTCollector WARN] {msg}")
 
     def start(self):
         """Start the collector in a background thread."""
