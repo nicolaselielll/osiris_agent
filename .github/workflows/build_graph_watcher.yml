@@ -92,4 +92,4 @@ jobs:
                   osiris_agent/bin/graph_watcher_aarch64
           git diff --staged --quiet || \
             git commit -m "build: update graph_watcher binaries [skip ci]"
-          git push
+          git push origin HEAD:main
