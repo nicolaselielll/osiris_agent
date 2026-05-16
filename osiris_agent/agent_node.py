@@ -62,6 +62,7 @@ class WebBridge(Node):
         self.declare_parameter('graph_debounce_interval',   1.0)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
+        # Dev: self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
 
         self.ws   = None
