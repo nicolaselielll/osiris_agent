@@ -18,7 +18,7 @@ class Ros2ControlCollector:
     # first use and the collector degrades gracefully if the package is absent.
     _cm_msgs_available = None  # None = not checked yet
 
-    def __init__(self, node, event_callback, logger):
+    def __init__(self, node, event_callback, logger, poll_interval: float = 2.0):
         self._node = node
         self._event_callback = event_callback
         self._logger = logger
@@ -35,9 +35,9 @@ class Ros2ControlCollector:
         self._list_controllers_client = None
         self._list_hardware_client = None
 
-        # Rate-limiting: poll at most once every 2 seconds
+        # Rate-limiting: poll at most once per poll_interval seconds
         self._last_poll_time = 0.0
-        self._poll_interval = 2.0  # seconds
+        self._poll_interval = poll_interval
 
     # ------------------------------------------------------------------
     # Public API – called from _check_graph_changes
