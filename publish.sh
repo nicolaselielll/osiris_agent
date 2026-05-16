@@ -1,4 +1,5 @@
 #!/bin/bash
+set -e
 
 # Usage: ./publish.sh 0.1.4
 
@@ -8,6 +9,8 @@ if [ -z "$1" ]; then
 fi
 
 V=$1
+
+cd "$(dirname "$0")"
 
 # Update version in setup.py and __init__.py
 sed -i "s/version='.*'/version='$V'/" setup.py
@@ -29,10 +32,10 @@ rm -rf dist build *.egg-info
 # up-to-date binaries are included in the PyPI wheel.
 echo "ℹ️  Using pre-built graph_watcher binaries from repo (built by CI)"
 
-python3.12 -m build
+python3 -m build
 export TWINE_USERNAME=__token__
 export TWINE_PASSWORD=$(grep PYPI_API_TOKEN .env | cut -d= -f2)
-python3.12 -m twine upload dist/*
+python3 -m twine upload dist/*
 unset TWINE_PASSWORD TWINE_USERNAME
 
 echo "✅ Published version $V to PyPI"
