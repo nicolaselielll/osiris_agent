@@ -13,7 +13,8 @@ class GraphWatcher : public rclcpp::Node
 {
 public:
   GraphWatcher()
-  : Node("osiris_graph_watcher")
+  : Node("osiris_graph_watcher",
+         rclcpp::NodeOptions().use_intra_process_comms(false))
   {
     pub_ = this->create_publisher<std_msgs::msg::Empty>(
       "/osiris/graph_changed", rclcpp::QoS(1).transient_local());

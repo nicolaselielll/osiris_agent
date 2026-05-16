@@ -188,6 +188,7 @@ class BTCollector:
             # Main loop - request tree first, then poll for status
             self._log_info("Starting BT collection loop...")
             tree_received = False
+            _miss_count = 0  # consecutive timeouts without ever receiving a tree
             
             while self._running:
                 try:
@@ -207,6 +208,7 @@ class BTCollector:
                         # emit bt_tree now with status merged into nodes (guaranteed before any bt_status)
                         if self._current_tree:
                             self._log_info("Sending initial tree event with statuses")
+                            _miss_count = 0  # connected successfully — reset miss counter
                             self._emit_current_tree_event()
                     
                     # Poll for status updates
@@ -215,7 +217,15 @@ class BTCollector:
                     
                 except zmq.Again:
                     # Timeout - need to recreate socket because REQ is in bad state
-                    self._log_warn("Timeout - recreating socket...")
+                    had_tree = bool(self._current_tree)
+                    if had_tree:
+                        # We had a live tree and lost it — always warn
+                        self._log_warn("Timeout - recreating socket...")
+                    elif _miss_count == 0:
+                        # First miss only: let the user know we're waiting
+                        self._log_info(f"BT executor not found on tcp://{self._host}:{self._server_port}, will keep retrying silently...")
+                    # else: no log — avoid spam while waiting for executor to start
+                    _miss_count += 1
                     req_socket.close()
                     req_socket = self._context.socket(zmq.REQ)
                     req_socket.setsockopt(zmq.RCVTIMEO, ZMQ_RECV_TIMEOUT_MS)
@@ -312,7 +322,7 @@ class BTCollector:
             "tree": self._current_tree.structure,
             "nodes": nodes_with_status,
         }
-        self._log_info(f"Sending tree event ({len(nodes_with_status)} nodes)")
+        self._log_debug(f"Sending tree event ({len(nodes_with_status)} nodes)")
         self._event_callback(event)
 
     def _request_tree_structure(self, socket: zmq.Socket) -> bool:
@@ -324,13 +334,13 @@ class BTCollector:
         unique_id = random.getrandbits(32)
         header = struct.pack('<BBI', protocol, req_type, unique_id)
         
-        self._log_info(f"Requesting tree structure...")
+        self._log_debug(f"Requesting tree structure...")
         socket.send(header, zmq.SNDMORE)
         socket.send(b"")  # Empty body
         
         # Receive multipart response
         parts = socket.recv_multipart()
-        self._log_info(f"Tree response: {len(parts)} parts")
+        self._log_debug(f"Tree response: {len(parts)} parts")
         
         if parts and len(parts) >= 2:
             return self._parse_tree_response(parts)
@@ -351,7 +361,7 @@ class BTCollector:
             self._log_warn("Empty tree response")
             return False
         
-        self._log_info(f"Parsing tree response: {len(parts)} parts")
+        self._log_debug(f"Parsing tree response: {len(parts)} parts")
         
         try:
             # Part 0: Header
@@ -525,7 +535,7 @@ class BTCollector:
                         node_name = node.name
                         node_tag = node.tag
                     
-                    self._log_info(f"  Node {uid} ({node_name}): -> {status_str}")
+                    self._log_debug(f"  Node {uid} ({node_name}): -> {status_str}")
                     
                     changes.append({
                         'uid': uid,
@@ -542,8 +552,8 @@ class BTCollector:
                     'changes': changes
                 }
                 
-                self._log_info(f"Status update: {len(changes)} changes")
-                self._log_info(f"Sending status event: {json.dumps(event, indent=2)}")
+                self._log_debug(f"Status update: {len(changes)} changes")
+                self._log_debug(f"Sending status event: {json.dumps(event, indent=2)}")
                 self._event_callback(event)
                 
         except Exception as e:

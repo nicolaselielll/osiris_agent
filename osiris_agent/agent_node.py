@@ -51,7 +51,8 @@ class WebBridge(Node):
 
         # Declare tunable parameters
         self.declare_parameter('tf_tree_enabled',        False)
-        self.declare_parameter('ros2_control_enabled',   False)
+        self.declare_parameter('ros2_control_enabled',        False)
+        self.declare_parameter('ros2_control_poll_interval',    2.0)
         self.declare_parameter('battery_topic',          '/battery_state')
         self.declare_parameter('bt_collector_enabled',   False)
         self.declare_parameter('bt_host',               '127.0.0.1')
@@ -145,6 +146,7 @@ class WebBridge(Node):
                 node=self,
                 event_callback=self._on_ros2_control_event,
                 logger=self.get_logger(),
+                poll_interval=self.get_parameter('ros2_control_poll_interval').get_parameter_value().double_value,
             )
         else:
             self._ros2_control = None
@@ -1667,16 +1669,22 @@ def main(args=None):
 
     # Locate the graph_watcher binary:
     # 1. Prefer PATH (colcon dev workspace with source install/setup.bash)
-    # 2. Fall back to arch-specific binary bundled in the pip package:
-    #    bin/graph_watcher_x86_64  or  bin/graph_watcher_aarch64
-    # 3. Fall back to bin/graph_watcher (legacy / colcon-installed generic name)
+    # 2. Fall back to distro+arch-specific binary:  bin/graph_watcher_{arch}_{distro}
+    #    (e.g. graph_watcher_aarch64_lyrical, graph_watcher_x86_64_jazzy)
+    # 3. Fall back to arch-only binary:             bin/graph_watcher_{arch}
+    # 4. Fall back to bin/graph_watcher (legacy / colcon-installed generic name)
     _watcher_proc = None
     _watcher_bin = shutil.which('graph_watcher')
     if _watcher_bin is None:
         try:
             _arch = platform.machine()  # 'x86_64' or 'aarch64'
+            _distro = os.environ.get('ROS_DISTRO', '')  # e.g. 'humble', 'jazzy', 'lyrical'
             _pkg = importlib.resources.files('osiris_agent')
-            for _name in (f'bin/graph_watcher_{_arch}', 'bin/graph_watcher'):
+            _candidates = []
+            if _distro:
+                _candidates.append(f'bin/graph_watcher_{_arch}_{_distro}')
+            _candidates += [f'bin/graph_watcher_{_arch}', 'bin/graph_watcher']
+            for _name in _candidates:
                 _candidate = _pkg.joinpath(_name)
                 if _candidate.is_file():  # type: ignore[attr-defined]
                     _watcher_bin = str(_candidate)
