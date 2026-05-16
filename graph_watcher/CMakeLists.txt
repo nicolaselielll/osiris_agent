@@ -15,7 +15,13 @@ ament_target_dependencies(graph_watcher rclcpp std_msgs)
 # IntraProcessManager::add_publisher) are not resolved at startup.
 # This makes the binary ABI-compatible across ROS 2 distros as long as
 # intra-process comms is disabled at runtime (see graph_check_node.cpp).
-target_link_options(graph_watcher PRIVATE -Wl,-z,lazy)
+# Statically link libstdc++/libgcc so the binary runs on any distro
+# regardless of the system libstdc++ version.
+target_link_options(graph_watcher PRIVATE
+  -Wl,-z,lazy
+  -static-libstdc++
+  -static-libgcc
+)
 
 install(TARGETS graph_watcher DESTINATION lib/${PROJECT_NAME})
 

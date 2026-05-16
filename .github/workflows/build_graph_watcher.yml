@@ -13,13 +13,13 @@ jobs:
   build-x86_64:
     runs-on: ubuntu-latest
     container:
-      image: ros:jazzy-ros-base
+      image: ros:humble-ros-base
     steps:
       - uses: actions/checkout@v4
 
       - name: Build graph_watcher (x86_64)
         run: |
-          source /opt/ros/jazzy/setup.bash
+          source /opt/ros/humble/setup.bash
           BUILD_DIR=$(mktemp -d)
           cmake -S graph_watcher -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
           cmake --build "$BUILD_DIR" --parallel
@@ -48,10 +48,10 @@ jobs:
             --platform linux/arm64 \
             -v "$PWD/graph_watcher":/ws/src/graph_watcher:ro \
             -v "$PWD/osiris_agent/bin":/out \
-            ros:jazzy-ros-base \
+            ros:humble-ros-base \
             bash -c '
               set -e
-              source /opt/ros/jazzy/setup.bash
+              source /opt/ros/humble/setup.bash
               cd /ws
               colcon build --packages-select graph_watcher \
                 --cmake-args -DCMAKE_BUILD_TYPE=Release
