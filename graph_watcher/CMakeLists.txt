@@ -20,3 +20,4 @@ target_link_options(graph_watcher PRIVATE -Wl,-z,lazy)
 install(TARGETS graph_watcher DESTINATION lib/${PROJECT_NAME})
 
 ament_package()
+
