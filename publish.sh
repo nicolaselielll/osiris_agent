@@ -9,8 +9,9 @@ fi
 
 V=$1
 
-# Update version in setup.py
-sed -i '' "s/version='.*'/version='$V'/" setup.py
+# Update version in setup.py and __init__.py
+sed -i "s/version='.*'/version='$V'/" setup.py
+sed -i "s/__version__ = '.*'/__version__ = '$V'/" osiris_agent/__init__.py
 
 # Commit and tag
 git add .
@@ -22,23 +23,11 @@ git push origin "v$V"
 # Build and upload
 rm -rf dist build *.egg-info
 
-# Build the C++ graph_watcher binary from source using the system ROS2 installation
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROS_SETUP="/opt/ros/humble/setup.bash"
-
-if [ ! -f "$ROS_SETUP" ]; then
-  echo "⚠️  ROS2 Humble not found at $ROS_SETUP — skipping graph_watcher build"
-else
-  echo "Building graph_watcher..."
-  BUILD_DIR="$(mktemp -d)"
-  source "$ROS_SETUP"
-  cmake -S "$SCRIPT_DIR/graph_watcher" -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release > /dev/null
-  cmake --build "$BUILD_DIR" --parallel > /dev/null
-  cp "$BUILD_DIR/graph_watcher" "$SCRIPT_DIR/osiris_agent/bin/graph_watcher"
-  chmod +x "$SCRIPT_DIR/osiris_agent/bin/graph_watcher"
-  rm -rf "$BUILD_DIR"
-  echo "✅ Built and bundled graph_watcher binary"
-fi
+# Note: graph_watcher binaries (graph_watcher_x86_64, graph_watcher_aarch64)
+# are built by GitHub Actions CI and committed back to the repo automatically.
+# Make sure to pull the latest dev/main before running this script so the
+# up-to-date binaries are included in the PyPI wheel.
+echo "ℹ️  Using pre-built graph_watcher binaries from repo (built by CI)"
 
 python3.12 -m build
 export TWINE_USERNAME=__token__
