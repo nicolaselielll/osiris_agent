@@ -66,8 +66,8 @@ class WebBridge(Node):
         self.declare_parameter('bag_output_dir',            '~/ros2_bags')
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -1141,7 +1141,7 @@ class WebBridge(Node):
 
     def _on_graph_changed(self, _msg: EmptyMsg):
         """Debounced callback fired by the C++ osiris_graph_watcher node."""
-        self.get_logger().info("[graph] event received")
+        self.get_logger().debug("[graph] event received")
         self._trigger_graph_poll()
 
     def _trigger_graph_poll(self):
@@ -1159,7 +1159,7 @@ class WebBridge(Node):
 
     def _debounce_fire(self):
         """Called from threading.Timer — run the graph poll directly."""
-        self.get_logger().info("[graph] watcher triggered poll")
+        self.get_logger().debug("[graph] watcher triggered poll")
         self._check_graph_changes()
 
     # ──────────────────────────────────────────────
