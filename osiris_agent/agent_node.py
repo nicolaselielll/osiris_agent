@@ -2,10 +2,13 @@ import asyncio
 import os
 import platform
 import random
+import signal
+import subprocess
 import sys
 import threading
 import time
 from collections import deque
+from pathlib import Path
 
 import psutil
 import rclpy
@@ -60,6 +63,7 @@ class WebBridge(Node):
         self.declare_parameter('bt_publisher_port',      1668)
         self.declare_parameter('tf_tree_poll_interval',   0.2)
         self.declare_parameter('graph_debounce_interval',   1.0)
+        self.declare_parameter('bag_output_dir',            '~/ros2_bags')
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
@@ -68,6 +72,11 @@ class WebBridge(Node):
         self.ws   = None
         self.loop = None
         self._send_queue: asyncio.Queue | None = None
+
+        # ── Bag recording ─────────────────────────────────────────────────────
+        self._bag_proc: subprocess.Popen | None = None
+        self._bag_output_path: str | None = None
+        self._bag_lock = threading.Lock()
 
         # ── Topic subscriptions (gateway-requested) ──────────────────────────
         self._topic_subs: dict[str, rclpy.subscription.Subscription] = {}
@@ -301,6 +310,10 @@ class WebBridge(Node):
                     self._unsubscribe_from_topic(topic)
             elif msg_type == 'error':
                 self.get_logger().warning(f"Gateway error: {data.get('message', '')}")
+            elif msg_type == 'bag_start_record':
+                self._start_bag_recording(data)
+            elif msg_type == 'bag_stop_record':
+                await asyncio.to_thread(self._stop_bag_recording)
 
     async def _send_initial_state(self):
         # Wait for the first _check_graph_changes tick to populate all caches.
@@ -852,6 +865,93 @@ class WebBridge(Node):
                 asyncio.run_coroutine_threadsafe(
                     self._send_bridge_subscriptions(), self.loop
                 )
+
+    # ── Bag recording ──────────────────────────────────────────────────────────
+
+    def _start_bag_recording(self, data: dict):
+        with self._bag_lock:
+            if self._bag_proc is not None and self._bag_proc.poll() is None:
+                self._enqueue({
+                    'type': 'error',
+                    'message': 'Bag recording already in progress',
+                })
+                return
+
+            topics: list[str] = data.get('topics', [])
+            bag_dir = os.path.expanduser(
+                self.get_parameter('bag_output_dir').get_parameter_value().string_value
+            )
+            os.makedirs(bag_dir, exist_ok=True)
+            output_path = os.path.join(bag_dir, f'bag_{int(time.time())}')
+
+            if topics:
+                cmd = ['ros2', 'bag', 'record', '-o', output_path] + topics
+            else:
+                cmd = ['ros2', 'bag', 'record', '-a', '-o', output_path]
+
+            self._bag_proc = subprocess.Popen(
+                cmd,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            self._bag_output_path = output_path
+
+        self.get_logger().info(
+            f"Bag recording started: {output_path}  topics={topics or 'all'}"
+        )
+        self._enqueue({
+            'type':      'bag_record_started',
+            'path':      output_path,
+            'topics':    topics if topics else 'all',
+            'timestamp': time.time(),
+        })
+
+    def _stop_bag_recording(self):
+        with self._bag_lock:
+            if self._bag_proc is None or self._bag_proc.poll() is not None:
+                self._enqueue({
+                    'type':    'error',
+                    'message': 'No bag recording is currently in progress',
+                })
+                return
+
+            proc = self._bag_proc
+            output_path = self._bag_output_path
+            self._bag_proc = None
+            self._bag_output_path = None
+
+        # SIGINT lets ros2 bag flush the SQLite index before exiting.
+        try:
+            proc.send_signal(signal.SIGINT)
+            proc.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+        size_bytes = 0
+        try:
+            size_bytes = sum(
+                f.stat().st_size
+                for f in Path(output_path).rglob('*')
+                if f.is_file()
+            )
+        except (FileNotFoundError, OSError):
+            pass
+
+        name = os.path.basename(output_path)
+        self.get_logger().info(
+            f"Bag recording stopped: {output_path}  size={size_bytes} bytes"
+        )
+        self._enqueue({
+            'type':       'bag_record_stopped',
+            'name':       name,
+            'path':       output_path,
+            'size_bytes': size_bytes,
+            'timestamp':  time.time(),
+        })
 
     def _on_topic_msg(self, msg, topic_name: str):
         if not self.ws or not self.loop:
@@ -1659,6 +1759,20 @@ class WebBridge(Node):
             self._tf_tree.destroy()
         if self._bt_collector:
             self._bt_collector.stop()
+        with self._bag_lock:
+            bag_proc = self._bag_proc
+            self._bag_proc = None
+            self._bag_output_path = None
+        if bag_proc is not None and bag_proc.poll() is None:
+            try:
+                bag_proc.send_signal(signal.SIGINT)
+                bag_proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                bag_proc.kill()
+                try:
+                    bag_proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    pass
         super().destroy_node()
 
 
