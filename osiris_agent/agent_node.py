@@ -5,8 +5,10 @@ import random
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import zipfile
 from collections import deque
 from pathlib import Path
 
@@ -311,9 +313,24 @@ class WebBridge(Node):
             elif msg_type == 'error':
                 self.get_logger().warning(f"Gateway error: {data.get('message', '')}")
             elif msg_type == 'bag_start_record':
+                topics = data.get('topics', [])
+                self.get_logger().info(
+                    f"[bag] bag_start_record received  topics={topics or 'all'}"
+                )
                 self._start_bag_recording(data)
             elif msg_type == 'bag_stop_record':
+                self.get_logger().info("[bag] bag_stop_record received")
                 await asyncio.to_thread(self._stop_bag_recording)
+            elif msg_type == 'bag_download_request':
+                path       = data.get('path', '')
+                request_id = data.get('request_id', '')
+                upload_url = data.get('upload_url', '')
+                self.get_logger().info(
+                    f"[bag] bag_download_request received  path={path}  request_id={request_id}"
+                )
+                asyncio.ensure_future(
+                    asyncio.to_thread(self._send_bag_download, path, request_id, upload_url)
+                )
 
     async def _send_initial_state(self):
         # Wait for the first _check_graph_changes tick to populate all caches.
@@ -376,6 +393,7 @@ class WebBridge(Node):
             self._cached_bt_tree_event = None
 
         await self._send_bridge_subscriptions()
+        await self._send_bag_files()
 
         self.get_logger().info(
             f"Sent initial_state: {len(nodes)} nodes, {len(topics)} topics, "
@@ -868,9 +886,131 @@ class WebBridge(Node):
 
     # ── Bag recording ──────────────────────────────────────────────────────────
 
+    def _get_bag_files_snapshot(self) -> list[dict]:
+        """Return metadata for every completed bag in the output directory."""
+        bag_dir = os.path.expanduser(
+            self.get_parameter('bag_output_dir').get_parameter_value().string_value
+        )
+        bags = []
+        try:
+            entries = sorted(Path(bag_dir).iterdir())
+        except (FileNotFoundError, OSError):
+            return bags
+        for entry in entries:
+            if not entry.is_dir():
+                continue
+            # Skip the directory that is currently being recorded.
+            with self._bag_lock:
+                if str(entry) == self._bag_output_path:
+                    continue
+            try:
+                size_bytes = sum(
+                    f.stat().st_size for f in entry.rglob('*') if f.is_file()
+                )
+            except OSError:
+                size_bytes = 0
+            # Prefer the timestamp embedded in the directory name (bag_<ts>),
+            # fall back to the directory mtime.
+            name = entry.name
+            try:
+                created_at = float(name.split('_', 1)[1])
+            except (IndexError, ValueError):
+                created_at = entry.stat().st_mtime
+            bags.append({
+                'name':       name,
+                'path':       str(entry),
+                'size_bytes': size_bytes,
+                'created_at': created_at,
+            })
+        return bags
+
+    async def _send_bag_files(self):
+        bags = await asyncio.to_thread(self._get_bag_files_snapshot)
+        await self._send_queue.put(json.dumps({
+            'type':      'bag_files',
+            'bags':      bags,
+            'timestamp': time.time(),
+        }))
+        self.get_logger().info(f"[bag] bag_files sent to gateway  count={len(bags)}")
+
+    def _send_bag_download(self, path: str, request_id: str, upload_url: str):
+        """Zip the bag directory and POST it to the gateway upload endpoint."""
+        import requests as _requests
+
+        # ── Path traversal guard ──────────────────────────────────────────────
+        bag_dir = os.path.expanduser(
+            self.get_parameter('bag_output_dir').get_parameter_value().string_value
+        )
+        bag_dir_real = os.path.realpath(bag_dir)
+        path_real    = os.path.realpath(path)
+        if not (path_real == bag_dir_real or
+                path_real.startswith(bag_dir_real + os.sep)):
+            self.get_logger().error(
+                f"[bag] download rejected — path outside bag_output_dir: {path}"
+            )
+            return
+
+        if not os.path.isdir(path_real):
+            self.get_logger().error(
+                f"[bag] download rejected — not a directory: {path}"
+            )
+            return
+
+        tmp_path = None
+        try:
+            name = os.path.basename(path_real)
+            self.get_logger().info(
+                f"[bag] zipping {path_real}  request_id={request_id}"
+            )
+
+            with tempfile.NamedTemporaryFile(suffix='.zip', delete=False) as tmp_f:
+                tmp_path = tmp_f.name
+
+            with zipfile.ZipFile(tmp_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for file in sorted(Path(path_real).rglob('*')):
+                    if file.is_file():
+                        zf.write(file, file.relative_to(Path(path_real).parent))
+
+            zip_size = os.path.getsize(tmp_path)
+            self.get_logger().info(
+                f"[bag] zip ready  name={name}.zip  size={zip_size} bytes  "
+                f"uploading to {upload_url}"
+            )
+
+            url = f"{upload_url}?request_id={request_id}"
+            with open(tmp_path, 'rb') as f:
+                resp = _requests.post(
+                    url,
+                    data=f,
+                    headers={
+                        'Content-Type':   'application/zip',
+                        'Content-Length': str(zip_size),
+                    },
+                    timeout=120,
+                )
+            self.get_logger().info(
+                f"[bag] upload complete  status={resp.status_code}  "
+                f"request_id={request_id}"
+            )
+
+        except Exception as e:
+            self.get_logger().error(
+                f"[bag] download upload failed  request_id={request_id}: {e}"
+            )
+        finally:
+            if tmp_path and os.path.exists(tmp_path):
+                try:
+                    os.unlink(tmp_path)
+                    self.get_logger().debug(f"[bag] temp zip deleted: {tmp_path}")
+                except OSError:
+                    pass
+
     def _start_bag_recording(self, data: dict):
         with self._bag_lock:
             if self._bag_proc is not None and self._bag_proc.poll() is None:
+                self.get_logger().warning(
+                    "[bag] rejected start — recording already in progress"
+                )
                 self._enqueue({
                     'type': 'error',
                     'message': 'Bag recording already in progress',
@@ -889,26 +1029,35 @@ class WebBridge(Node):
             else:
                 cmd = ['ros2', 'bag', 'record', '-a', '-o', output_path]
 
+            self.get_logger().info(
+                f"[bag] launching subprocess: {' '.join(cmd)}"
+            )
             self._bag_proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.PIPE,
             )
             self._bag_output_path = output_path
+            self.get_logger().info(
+                f"[bag] subprocess started  pid={self._bag_proc.pid}  output={output_path}"
+            )
 
-        self.get_logger().info(
-            f"Bag recording started: {output_path}  topics={topics or 'all'}"
-        )
         self._enqueue({
             'type':      'bag_record_started',
             'path':      output_path,
             'topics':    topics if topics else 'all',
             'timestamp': time.time(),
         })
+        self.get_logger().info(
+            f"[bag] bag_record_started sent to gateway  topics={topics or 'all'}"
+        )
 
     def _stop_bag_recording(self):
         with self._bag_lock:
             if self._bag_proc is None or self._bag_proc.poll() is not None:
+                self.get_logger().warning(
+                    "[bag] rejected stop — no recording is currently in progress"
+                )
                 self._enqueue({
                     'type':    'error',
                     'message': 'No bag recording is currently in progress',
@@ -921,10 +1070,17 @@ class WebBridge(Node):
             self._bag_output_path = None
 
         # SIGINT lets ros2 bag flush the SQLite index before exiting.
+        self.get_logger().info(
+            f"[bag] sending SIGINT to pid={proc.pid}  output={output_path}"
+        )
         try:
             proc.send_signal(signal.SIGINT)
             proc.wait(timeout=10)
+            self.get_logger().info("[bag] subprocess exited cleanly")
         except subprocess.TimeoutExpired:
+            self.get_logger().warning(
+                "[bag] subprocess did not exit within 10 s — sending SIGKILL"
+            )
             proc.kill()
             try:
                 proc.wait(timeout=2)
@@ -943,7 +1099,7 @@ class WebBridge(Node):
 
         name = os.path.basename(output_path)
         self.get_logger().info(
-            f"Bag recording stopped: {output_path}  size={size_bytes} bytes"
+            f"[bag] recording finalised  name={name}  size={size_bytes} bytes"
         )
         self._enqueue({
             'type':       'bag_record_stopped',
@@ -952,6 +1108,9 @@ class WebBridge(Node):
             'size_bytes': size_bytes,
             'timestamp':  time.time(),
         })
+        self.get_logger().info(
+            f"[bag] bag_record_stopped sent to gateway  size={size_bytes} bytes"
+        )
 
     def _on_topic_msg(self, msg, topic_name: str):
         if not self.ws or not self.loop:
