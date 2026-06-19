@@ -1,4 +1,5 @@
 import asyncio
+import http.client
 import os
 import platform
 import random
@@ -8,6 +9,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import zipfile
 from collections import deque
 from pathlib import Path
@@ -935,7 +937,6 @@ class WebBridge(Node):
 
     def _send_bag_download(self, path: str, request_id: str, upload_url: str):
         """Zip the bag directory and POST it to the gateway upload endpoint."""
-        import requests as _requests
 
         # ── Path traversal guard ──────────────────────────────────────────────
         bag_dir = os.path.expanduser(
@@ -977,21 +978,43 @@ class WebBridge(Node):
                 f"uploading to {upload_url}"
             )
 
-            url = f"{upload_url}?request_id={request_id}"
-            with open(tmp_path, 'rb') as f:
-                resp = _requests.post(
-                    url,
-                    data=f,
-                    headers={
-                        'Content-Type':   'application/zip',
-                        'Content-Length': str(zip_size),
-                    },
-                    timeout=120,
-                )
+            # ── Stream-upload via stdlib http.client (no extra dependencies) ───
+            # Derive host/scheme from the active WS URL so the upload reaches
+            # the same endpoint even when the gateway sends 'localhost' (which
+            # would resolve to the container itself, not the host).
+            ws_parsed     = urllib.parse.urlparse(self.ws_url)
+            http_scheme   = 'https' if ws_parsed.scheme == 'wss' else 'http'
+            netloc        = ws_parsed.netloc.split('?')[0]  # strip any query fragment
+            upload_path   = urllib.parse.urlparse(upload_url).path
+            qs            = urllib.parse.urlencode({'request_id': request_id})
+            path_q        = f"{upload_path}?{qs}"
+
             self.get_logger().info(
-                f"[bag] upload complete  status={resp.status_code}  "
-                f"request_id={request_id}"
+                f"[bag] effective upload target: {http_scheme}://{netloc}{path_q}"
             )
+
+            conn = (
+                http.client.HTTPSConnection(netloc, timeout=120)
+                if http_scheme == 'https'
+                else http.client.HTTPConnection(netloc, timeout=120)
+            )
+            try:
+                with open(tmp_path, 'rb') as f:
+                    conn.request(
+                        'POST', path_q, body=f,
+                        headers={
+                            'Content-Type':   'application/zip',
+                            'Content-Length': str(zip_size),
+                        },
+                    )
+                resp = conn.getresponse()
+                resp.read()  # drain so the connection can be reused / closed cleanly
+                self.get_logger().info(
+                    f"[bag] upload complete  status={resp.status}  "
+                    f"request_id={request_id}"
+                )
+            finally:
+                conn.close()
 
         except Exception as e:
             self.get_logger().error(

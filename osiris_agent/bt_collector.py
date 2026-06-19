@@ -524,7 +524,8 @@ class BTCollector:
                 status_str = NodeStatus.to_string(status_val)
                 
                 # Only report changes
-                if self._last_statuses.get(uid) != status_str:
+                previous_status = self._last_statuses.get(uid)
+                if previous_status != status_str:
                     self._last_statuses[uid] = status_str
                     
                     # Get node info if available
@@ -541,6 +542,7 @@ class BTCollector:
                         'uid': uid,
                         'name': node_name,
                         'tag': node_tag,
+                        'previous_status': previous_status,
                         'status': status_str
                     })
             
