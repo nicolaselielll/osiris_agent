@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 
 import zmq
+import msgpack
 import random  # added to support unique_id generation in requests
 
 # Default Groot2 configuration (industry standard)
@@ -28,7 +29,8 @@ DEFAULT_HOST = "127.0.0.1"
 # ZMQ timeouts
 ZMQ_RECV_TIMEOUT_MS = 500
 ZMQ_RECONNECT_INTERVAL = 0.5
-STATUS_POLL_INTERVAL = 0.1  # Poll for status every 100ms
+TRANSITION_POLL_INTERVAL = 0.05  # Poll transitions every 50ms (fast enough to not miss any)
+SNAPSHOT_POLL_INTERVAL = 0.5   # Poll full status snapshot for tree-change detection
 
 
 class NodeStatus(IntEnum):
@@ -110,6 +112,11 @@ class BTCollector:
         
         self._current_tree: Optional[BTTree] = None
         self._last_statuses: Dict[int, str] = {}
+        self._blackboard: Dict[str, Any] = {}
+        self._last_emitted_blackboard: Optional[str] = None  # hash of last emitted bb, for change detection
+        self._subtree_names: str = ""
+        self._recording: bool = False
+        self._last_snapshot_poll: float = 0.0
 
     def _log_info(self, msg: str):
         if self._logger:
@@ -185,7 +192,7 @@ class BTCollector:
             self._log_info(f"Connecting to Groot2 server: {server_addr}")
             req_socket.connect(server_addr)
             
-            # Main loop - request tree first, then poll for status
+            # Main loop - request tree first, then poll for transitions
             self._log_info("Starting BT collection loop...")
             tree_received = False
             _miss_count = 0  # consecutive timeouts without ever receiving a tree
@@ -196,24 +203,33 @@ class BTCollector:
                     if not tree_received:
                         tree_received = self._request_tree_structure(req_socket)
                         if not tree_received:
-                            # No tree yet, wait and retry
                             time.sleep(ZMQ_RECONNECT_INTERVAL)
                             continue
-                        # Silently fetch current statuses to embed in the initial bt_tree event.
-                        # suppress_event=True prevents a bt_status from firing before bt_tree.
+                        # Fetch initial status snapshot + start recording transitions
                         try:
                             self._poll_status(req_socket, suppress_event=True)
+                            self._start_recording(req_socket)
                         except Exception:
                             pass
-                        # emit bt_tree now with status merged into nodes (guaranteed before any bt_status)
                         if self._current_tree:
                             self._log_info("Sending initial tree event with statuses")
-                            _miss_count = 0  # connected successfully — reset miss counter
+                            _miss_count = 0
                             self._emit_current_tree_event()
                     
-                    # Poll for status updates
-                    self._poll_status(req_socket)
-                    time.sleep(STATUS_POLL_INTERVAL)
+                    # Poll transitions (exact 1:1 match with terminal output)
+                    self._poll_transitions(req_socket)
+                    
+                    # Periodic status snapshot for tree-change detection only (no emit)
+                    now = time.time()
+                    if now - self._last_snapshot_poll >= SNAPSHOT_POLL_INTERVAL:
+                        self._last_snapshot_poll = now
+                        self._poll_status(req_socket, suppress_event=True)
+                    
+                    # Blackboard
+                    if self._subtree_names:
+                        self._request_blackboard(req_socket, self._subtree_names)
+                    
+                    time.sleep(TRANSITION_POLL_INTERVAL)
                     
                 except zmq.Again:
                     # Timeout - need to recreate socket because REQ is in bad state
@@ -236,6 +252,10 @@ class BTCollector:
                         self._emit_bt_gone_event()
                         self._current_tree = None
                         self._last_statuses.clear()
+                        self._blackboard = {}
+                        self._subtree_names = ""
+                        self._last_emitted_blackboard = None
+                        self._recording = False
                     time.sleep(ZMQ_RECONNECT_INTERVAL)
                     
                 except zmq.ZMQError as e:
@@ -252,6 +272,10 @@ class BTCollector:
                             self._emit_bt_gone_event()
                             self._current_tree = None
                             self._last_statuses.clear()
+                            self._blackboard = {}
+                            self._subtree_names = ""
+                            self._recording = False
+                            self._last_emitted_blackboard = None
                         time.sleep(ZMQ_RECONNECT_INTERVAL)
                     else:
                         self._log_error(f"ZMQ error: {e}")
@@ -321,8 +345,9 @@ class BTCollector:
             "tree_id": self._current_tree.tree_id,
             "tree": self._current_tree.structure,
             "nodes": nodes_with_status,
+            "blackboard": self._blackboard,
         }
-        self._log_debug(f"Sending tree event ({len(nodes_with_status)} nodes)")
+        self._log_debug(f"Sending tree event ({len(nodes_with_status)} nodes, {len(self._blackboard)} bb entries)")
         self._event_callback(event)
 
     def _request_tree_structure(self, socket: zmq.Socket) -> bool:
@@ -343,12 +368,12 @@ class BTCollector:
         self._log_debug(f"Tree response: {len(parts)} parts")
         
         if parts and len(parts) >= 2:
-            return self._parse_tree_response(parts)
+            return self._parse_tree_response(parts, socket)
         else:
             self._log_warn("Invalid tree response (expected 2+ parts)")
             return False
 
-    def _parse_tree_response(self, parts: list) -> bool:
+    def _parse_tree_response(self, parts: list, socket: zmq.Socket) -> bool:
         """
         Parse tree structure response from Groot2.
         Returns True if successful.
@@ -405,6 +430,17 @@ class BTCollector:
             self._current_tree = tree
             self._last_statuses.clear()
             self._log_info(f"Tree structure received: {len(nodes_list)} nodes")
+
+            # Request blackboard data using subtree names from XML.
+            # Seed _last_emitted_blackboard so the next poll cycle doesn't
+            # emit a duplicate bt_blackboard (data already in bt_tree).
+            subtree_names = self._extract_subtree_names(xml)
+            self._subtree_names = subtree_names
+            if subtree_names:
+                self._log_debug(f"Requesting blackboard for subtrees: {subtree_names}")
+                self._request_blackboard(socket, subtree_names)
+                self._last_emitted_blackboard = json.dumps(self._blackboard, sort_keys=True, default=str)
+
             return True
             
         except Exception as e:
@@ -560,6 +596,174 @@ class BTCollector:
                 
         except Exception as e:
             self._log_error(f"Error parsing status message: {e}")
+
+    def _extract_subtree_names(self, xml: str) -> str:
+        """
+        Extract BehaviorTree IDs from the XML to build the bb_list for
+        the blackboard request. Returns a semicolon-separated string.
+        """
+        import xml.etree.ElementTree as ET
+        try:
+            root = ET.fromstring(xml)
+            ids = []
+            for bt_elem in root.iter('BehaviorTree'):
+                bt_id = bt_elem.attrib.get('ID', '')
+                if bt_id:
+                    ids.append(bt_id)
+            return ';'.join(ids) if ids else ''
+        except ET.ParseError:
+            self._log_warn("Could not parse XML for subtree names")
+            return ''
+
+    def _request_blackboard(self, socket: zmq.Socket, bb_list: str):
+        """
+        Request blackboard data from the Groot2 server.
+        
+        Protocol: 2-part ZMQ message
+          Part 0: Header (6 bytes): protocol(1)=2, type(1)='B', unique_id(4)
+          Part 1: Semicolon-separated list of subtree names (e.g. "MainTree;SubA")
+        
+        Response:
+          Part 0: Reply header (22 bytes)
+          Part 1: MessagePack-encoded JSON of blackboard key-value pairs
+        
+        Emits a bt_blackboard event only when the data differs from the
+        previously emitted snapshot.
+        """
+        if not bb_list:
+            return
+        
+        try:
+            protocol = 2
+            req_type = ord('B')  # 'B' = BLACKBOARD request
+            unique_id = random.getrandbits(32)
+            header = struct.pack('<BBI', protocol, req_type, unique_id)
+            
+            socket.send(header, zmq.SNDMORE)
+            socket.send(bb_list.encode('utf-8'))
+            
+            parts = socket.recv_multipart()
+            if not parts or len(parts) < 2:
+                return
+            
+            # Part 1 is MessagePack-encoded JSON
+            bb_data = msgpack.unpackb(parts[1])
+            if isinstance(bb_data, dict):
+                self._blackboard = bb_data
+                total_keys = sum(len(v) if isinstance(v, dict) else 0 for v in bb_data.values())
+                
+                # Only emit if the data actually changed
+                if total_keys > 0:
+                    bb_hash = json.dumps(bb_data, sort_keys=True, default=str)
+                    if bb_hash != self._last_emitted_blackboard:
+                        self._last_emitted_blackboard = bb_hash
+                        self._log_debug(f"Blackboard changed: {len(bb_data)} subtree(s), {total_keys} keys")
+                        self._event_callback({
+                            "type": "bt_blackboard",
+                            "timestamp": time.time(),
+                            "tree_id": self._current_tree.tree_id if self._current_tree else None,
+                            "blackboard": bb_data,
+                        })
+            else:
+                self._log_warn(f"Unexpected blackboard response type: {type(bb_data)}")
+                
+        except zmq.Again:
+            pass  # normal — tree may have finished, socket will be recreated by outer loop
+        except Exception as e:
+            self._log_warn(f"Error requesting blackboard: {e}")
+
+    def _start_recording(self, socket: zmq.Socket):
+        """Enable transition recording so we get every status change, not just snapshots."""
+        try:
+            protocol = 2
+            header = struct.pack('<BBI', protocol, ord('r'), random.getrandbits(32))
+            socket.send(header, zmq.SNDMORE)
+            socket.send(b"start")
+            parts = socket.recv_multipart()
+            if parts and len(parts) >= 2:
+                self._recording = True
+                self._log_info("Transition recording started")
+        except Exception as e:
+            self._log_warn(f"Failed to start recording: {e}")
+
+    def _poll_transitions(self, socket: zmq.Socket):
+        """
+        Fetch all status transitions since last poll.
+        
+        Uses Groot2 GET_TRANSITIONS ('t') which returns every individual
+        status change (e.g. RUNNING→FAILURE, FAILURE→IDLE) — exactly what
+        the terminal StdCoutLogger shows.
+        
+        Response format: 9 bytes per transition:
+          6 bytes: timestamp_usec (relative to recording start)
+          2 bytes: node_uid (uint16)
+          1 byte:  status (uint8)
+            Values 0-4: IDLE, RUNNING, SUCCESS, FAILURE, SKIPPED
+            Values 11-13: IDLE (was RUNNING/SUCCESS/FAILURE) — subtract 10
+        """
+        if not self._recording:
+            return
+        
+        try:
+            protocol = 2
+            header = struct.pack('<BBI', protocol, ord('t'), random.getrandbits(32))
+            socket.send(header)
+            
+            parts = socket.recv_multipart()
+            if not parts or len(parts) < 2:
+                return
+            
+            data = parts[1]
+            if len(data) < 9:
+                return  # no transitions
+            
+            changes = []
+            offset = 0
+            while offset + 9 <= len(data):
+                ts_usec = int.from_bytes(data[offset:offset+6], 'little')
+                uid = struct.unpack('<H', data[offset+6:offset+8])[0]
+                raw_status = data[offset+8]
+                offset += 9
+                
+                # Decode status: values >= 10 mean "IDLE (was X)"
+                if raw_status >= 10:
+                    prev_val = raw_status - 10
+                    new_status = "IDLE"
+                else:
+                    prev_val = None  # derived from _last_statuses below
+                    new_status = NodeStatus.to_string(raw_status)
+                
+                previous_status = self._last_statuses.get(uid) if prev_val is None else NodeStatus.to_string(prev_val)
+                
+                # Get node info
+                node_name = ""
+                node_tag = ""
+                if self._current_tree and uid in self._current_tree.nodes:
+                    node = self._current_tree.nodes[uid]
+                    node_name = node.name
+                    node_tag = node.tag
+                
+                self._last_statuses[uid] = new_status
+                changes.append({
+                    'uid': uid,
+                    'name': node_name,
+                    'tag': node_tag,
+                    'previous_status': previous_status,
+                    'status': new_status,
+                })
+            
+            if changes:
+                self._event_callback({
+                    'type': 'bt_status',
+                    'timestamp': time.time(),
+                    'tree_id': self._current_tree.tree_id if self._current_tree else None,
+                    'changes': changes,
+                })
+                
+        except zmq.Again:
+            pass  # normal — tree may have finished
+        except Exception as e:
+            self._log_warn(f"Error polling transitions: {e}")
 
     def _handle_breakpoint_message(self, data: bytes):
         """Handle breakpoint messages from Groot2."""

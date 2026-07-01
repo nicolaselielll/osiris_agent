@@ -37,6 +37,7 @@ from .tf_tree_collector import TfTreeCollector
 # Constants
 # ──────────────────────────────────────────────
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
+MAX_TELEMETRY_PROCESSES    = 15    # cap on processes reported per telemetry sample
 MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
 RECONNECT_MAX_DELAY        = 30    # seconds
@@ -1584,11 +1585,70 @@ class WebBridge(Node):
         except Exception:
             pass
 
+        # CPU frequency (GHz)
+        cpu_freq = None
+        try:
+            freq = psutil.cpu_freq()
+            if freq and freq.current:
+                cpu_freq = round(freq.current / 1000.0, 2)
+        except Exception:
+            pass
+
+        # Load averages (1, 5, 15 min)
+        cpu_load = None
+        try:
+            load1, load5, load15 = os.getloadavg()
+            cpu_load = {
+                'load1':  round(load1, 1),
+                'load5':  round(load5, 1),
+                'load15': round(load15, 1),
+            }
+        except Exception:
+            pass
+
+        # Process list (top processes by CPU usage).
+        # Two-phase fetch: cheap fields for all processes first, then only
+        # pull the more expensive fields (cmdline, memory_info, username) for
+        # the top N CPU consumers, to avoid per-second syscalls against every
+        # process on the host and to avoid leaking the full host process list
+        # (cmdline can contain secrets) over the wire.
+        processes = []
+        try:
+            candidates = []
+            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent']):
+                try:
+                    info = proc.info
+                    candidates.append((round(info['cpu_percent'] or 0.0, 1), proc))
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+            candidates.sort(key=lambda c: c[0], reverse=True)
+
+            for cpu_percent, proc in candidates[:MAX_TELEMETRY_PROCESSES]:
+                try:
+                    with proc.oneshot():
+                        cmdline = proc.cmdline()
+                        mem_info = proc.memory_info()
+                        processes.append({
+                            'pid':          proc.pid,
+                            'name':         proc.name(),
+                            'cmdline':      ' '.join(cmdline)[:256] if cmdline else '',
+                            'num_threads':  proc.num_threads(),
+                            'username':     proc.username(),
+                            'memory_mb':    round(mem_info.rss / (1024 * 1024), 1) if mem_info else 0,
+                            'cpu_percent':  cpu_percent,
+                        })
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    continue
+        except Exception:
+            pass
+
         return {
             'cpu': {
-                'now':       cpu_now,
+                'now':        cpu_now,
                 'throttling': None,
-                'temp':      cpu_c,
+                'temp':       cpu_c,
+                'freq':       cpu_freq,
+                'load':       cpu_load,
             },
             'ram': {
                 'percent':  round(ram_percent, 1),
@@ -1606,7 +1666,8 @@ class WebBridge(Node):
                 'tx_mbps': net_tx_mbps,
                 'rx_mbps': net_rx_mbps,
             },
-            'battery': self._last_battery_state,
+            'battery':   self._last_battery_state,
+            'processes': processes,
         }
 
     def _get_cpu_model(self) -> str | None:
@@ -1897,6 +1958,7 @@ class WebBridge(Node):
                 'type': 'bt_state', 'timestamp': src.get('timestamp', time.time()),
                 'tree_id': src.get('tree_id'), 'tree': src.get('tree'),
                 'nodes': src.get('nodes', []),
+                'blackboard': src.get('blackboard'),
             }
         if (
             hasattr(self, '_nav2_bt_tree_id')
@@ -1911,10 +1973,11 @@ class WebBridge(Node):
                     {**nd, 'status': self._nav2_bt_statuses.get(nd['name'], 'IDLE')}
                     for nd in self._nav2_bt_nodes_list
                 ],
+                'blackboard': None,
             }
         return {
             'type': 'bt_state', 'timestamp': time.time(),
-            'tree_id': None, 'tree': None, 'nodes': [],
+            'tree_id': None, 'tree': None, 'nodes': [], 'blackboard': None,
         }
 
     def _bt_snapshot_from_state_event(self, src: dict) -> dict:
@@ -1923,6 +1986,7 @@ class WebBridge(Node):
             'tree_id': src.get('tree_id'),
             'tree': src.get('tree'),
             'nodes': src.get('nodes', []),
+            'blackboard': src.get('blackboard'),
         }
 
     # ──────────────────────────────────────────────

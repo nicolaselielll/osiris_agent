@@ -35,6 +35,7 @@ setup(
         'websockets',
         'psutil',
         'pyzmq',
+        'msgpack',
     ],
     extras_require={
         'ros': ['rclpy'],
