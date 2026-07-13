@@ -668,7 +668,7 @@ class BTCollector:
                 self._log_warn(f"Unexpected blackboard response type: {type(bb_data)}")
                 
         except zmq.Again:
-            pass  # normal — tree may have finished, socket will be recreated by outer loop
+            raise  # re-raise so outer loop recreates the REQ socket cleanly
         except Exception as e:
             self._log_warn(f"Error requesting blackboard: {e}")
 
@@ -761,7 +761,7 @@ class BTCollector:
                 })
                 
         except zmq.Again:
-            pass  # normal — tree may have finished
+            raise  # re-raise so outer loop recreates the REQ socket cleanly
         except Exception as e:
             self._log_warn(f"Error polling transitions: {e}")
 
