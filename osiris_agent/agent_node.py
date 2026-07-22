@@ -71,7 +71,6 @@ class WebBridge(Node):
         self.declare_parameter('bag_output_dir',            '~/ros2_bags')
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
 
         self.ws   = None
@@ -86,9 +85,14 @@ class WebBridge(Node):
         # ── Topic subscriptions (gateway-requested) ──────────────────────────
         self._topic_subs: dict[str, rclpy.subscription.Subscription] = {}
         self._topic_subs_lock = threading.Lock()
-        self._topic_last_timestamp: dict[str, float] = {}
-        self._topic_rate_history: dict[str, deque] = {}
-        self._rate_history_depth = 8
+        # Rolling window of receipt timestamps per subscribed topic, used to
+        # recompute each topic's rate_hz on a 1Hz timer (see _publish_topic_rates)
+        # rather than piggybacking a value on topic_data itself — a piggybacked
+        # rate only updates when a new message arrives, so it freezes at its last
+        # value instead of decaying toward zero once a topic goes quiet.
+        self._topic_rate_timestamps: dict[str, deque] = {}
+        self._topic_rate_lock = threading.Lock()
+        self._RATE_WINDOW_S = 5.0
 
         # ── Existence caches (set of fully-qualified names) ───────────────────
         self._active_nodes:    set[str] = set()
@@ -134,6 +138,7 @@ class WebBridge(Node):
         self._last_sent_services: dict | None = None
         self._graph_dirty = False
         self._graph_debounce_timer: threading.Timer | None = None
+        self._graph_check_pending = False  # set when a trigger arrives while a check is already running
 
         # ── Service scan throttle ─────────────────────────────────────────────
         self._service_rescan_ticks: int = 0
@@ -190,6 +195,7 @@ class WebBridge(Node):
         _tf_tree_poll_interval = self.get_parameter('tf_tree_poll_interval').get_parameter_value().double_value
         self.create_timer(TELEMETRY_INTERVAL,          self._collect_telemetry)
         self.create_timer(_tf_tree_poll_interval,      self._poll_tf_tree)
+        self.create_timer(1.0,                         self._publish_topic_rates)
 
         # ── Battery state subscription ────────────────────────────────────────
         _battery_topic = self.get_parameter('battery_topic').get_parameter_value().string_value
@@ -347,10 +353,7 @@ class WebBridge(Node):
         self._last_sent_services = None
         self._graph_dirty        = True
 
-        nodes       = self._get_nodes_with_relations()
-        topics      = self._get_topics_with_relations()
-        actions     = self._get_actions_with_relations()
-        services    = self._get_services_with_relations()
+        nodes, topics, actions, services = await asyncio.to_thread(self._get_graph_snapshot_locked)
         controllers = self._ros2_control.get_controllers_snapshot() if self._ros2_control is not None else []
         hardware    = self._ros2_control.get_hardware_snapshot() if self._ros2_control is not None else []
         telemetry   = self._get_telemetry_snapshot()
@@ -412,15 +415,33 @@ class WebBridge(Node):
             'timestamp': time.time(),
         }))
 
+    async def _send_subscribe_failed(self, topic_name: str, reason: str):
+        await self._send_queue.put(json.dumps({
+            'type': 'subscribe_failed',
+            'topic': topic_name,
+            'reason': reason,
+            'timestamp': time.time(),
+        }))
+
     # ──────────────────────────────────────────────
     # Tier-1: cheap existence detection
     # ──────────────────────────────────────────────
 
     def _check_graph_changes(self):
         if not self._graph_check_lock.acquire(blocking=False):
-            return  # another poll is already in progress — skip this one
+            # A check is already running (e.g. slow introspection during
+            # heavy graph churn). Whatever triggered this call must not be
+            # silently dropped — flag it so the in-flight run loops back
+            # around and re-checks before releasing the lock. This keeps
+            # the pipeline purely event-driven (no periodic polling) while
+            # guaranteeing every trigger is eventually acted on.
+            self._graph_check_pending = True
+            return
         try:
             self._check_graph_changes_locked()
+            while self._graph_check_pending:
+                self._graph_check_pending = False
+                self._check_graph_changes_locked()
         finally:
             self._graph_check_lock.release()
 
@@ -805,6 +826,23 @@ class WebBridge(Node):
             for name, type_str in self._active_services.items()
         }
 
+    def _get_graph_snapshot_locked(self) -> tuple[dict, dict, dict, dict]:
+        """Gather all four graph relation dicts under _graph_check_lock.
+
+        _check_graph_changes_locked() mutates _topic_relations / _active_*
+        in place on the timer/executor thread; without this lock a caller
+        on another thread (e.g. _send_initial_state on the websocket thread)
+        can observe a torn dict mid-mutation (RuntimeError: dictionary
+        changed size during iteration, or a silently incomplete snapshot).
+        """
+        with self._graph_check_lock:
+            return (
+                self._get_nodes_with_relations(),
+                self._get_topics_with_relations(),
+                self._get_actions_with_relations(),
+                self._get_services_with_relations(),
+            )
+
     # ──────────────────────────────────────────────
     # Delta-send: flush graph snapshots after each tick
     # ──────────────────────────────────────────────
@@ -812,31 +850,40 @@ class WebBridge(Node):
     def _flush_graph_snapshots(self):
         if not self._graph_dirty or not self.ws or not self.loop:
             return
-        self._graph_dirty = False
 
-        nodes = self._get_nodes_with_relations()
-        if nodes != self._last_sent_nodes:
-            self.get_logger().info(f"[flush] nodes ({len(nodes)} nodes)")
-            self._last_sent_nodes = nodes.copy()
-            self._enqueue({'type': 'nodes', 'data': nodes, 'timestamp': time.time()})
+        # Only clear the dirty flag once every snapshot has actually been
+        # built and enqueued. If anything below raises, the flag is put
+        # back so the next trigger retries instead of the client silently
+        # never receiving this update.
+        try:
+            nodes = self._get_nodes_with_relations()
+            if nodes != self._last_sent_nodes:
+                self.get_logger().info(f"[flush] nodes ({len(nodes)} nodes)")
+                self._last_sent_nodes = nodes.copy()
+                self._enqueue({'type': 'nodes', 'data': nodes, 'timestamp': time.time()})
 
-        topics = self._get_topics_with_relations()
-        if topics != self._last_sent_topics:
-            self.get_logger().info(f"[flush] topics ({len(topics)} topics)")
-            self._last_sent_topics = topics.copy()
-            self._enqueue({'type': 'topics', 'data': topics, 'timestamp': time.time()})
+            topics = self._get_topics_with_relations()
+            if topics != self._last_sent_topics:
+                self.get_logger().info(f"[flush] topics ({len(topics)} topics)")
+                self._last_sent_topics = topics.copy()
+                self._enqueue({'type': 'topics', 'data': topics, 'timestamp': time.time()})
 
-        actions = self._get_actions_with_relations()
-        if actions != self._last_sent_actions:
-            self.get_logger().info(f"[flush] actions ({len(actions)} actions)")
-            self._last_sent_actions = actions.copy()
-            self._enqueue({'type': 'actions', 'data': actions, 'timestamp': time.time()})
+            actions = self._get_actions_with_relations()
+            if actions != self._last_sent_actions:
+                self.get_logger().info(f"[flush] actions ({len(actions)} actions)")
+                self._last_sent_actions = actions.copy()
+                self._enqueue({'type': 'actions', 'data': actions, 'timestamp': time.time()})
 
-        services = self._get_services_with_relations()
-        if services != self._last_sent_services:
-            self.get_logger().info(f"[flush] services ({len(services)} services)")
-            self._last_sent_services = services.copy()
-            self._enqueue({'type': 'services', 'data': services, 'timestamp': time.time()})
+            services = self._get_services_with_relations()
+            if services != self._last_sent_services:
+                self.get_logger().info(f"[flush] services ({len(services)} services)")
+                self._last_sent_services = services.copy()
+                self._enqueue({'type': 'services', 'data': services, 'timestamp': time.time()})
+        except Exception:
+            self._graph_dirty = True
+            raise
+        else:
+            self._graph_dirty = False
 
     # ──────────────────────────────────────────────
     # Topic subscriptions (gateway-requested)
@@ -853,11 +900,19 @@ class WebBridge(Node):
                     f"Subscription limit ({MAX_SUBSCRIPTIONS}) reached; "
                     f"cannot subscribe to {topic_name}"
                 )
+                if self.loop:
+                    asyncio.run_coroutine_threadsafe(
+                        self._send_subscribe_failed(topic_name, 'subscription_limit_reached'), self.loop
+                    )
                 return
 
         types = dict(self.get_topic_names_and_types()).get(topic_name)
         if not types:
             self.get_logger().warning(f"Topic not found: {topic_name}")
+            if self.loop:
+                asyncio.run_coroutine_threadsafe(
+                    self._send_subscribe_failed(topic_name, 'topic_not_found'), self.loop
+                )
             return
 
         msg_class = get_message(types[0])
@@ -1141,33 +1196,53 @@ class WebBridge(Node):
             return
 
         ts = time.time()
-        last_ts = self._topic_last_timestamp.get(topic_name)
-        if last_ts is not None:
-            delta = ts - last_ts
-            if delta > 0:
-                history = self._topic_rate_history.setdefault(
-                    topic_name, deque(maxlen=self._rate_history_depth)
-                )
-                history.append(delta)
-        self._topic_last_timestamp[topic_name] = ts
-
-        rate = None
-        history = self._topic_rate_history.get(topic_name)
-        if history:
-            total = sum(history)
-            if total > 0:
-                rate = len(history) / total
+        with self._topic_rate_lock:
+            self._topic_rate_timestamps.setdefault(topic_name, deque()).append(ts)
 
         asyncio.run_coroutine_threadsafe(
             self._send_queue.put(json.dumps({
                 'type': 'topic_data',
                 'topic': topic_name,
                 'data': message_to_ordereddict(msg),
-                'rate_hz': rate,
                 'timestamp': ts,
             })),
             self.loop,
         )
+
+    def _publish_topic_rates(self):
+        """Periodic 1Hz timer callback — recomputes every subscribed topic's
+        rate_hz from a rolling window of receipt timestamps and pushes it as its
+        own message, independent of whether that topic published anything this
+        tick. This is what makes a quiet topic's rate correctly decay to 0
+        instead of freezing at its last computed value."""
+        if not self.ws or not self.loop:
+            return
+
+        with self._topic_subs_lock:
+            subscribed = list(self._topic_subs.keys())
+
+        now = time.time()
+        cutoff = now - self._RATE_WINDOW_S
+        rates = {}
+        with self._topic_rate_lock:
+            for topic in subscribed:
+                buf = self._topic_rate_timestamps.get(topic)
+                if buf:
+                    while buf and buf[0] < cutoff:
+                        buf.popleft()
+                    rates[topic] = round(len(buf) / self._RATE_WINDOW_S, 2)
+                else:
+                    rates[topic] = 0.0
+            # Drop buffers for topics no longer subscribed so this dict doesn't
+            # grow unbounded across repeated subscribe/unsubscribe cycles.
+            for stale in set(self._topic_rate_timestamps) - set(subscribed):
+                del self._topic_rate_timestamps[stale]
+
+        self._enqueue({
+            'type': 'topic_rates',
+            'rates': rates,
+            'timestamp': now,
+        })
 
     # ──────────────────────────────────────────────
     # Lifecycle (managed nodes)
@@ -2150,3 +2225,4 @@ def main(args=None):
 
 if __name__ == '__main__':
     main()
+    
