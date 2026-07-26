@@ -58,6 +58,7 @@ class WebBridge(Node):
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
 
         # Declare tunable parameters
+        self.declare_parameter('telemetry_enabled',      True)
         self.declare_parameter('tf_tree_enabled',        False)
         self.declare_parameter('ros2_control_enabled',        False)
         self.declare_parameter('ros2_control_poll_interval',    2.0)
@@ -71,7 +72,8 @@ class WebBridge(Node):
         self.declare_parameter('bag_output_dir',            '~/ros2_bags')
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -157,6 +159,15 @@ class WebBridge(Node):
         self._last_io_time:     float | None = None
         self._last_battery_state: dict | None = None
         psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
+        # Starts at the local ROS param (yaml value if the user set one, else
+        # its declared default of True) — overridden by the gateway's
+        # agent_config push once connected, see _apply_agent_config. If that
+        # push never arrives (offline, gateway didn't have a config saved,
+        # etc.) this local value is simply never overwritten, so the yaml/
+        # default value stands. The timer itself always runs; this just gates
+        # whether each tick actually sends anything, so toggling it takes
+        # effect on the very next tick with no timer start/stop bookkeeping.
+        self._telemetry_enabled = self.get_parameter('telemetry_enabled').get_parameter_value().bool_value
 
         # ── Collectors ────────────────────────────────────────────────────────
         ros2_control_enabled = self.get_parameter('ros2_control_enabled').get_parameter_value().bool_value
@@ -311,7 +322,9 @@ class WebBridge(Node):
             except json.JSONDecodeError:
                 continue
             msg_type = data.get('type')
-            if msg_type == 'subscribe':
+            if msg_type == 'agent_config':
+                self._apply_agent_config(data.get('config') or {})
+            elif msg_type == 'subscribe':
                 topic = data.get('topic')
                 if topic:
                     self._subscribe_to_topic(topic)
@@ -1591,8 +1604,23 @@ class WebBridge(Node):
     # Telemetry
     # ──────────────────────────────────────────────
 
+    def _apply_agent_config(self, config: dict) -> None:
+        """Applies the gateway-pushed feature-toggle config (sent right after
+        auth_success on every connect). A key absent from `config` means "no
+        override" — keep whatever this feature's own local default already is
+        — so a robot with nothing set in agent_config yet is unaffected.
+        Single dispatch point so each new toggle (Graph, Params, Nav2, Goals,
+        BT, TF Tree) has one place to land rather than scattering config reads
+        across the file.
+        """
+        if 'telemetry_enabled' in config:
+            self._telemetry_enabled = bool(config['telemetry_enabled'])
+        self.get_logger().info(f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}')
+
     def _collect_telemetry(self):
         if not self.ws or not self.loop:
+            return
+        if not self._telemetry_enabled:
             return
         self._enqueue({
             'type': 'telemetry',
