@@ -180,12 +180,15 @@ class WebBridge(Node):
             )
         else:
             self._ros2_control = None
-        _tf_tree_enabled = self.get_parameter('tf_tree_enabled').get_parameter_value().bool_value
-        self._tf_tree = TfTreeCollector(
-            node=self,
-            event_callback=self._on_tf_tree_event,
-            logger=self.get_logger(),
-        ) if _tf_tree_enabled else None
+        # Not constructed here — TfTreeCollector isn't free (real TF buffer/
+        # listener), so building it now from the local param and possibly
+        # tearing it straight down once agent_config arrives would be wasted
+        # work. Left as None until _apply_agent_config resolves the final
+        # answer (config override, else this local default) and constructs
+        # it at most once. self._tf_tree is already checked for None
+        # everywhere it's read, so nothing else needs to change.
+        self._tf_tree_enabled_default = self.get_parameter('tf_tree_enabled').get_parameter_value().bool_value
+        self._tf_tree = None
 
         # ── Timers ────────────────────────────────────────────────────────────
         # Subscribe to C++ graph watcher events — event-driven polls.
@@ -207,6 +210,14 @@ class WebBridge(Node):
         self.create_timer(TELEMETRY_INTERVAL,          self._collect_telemetry)
         self.create_timer(_tf_tree_poll_interval,      self._poll_tf_tree)
         self.create_timer(1.0,                         self._publish_topic_rates)
+
+        # One-time safety net: if the gateway never delivers agent_config (no
+        # network, gateway down, whatever) within a few seconds of startup,
+        # resolve every toggle to its local param default rather than leaving
+        # things like TF tree stuck at None forever. Not needed on later
+        # reconnects — once a real config has arrived once, this is a no-op.
+        self._agent_config_received = False
+        self._agent_config_fallback_timer = self.create_timer(5.0, self._apply_agent_config_fallback)
 
         # ── Battery state subscription ────────────────────────────────────────
         _battery_topic = self.get_parameter('battery_topic').get_parameter_value().string_value
@@ -1604,18 +1615,46 @@ class WebBridge(Node):
     # Telemetry
     # ──────────────────────────────────────────────
 
+    def _apply_agent_config_fallback(self):
+        self._agent_config_fallback_timer.cancel()
+        if self._agent_config_received:
+            return
+        self.get_logger().warning('No agent_config received within timeout — applying local param defaults')
+        self._apply_agent_config({})
+
     def _apply_agent_config(self, config: dict) -> None:
         """Applies the gateway-pushed feature-toggle config (sent right after
-        auth_success on every connect). A key absent from `config` means "no
-        override" — keep whatever this feature's own local default already is
-        — so a robot with nothing set in agent_config yet is unaffected.
-        Single dispatch point so each new toggle (Graph, Params, Nav2, Goals,
-        BT, TF Tree) has one place to land rather than scattering config reads
-        across the file.
+        auth_success on every connect, and by _apply_agent_config_fallback if
+        that never arrives). A key absent from `config` means "no override" —
+        fall back to this feature's own local param default — so a robot with
+        nothing set in agent_config yet behaves exactly as it did before this
+        existed. Single dispatch point so each new toggle (Graph, Params,
+        Nav2, Goals, BT, TF Tree) has one place to land rather than
+        scattering config reads across the file.
         """
+        self._agent_config_received = True
+
         if 'telemetry_enabled' in config:
             self._telemetry_enabled = bool(config['telemetry_enabled'])
-        self.get_logger().info(f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}')
+
+        # TF tree: resolve the final answer, then construct/destroy the
+        # collector at most once to reach it — never both in the same pass.
+        tf_tree_enabled = bool(config['tf_tree_enabled']) if 'tf_tree_enabled' in config else self._tf_tree_enabled_default
+        if tf_tree_enabled and self._tf_tree is None:
+            self._tf_tree = TfTreeCollector(
+                node=self,
+                event_callback=self._on_tf_tree_event,
+                logger=self.get_logger(),
+            )
+            self.get_logger().info('TF tree monitoring started')
+        elif not tf_tree_enabled and self._tf_tree is not None:
+            self._tf_tree.destroy()
+            self._tf_tree = None
+            self.get_logger().info('TF tree monitoring stopped')
+
+        self.get_logger().info(
+            f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}, tf_tree_enabled={tf_tree_enabled}'
+        )
 
     def _collect_telemetry(self):
         if not self.ws or not self.loop:
