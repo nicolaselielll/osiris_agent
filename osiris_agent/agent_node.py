@@ -23,7 +23,7 @@ from rcl_interfaces.msg import ParameterEvent
 from rcl_interfaces.srv import GetParameters, ListParameters
 from rclpy.node import Node
 from std_msgs.msg import Empty as EmptyMsg
-from rclpy.parameter import parameter_value_to_python
+from rclpy.parameter import Parameter, parameter_value_to_python
 from rclpy.qos import QoSProfile
 from rosidl_runtime_py import message_to_ordereddict
 from rosidl_runtime_py.utilities import get_message
@@ -195,16 +195,16 @@ class WebBridge(Node):
         self._telemetry_enabled = self.get_parameter('telemetry_enabled').get_parameter_value().bool_value
 
         # ── Collectors ────────────────────────────────────────────────────────
-        ros2_control_enabled = self.get_parameter('ros2_control_enabled').get_parameter_value().bool_value
-        if ros2_control_enabled:
-            self._ros2_control = Ros2ControlCollector(
-                node=self,
-                event_callback=self._on_ros2_control_event,
-                logger=self.get_logger(),
-                poll_interval=self.get_parameter('ros2_control_poll_interval').get_parameter_value().double_value,
-            )
-        else:
-            self._ros2_control = None
+        # Not constructed here — same reasoning as TF Tree below: building a
+        # Ros2ControlCollector now from the local param and possibly tearing
+        # it straight back down once agent_config arrives would be wasted
+        # work. Left as None until _apply_agent_config resolves the final
+        # answer (config override, else this local default) and constructs
+        # it at most once. self._ros2_control is already checked for None
+        # everywhere it's read, so nothing else needs to change.
+        self._ros2_control_enabled_default = self.get_parameter('ros2_control_enabled').get_parameter_value().bool_value
+        self._ros2_control_poll_interval_default = self.get_parameter('ros2_control_poll_interval').get_parameter_value().double_value
+        self._ros2_control = None
         # Not constructed here — TfTreeCollector isn't free (real TF buffer/
         # listener), so building it now from the local param and possibly
         # tearing it straight down once agent_config arrives would be wasted
@@ -231,10 +231,15 @@ class WebBridge(Node):
             self._on_parameter_event, 100,
         )
         self._startup_check_timer = self.create_timer(1.0, self._do_startup_check)
-        _tf_tree_poll_interval = self.get_parameter('tf_tree_poll_interval').get_parameter_value().double_value
         self.create_timer(TELEMETRY_INTERVAL,          self._collect_telemetry)
-        self.create_timer(_tf_tree_poll_interval,      self._poll_tf_tree)
         self.create_timer(1.0,                         self._publish_topic_rates)
+        # Not created here — its period is a constructor arg to create_timer,
+        # so like TF Tree/ros2_control above it's deferred to
+        # _apply_agent_config, which resolves config override vs. this local
+        # default and creates the timer at most once per resolved interval.
+        self._tf_tree_poll_interval_default = self.get_parameter('tf_tree_poll_interval').get_parameter_value().double_value
+        self._tf_tree_poll_timer = None
+        self._tf_tree_poll_interval = None
 
         # One-time safety net: if the gateway never delivers agent_config (no
         # network, gateway down, whatever) within a few seconds of startup,
@@ -245,16 +250,13 @@ class WebBridge(Node):
         self._agent_config_fallback_timer = self.create_timer(5.0, self._apply_agent_config_fallback)
 
         # ── Battery state subscription ────────────────────────────────────────
-        _battery_topic = self.get_parameter('battery_topic').get_parameter_value().string_value
-        try:
-            from sensor_msgs.msg import BatteryState as BatteryStateMsg
-            self.create_subscription(
-                BatteryStateMsg, _battery_topic,
-                self._on_battery_state, 10,
-            )
-            self.get_logger().info(f'Battery state subscription active on {_battery_topic}')
-        except Exception as e:
-            self.get_logger().warning(f'Battery state monitoring unavailable: {e}')
+        # Not subscribed here — the topic name is a constructor arg to
+        # create_subscription, so like the timers above it's deferred to
+        # _apply_agent_config, which resolves config override vs. this local
+        # default and (re)subscribes at most once per resolved topic.
+        self._battery_topic_default = self.get_parameter('battery_topic').get_parameter_value().string_value
+        self._battery_sub = None
+        self._battery_topic = None
 
         # ── WebSocket thread ──────────────────────────────────────────────────
         threading.Thread(target=self._run_ws_client, daemon=True).start()
@@ -1708,6 +1710,51 @@ class WebBridge(Node):
             self._tf_tree = None
             self.get_logger().info('TF tree monitoring stopped')
 
+        # TF tree poll timer: independent of the collector above — _poll_tf_tree
+        # is a no-op whenever self._tf_tree is None, so the timer's period is
+        # resolved and (re)created here regardless of tf_tree_enabled, exactly
+        # like telemetry's own timer runs unconditionally.
+        tf_tree_poll_interval = float(config['tf_tree_poll_interval']) if 'tf_tree_poll_interval' in config else self._tf_tree_poll_interval_default
+        if self._tf_tree_poll_timer is None or self._tf_tree_poll_interval != tf_tree_poll_interval:
+            if self._tf_tree_poll_timer is not None:
+                self._tf_tree_poll_timer.cancel()
+            self._tf_tree_poll_timer = self.create_timer(tf_tree_poll_interval, self._poll_tf_tree)
+            self._tf_tree_poll_interval = tf_tree_poll_interval
+
+        # ros2_control: same construct/destroy-at-most-once pattern as TF tree.
+        ros2_control_enabled = bool(config['ros2_control_enabled']) if 'ros2_control_enabled' in config else self._ros2_control_enabled_default
+        ros2_control_poll_interval = float(config['ros2_control_poll_interval']) if 'ros2_control_poll_interval' in config else self._ros2_control_poll_interval_default
+        if ros2_control_enabled and self._ros2_control is None:
+            self._ros2_control = Ros2ControlCollector(
+                node=self,
+                event_callback=self._on_ros2_control_event,
+                logger=self.get_logger(),
+                poll_interval=ros2_control_poll_interval,
+            )
+            self.get_logger().info('ros2_control monitoring started')
+        elif not ros2_control_enabled and self._ros2_control is not None:
+            self._ros2_control.destroy()
+            self._ros2_control = None
+            self.get_logger().info('ros2_control monitoring stopped')
+
+        # Battery topic: the subscription's topic name is a constructor arg,
+        # so it's (re)created here whenever the resolved topic changes.
+        battery_topic = config['battery_topic'] if 'battery_topic' in config else self._battery_topic_default
+        if self._battery_sub is None or self._battery_topic != battery_topic:
+            if self._battery_sub is not None:
+                self.destroy_subscription(self._battery_sub)
+                self._battery_sub = None
+            try:
+                from sensor_msgs.msg import BatteryState as BatteryStateMsg
+                self._battery_sub = self.create_subscription(
+                    BatteryStateMsg, battery_topic,
+                    self._on_battery_state, 10,
+                )
+                self.get_logger().info(f'Battery state subscription active on {battery_topic}')
+            except Exception as e:
+                self.get_logger().warning(f'Battery state monitoring unavailable: {e}')
+            self._battery_topic = battery_topic
+
         # Goals: no single collector object to construct/destroy — just a set
         # of per-action subscriptions. Turning on catches up on every action
         # already known (self._active_actions, populated by the graph scan
@@ -1779,6 +1826,17 @@ class WebBridge(Node):
             self.get_logger().info(f'BT.CPP monitoring started ({bt_host}:{bt_server_port}/{bt_publisher_port})')
 
         self._bt_mode = bt_mode
+
+        # bag_output_dir / graph_debounce_interval: every consumer already
+        # calls self.get_parameter(...) fresh at time of use (a plain path
+        # string re-read on each bag list/download/record; a plain float
+        # re-read into a brand-new threading.Timer on every debounce trigger,
+        # not a fixed recurring ROS timer) — so there's nothing to construct
+        # or defer here, just update the underlying ROS param when overridden.
+        if 'bag_output_dir' in config:
+            self.set_parameters([Parameter('bag_output_dir', Parameter.Type.STRING, str(config['bag_output_dir']))])
+        if 'graph_debounce_interval' in config:
+            self.set_parameters([Parameter('graph_debounce_interval', Parameter.Type.DOUBLE, float(config['graph_debounce_interval']))])
 
         self.get_logger().info(
             f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}, '
