@@ -59,11 +59,20 @@ class WebBridge(Node):
 
         # Declare tunable parameters
         self.declare_parameter('telemetry_enabled',      True)
+        self.declare_parameter('goals_enabled',          True)
+        self.declare_parameter('params_enabled',         True)
         self.declare_parameter('tf_tree_enabled',        False)
         self.declare_parameter('ros2_control_enabled',        False)
         self.declare_parameter('ros2_control_poll_interval',    2.0)
         self.declare_parameter('battery_topic',          '/battery_state')
-        self.declare_parameter('bt_collector_enabled',   False)
+        # Replaces the old bt_collector_enabled boolean — Nav2 BT and BT.CPP
+        # share a single event pipeline (_on_bt_event/_cached_bt_tree_event,
+        # no source tagging), so both being active at once would already
+        # corrupt each other's state. One three-way setting makes that
+        # mutual exclusion structural instead of a UI convention to enforce.
+        # Default 'nav2' matches today's actual behavior (Nav2 BT always-on,
+        # BT.CPP off).
+        self.declare_parameter('bt_mode',               'nav2')  # 'off' | 'nav2' | 'btcpp'
         self.declare_parameter('bt_host',               '127.0.0.1')
         self.declare_parameter('bt_server_port',         1667)
         self.declare_parameter('bt_publisher_port',      1668)
@@ -113,6 +122,15 @@ class WebBridge(Node):
         self._action_feedback_subs:     dict[str, rclpy.subscription.Subscription] = {}
         self._action_goal_states:       dict[str, dict[str, int]] = {}  # action → {uuid_hex → status_int}
         self._action_feedback_throttle: dict[str, float] = {}           # action → last_sent_time
+        # None = not yet resolved by _apply_agent_config — the graph scan
+        # still runs and populates _active_actions (Graph's action listing
+        # needs that regardless), but _subscribe_action_status is skipped
+        # until this becomes True, same "don't do the work just to undo it"
+        # reasoning as TF tree. Once resolved, toggling calls _subscribe_
+        # action_status/_unsubscribe_action_monitoring for every action
+        # already known in _active_actions to catch up/tear down.
+        self._goals_enabled_default = self.get_parameter('goals_enabled').get_parameter_value().bool_value
+        self._goals_enabled = None
 
         # ── Count sentinels (cheap change detection) ─────────────────────────
         self._topic_counts: dict[str, tuple[int, int]] = {}  # topic → (pub_n, sub_n)
@@ -127,6 +145,13 @@ class WebBridge(Node):
         self._node_parameter_cache: dict[str, dict | None] = {}  # None = not yet fetched, {} = fetched but empty
         self._pending_param_fetches: set[str] = set()
         self._nodes_no_param_service: set[str] = set()  # nodes whose list_parameters was never ready
+        # None = not yet resolved by _apply_agent_config. Requires graph_enabled
+        # in spirit — new nodes' params are only ever discovered via the graph
+        # tick, so if the reactive tick were ever disabled this would just
+        # cover whatever nodes existed at first tick (not built yet, see
+        # earlier discussion — no separate graph toggle exists today).
+        self._params_enabled_default = self.get_parameter('params_enabled').get_parameter_value().bool_value
+        self._params_enabled = None
 
         # ── Lifecycle subscriptions (auto-detected managed nodes) ─────────────
         self._lifecycle_subs: dict[str, rclpy.subscription.Subscription] = {}  # topic → sub
@@ -235,20 +260,21 @@ class WebBridge(Node):
         threading.Thread(target=self._run_ws_client, daemon=True).start()
 
         # ── Optional BT collectors ────────────────────────────────────────────
-        bt_enabled = self.get_parameter('bt_collector_enabled').get_parameter_value().bool_value
-        if bt_enabled:
-            self._bt_collector = BTCollector(
-                event_callback=self._on_bt_event,
-                host=self.get_parameter('bt_host').get_parameter_value().string_value,
-                server_port=self.get_parameter('bt_server_port').get_parameter_value().integer_value,
-                publisher_port=self.get_parameter('bt_publisher_port').get_parameter_value().integer_value,
-                logger=self.get_logger(),
-            )
-            self._bt_collector.start()
-        else:
-            self._bt_collector = None
-
-        self._init_nav2_bt_monitor()
+        # Neither constructed here — resolved once by _apply_agent_config
+        # (config override, else these local defaults), same deferred
+        # reasoning as TF tree/goals/params. self._bt_mode = None means "not
+        # yet resolved"; self._nav2_bt_monitor_initialized replaces the old
+        # hasattr(self, '_nav2_bt_tree_id')-as-a-proxy checks throughout the
+        # file, now that construction is no longer guaranteed to have
+        # happened by the time any of that code runs.
+        self._bt_mode_default = self.get_parameter('bt_mode').get_parameter_value().string_value
+        self._bt_host_default = self.get_parameter('bt_host').get_parameter_value().string_value
+        self._bt_server_port_default = self.get_parameter('bt_server_port').get_parameter_value().integer_value
+        self._bt_publisher_port_default = self.get_parameter('bt_publisher_port').get_parameter_value().integer_value
+        self._bt_mode = None
+        self._bt_collector = None
+        self._bt_collector_conn = None  # (host, server_port, publisher_port) BTCollector is currently connected with
+        self._nav2_bt_monitor_initialized = False
 
         _watcher_status = (
             f'pid={watcher_proc.pid}' if watcher_proc is not None else 'not started'
@@ -535,17 +561,22 @@ class WebBridge(Node):
             # are still in the middle of configuring/activating.
             def _fetch_all_params_delayed():
                 for fqn in list(current_nodes):
-                    self._fetch_node_parameters_async(fqn)
+                    if self._params_enabled:
+                        self._fetch_node_parameters_async(fqn)
                     self._fetch_lifecycle_state_async(fqn)
             self._param_fetch_timer = self.create_timer(5.0, lambda: (self._cancel_param_fetch_timer(), _fetch_all_params_delayed()))
             for _t in current_topics:
                 if _t.endswith('/transition_event'):
                     self._subscribe_lifecycle_topic(_t)
                     self._fetch_lifecycle_state_async(_t[:-len('/transition_event')])
-            # Resolve action types and subscribe monitoring for all actions at startup
+            # Resolve action types for all actions at startup — Graph's action
+            # listing needs this regardless of goals_enabled. Status
+            # subscription (actual goal tracking) is gated separately; see
+            # self._goals_enabled.
             for a in current_actions:
                 self._fetch_action_types(a, topic_type_map)
-                self._subscribe_action_status(a)
+                if self._goals_enabled:
+                    self._subscribe_action_status(a)
             if self._ros2_control is not None:
                 self._ros2_control.poll(force=True)
             if self._tf_tree is not None:
@@ -566,7 +597,8 @@ class WebBridge(Node):
             self._graph_dirty = True
         for fqn in started_nodes:
             self._nodes_no_param_service.discard(fqn)  # allow retry after restart
-            self._fetch_node_parameters_async(fqn)
+            if self._params_enabled:
+                self._fetch_node_parameters_async(fqn)
             self._fetch_lifecycle_state_async(fqn)
 
         stopped_nodes = self._active_nodes - current_nodes
@@ -589,7 +621,7 @@ class WebBridge(Node):
             if t.endswith('/transition_event'):
                 self._subscribe_lifecycle_topic(t)
             # Nav2 BT edge-case: /behavior_tree_log just appeared
-            if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+            if t == '/behavior_tree_log' and self._nav2_bt_monitor_initialized:
                 if self.count_publishers(t) > 0:
                     self._nav2_bt_publisher_active = True
                     if self._load_and_parse_bt_xml():
@@ -609,7 +641,7 @@ class WebBridge(Node):
                 lc_sub = self._lifecycle_subs.pop(t, None)
                 if lc_sub:
                     self.destroy_subscription(lc_sub)
-            if t == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+            if t == '/behavior_tree_log' and self._nav2_bt_monitor_initialized:
                 self._on_nav2_bt_gone()
 
         # ── 4. Service changes ─────────────────────────────────────────────────────────────
@@ -620,7 +652,8 @@ class WebBridge(Node):
         # ── 5. Action events ──────────────────────────────────────────────────
         for a in current_actions - self._active_actions:
             self._fetch_action_types(a, topic_type_map)
-            self._subscribe_action_status(a)
+            if self._goals_enabled:
+                self._subscribe_action_status(a)
             self._graph_dirty = True
 
         for a in self._active_actions - current_actions:
@@ -645,7 +678,7 @@ class WebBridge(Node):
                 self._fetch_action_types(a, topic_type_map)
 
         # ── 9. Nav2 BT publisher liveness check ──────────────────────────────
-        if hasattr(self, '_nav2_bt_publisher_active'):
+        if self._nav2_bt_monitor_initialized:
             bt_rel = self._topic_relations.get('/behavior_tree_log', {})
             bt_pubs = bt_rel.get('publishers', set()) & current_nodes
             if self._nav2_bt_publisher_active and not bt_pubs:
@@ -747,7 +780,7 @@ class WebBridge(Node):
                     self._graph_dirty = True
 
                 # Nav2 BT: publisher appeared/vanished on /behavior_tree_log
-                if topic == '/behavior_tree_log' and hasattr(self, '_nav2_bt_tree_id'):
+                if topic == '/behavior_tree_log' and self._nav2_bt_monitor_initialized:
                     old_pubs = old['publishers']
                     if publishers and not old_pubs:
                         self._nav2_bt_publisher_active = True
@@ -1375,6 +1408,21 @@ class WebBridge(Node):
         except Exception as e:
             self.get_logger().warning(f'[actions] failed to subscribe to feedback for {action_name}: {e}')
 
+    def _catch_up_action_feedback(self, action_name: str):
+        """Subscribes to feedback for an action whose type was already
+        resolved (cached) while goals_enabled was False. _fetch_action_types
+        early-returns once an action is cached, so simply re-calling it here
+        would silently no-op instead of subscribing — this reuses the
+        cached _feedback_msg_type instead of redoing type resolution."""
+        type_info = self._action_type_cache.get(action_name)
+        if not type_info:
+            return
+        try:
+            feedback_msg_cls = get_message(type_info['_feedback_msg_type'])
+            self._subscribe_action_feedback(action_name, feedback_msg_cls)
+        except Exception as e:
+            self.get_logger().warning(f'[actions] failed to catch up feedback subscription for {action_name}: {e}')
+
     def _unsubscribe_action_monitoring(self, action_name: str):
         sub = self._action_status_subs.pop(action_name, None)
         if sub:
@@ -1546,11 +1594,19 @@ class WebBridge(Node):
                 'goal_fields':     _fields(goal_cls),
                 'result_fields':   _fields(result_cls),
                 'feedback_fields': _fields(feedback_cls),
+                # Wire message type (not the same string as feedback_type
+                # above — that's the nested class name, this is the
+                # standalone _FeedbackMessage actually subscribed to) kept
+                # so a later goals_enabled toggle-on can catch up the
+                # feedback subscription without redoing type resolution —
+                # see _catch_up_action_feedback.
+                '_feedback_msg_type': feedback_msg_type,
             }
             self._action_type_cache[action_name] = type_info
             self.get_logger().info(f'[actions] resolved types for {action_name}: {base_type}')
             self._graph_dirty = True
-            self._subscribe_action_feedback(action_name, feedback_msg_cls)
+            if self._goals_enabled:
+                self._subscribe_action_feedback(action_name, feedback_msg_cls)
             return True
         except Exception as e:
             self.get_logger().warning(f'[actions] failed to resolve types for {action_name}: {e}')
@@ -1652,8 +1708,82 @@ class WebBridge(Node):
             self._tf_tree = None
             self.get_logger().info('TF tree monitoring stopped')
 
+        # Goals: no single collector object to construct/destroy — just a set
+        # of per-action subscriptions. Turning on catches up on every action
+        # already known (self._active_actions, populated by the graph scan
+        # regardless of this flag); turning off tears all of them down.
+        goals_enabled = bool(config['goals_enabled']) if 'goals_enabled' in config else self._goals_enabled_default
+        if goals_enabled and not self._goals_enabled:
+            for a in self._active_actions:
+                self._subscribe_action_status(a)
+                self._catch_up_action_feedback(a)
+            self.get_logger().info(f'Goal tracking started ({len(self._active_actions)} action(s))')
+        elif not goals_enabled and self._goals_enabled:
+            for a in list(set(self._action_status_subs) | set(self._action_feedback_subs)):
+                self._unsubscribe_action_monitoring(a)
+            self.get_logger().info('Goal tracking stopped')
+        self._goals_enabled = goals_enabled
+
+        # Params: no collector/subscription to construct/destroy either — just
+        # a cache. Turning on catches up on every node already known
+        # (self._active_nodes, populated by the graph scan regardless of this
+        # flag); turning off clears the cache so stale values don't keep
+        # showing in the Params pane after the user asked this to stop.
+        params_enabled = bool(config['params_enabled']) if 'params_enabled' in config else self._params_enabled_default
+        if params_enabled and not self._params_enabled:
+            for fqn in self._active_nodes:
+                self._fetch_node_parameters_async(fqn)
+            self.get_logger().info(f'Param fetching started ({len(self._active_nodes)} node(s))')
+        elif not params_enabled and self._params_enabled:
+            self._node_parameter_cache.clear()
+            self._pending_param_fetches.clear()
+            self._graph_dirty = True
+            self.get_logger().info('Param fetching stopped')
+        self._params_enabled = params_enabled
+
+        # BT: mutually exclusive by construction — Nav2 BT and BT.CPP share
+        # the same event pipeline (_on_bt_event/_cached_bt_tree_event, no
+        # source tagging), so only one may ever be active. Tear down
+        # whichever isn't the resolved mode before starting the other, so a
+        # switch never briefly has both running. BT.CPP additionally
+        # reconnects if its host/port changed while already in btcpp mode —
+        # a running BTCollector is a live ZMQ connection bound to whatever
+        # host/port it was constructed with.
+        bt_mode = config['bt_mode'] if 'bt_mode' in config else self._bt_mode_default
+        bt_host = config['bt_host'] if 'bt_host' in config else self._bt_host_default
+        bt_server_port = int(config['bt_server_port']) if 'bt_server_port' in config else self._bt_server_port_default
+        bt_publisher_port = int(config['bt_publisher_port']) if 'bt_publisher_port' in config else self._bt_publisher_port_default
+        bt_conn = (bt_host, bt_server_port, bt_publisher_port)
+
+        if bt_mode != 'nav2' and self._nav2_bt_monitor_initialized:
+            self._teardown_nav2_bt_monitor()
+        if bt_mode != 'btcpp' and self._bt_collector is not None:
+            self._bt_collector.stop()
+            self._bt_collector = None
+            self._bt_collector_conn = None
+
+        if bt_mode == 'nav2' and not self._nav2_bt_monitor_initialized:
+            self._init_nav2_bt_monitor()
+        elif bt_mode == 'btcpp' and (self._bt_collector is None or self._bt_collector_conn != bt_conn):
+            if self._bt_collector is not None:
+                self._bt_collector.stop()
+            self._bt_collector = BTCollector(
+                event_callback=self._on_bt_event,
+                host=bt_host,
+                server_port=bt_server_port,
+                publisher_port=bt_publisher_port,
+                logger=self.get_logger(),
+            )
+            self._bt_collector.start()
+            self._bt_collector_conn = bt_conn
+            self.get_logger().info(f'BT.CPP monitoring started ({bt_host}:{bt_server_port}/{bt_publisher_port})')
+
+        self._bt_mode = bt_mode
+
         self.get_logger().info(
-            f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}, tf_tree_enabled={tf_tree_enabled}'
+            f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}, '
+            f'tf_tree_enabled={tf_tree_enabled}, goals_enabled={goals_enabled}, '
+            f'params_enabled={params_enabled}, bt_mode={bt_mode}'
         )
 
     def _collect_telemetry(self):
@@ -1930,15 +2060,16 @@ class WebBridge(Node):
             self._nav2_bt_tree_structure   = None
             self._nav2_bt_nodes_list:      list = []
             self._nav2_bt_name_to_uid:     dict = {}
-            self.create_subscription(
+            self._nav2_bt_log_sub = self.create_subscription(
                 BehaviorTreeLog, '/behavior_tree_log', self._on_nav2_bt_log, 10
             )
-            self.create_subscription(
+            self._nav2_bt_goal_status_sub = self.create_subscription(
                 GoalStatusArray,
                 '/navigate_to_pose/_action/status',
                 self._on_nav2_goal_status,
                 10,
             )
+            self._nav2_bt_monitor_initialized = True
             # If bt_navigator is already publishing, pre-parse the XML so
             # the startup bt_state event includes the tree structure.
             if self.count_publishers('/behavior_tree_log') > 0:
@@ -1946,6 +2077,17 @@ class WebBridge(Node):
                 self._load_and_parse_bt_xml()
         except Exception as e:
             self.get_logger().debug(f"Nav2 BT monitoring unavailable: {e}")
+
+    def _teardown_nav2_bt_monitor(self):
+        if not self._nav2_bt_monitor_initialized:
+            return
+        self._on_nav2_bt_gone()  # notifies client the tree is gone, resets tree-state fields
+        self.destroy_subscription(self._nav2_bt_log_sub)
+        self.destroy_subscription(self._nav2_bt_goal_status_sub)
+        self._nav2_bt_log_sub = None
+        self._nav2_bt_goal_status_sub = None
+        self._nav2_bt_monitor_initialized = False
+        self.get_logger().info('Nav2 BT monitoring stopped')
 
     def _load_and_parse_bt_xml(self) -> bool:
         if self._nav2_bt_tree_id is not None:
@@ -2103,7 +2245,7 @@ class WebBridge(Node):
                 'blackboard': src.get('blackboard'),
             }
         if (
-            hasattr(self, '_nav2_bt_tree_id')
+            self._nav2_bt_monitor_initialized
             and self._nav2_bt_tree_id
             and self._nav2_bt_tree_structure
         ):
