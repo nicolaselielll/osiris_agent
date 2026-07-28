@@ -53,6 +53,14 @@ class WebBridge(Node):
         super().__init__('osiris_node')
         self._watcher_proc = watcher_proc
 
+        # Names explicitly set via --params-file/CLI at launch — distinct
+        # from self.get_parameter(name), which can't tell "the user
+        # explicitly passed this" apart from "nothing was passed, this is
+        # just the hardcoded declare_parameter default." _apply_agent_config
+        # needs that distinction to give a deliberate local override
+        # precedence over the cloud agent_config (see _resolve_config_value).
+        self._param_overrides = set(self.get_parameter_overrides().keys())
+
         auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
         if not auth_token:
             raise ValueError("OSIRIS_AUTH_TOKEN environment variable must be set")
@@ -192,7 +200,8 @@ class WebBridge(Node):
         # default value stands. The timer itself always runs; this just gates
         # whether each tick actually sends anything, so toggling it takes
         # effect on the very next tick with no timer start/stop bookkeeping.
-        self._telemetry_enabled = self.get_parameter('telemetry_enabled').get_parameter_value().bool_value
+        self._telemetry_enabled_default = self.get_parameter('telemetry_enabled').get_parameter_value().bool_value
+        self._telemetry_enabled = self._telemetry_enabled_default
 
         # ── Collectors ────────────────────────────────────────────────────────
         # Not constructed here — same reasoning as TF Tree below: building a
@@ -1680,24 +1689,40 @@ class WebBridge(Node):
         self.get_logger().warning('No agent_config received within timeout — applying local param defaults')
         self._apply_agent_config({})
 
+    def _resolve_config_value(self, name, config, local_default, cast=None):
+        """Precedence for a single agent_config field: an explicit yaml/CLI
+        param override (--params-file) always wins — passing one is a
+        deliberate, intentional choice, and a cloud agent_config value
+        should never silently supersede it. Absent that, the cloud config
+        value if present, else the hardcoded declare_parameter default.
+        Checked via membership in self._param_overrides rather than value
+        equality, so "explicitly set to the same value as the default"
+        still counts as an override.
+        """
+        if name in self._param_overrides:
+            return local_default
+        if name in config:
+            return cast(config[name]) if cast else config[name]
+        return local_default
+
     def _apply_agent_config(self, config: dict) -> None:
         """Applies the gateway-pushed feature-toggle config (sent right after
         auth_success on every connect, and by _apply_agent_config_fallback if
-        that never arrives). A key absent from `config` means "no override" —
-        fall back to this feature's own local param default — so a robot with
-        nothing set in agent_config yet behaves exactly as it did before this
-        existed. Single dispatch point so each new toggle (Graph, Params,
-        Nav2, Goals, BT, TF Tree) has one place to land rather than
-        scattering config reads across the file.
+        that never arrives). Per-field precedence: local yaml/CLI override >
+        cloud agent_config > hardcoded default — see _resolve_config_value.
+        A robot with nothing set in agent_config yet, and no yaml override
+        either, behaves exactly as it did before this existed. Single
+        dispatch point so each new toggle (Graph, Params, Nav2, Goals, BT,
+        TF Tree) has one place to land rather than scattering config reads
+        across the file.
         """
         self._agent_config_received = True
 
-        if 'telemetry_enabled' in config:
-            self._telemetry_enabled = bool(config['telemetry_enabled'])
+        self._telemetry_enabled = self._resolve_config_value('telemetry_enabled', config, self._telemetry_enabled_default, bool)
 
         # TF tree: resolve the final answer, then construct/destroy the
         # collector at most once to reach it — never both in the same pass.
-        tf_tree_enabled = bool(config['tf_tree_enabled']) if 'tf_tree_enabled' in config else self._tf_tree_enabled_default
+        tf_tree_enabled = self._resolve_config_value('tf_tree_enabled', config, self._tf_tree_enabled_default, bool)
         if tf_tree_enabled and self._tf_tree is None:
             self._tf_tree = TfTreeCollector(
                 node=self,
@@ -1714,7 +1739,7 @@ class WebBridge(Node):
         # is a no-op whenever self._tf_tree is None, so the timer's period is
         # resolved and (re)created here regardless of tf_tree_enabled, exactly
         # like telemetry's own timer runs unconditionally.
-        tf_tree_poll_interval = float(config['tf_tree_poll_interval']) if 'tf_tree_poll_interval' in config else self._tf_tree_poll_interval_default
+        tf_tree_poll_interval = self._resolve_config_value('tf_tree_poll_interval', config, self._tf_tree_poll_interval_default, float)
         if self._tf_tree_poll_timer is None or self._tf_tree_poll_interval != tf_tree_poll_interval:
             if self._tf_tree_poll_timer is not None:
                 self._tf_tree_poll_timer.cancel()
@@ -1722,8 +1747,8 @@ class WebBridge(Node):
             self._tf_tree_poll_interval = tf_tree_poll_interval
 
         # ros2_control: same construct/destroy-at-most-once pattern as TF tree.
-        ros2_control_enabled = bool(config['ros2_control_enabled']) if 'ros2_control_enabled' in config else self._ros2_control_enabled_default
-        ros2_control_poll_interval = float(config['ros2_control_poll_interval']) if 'ros2_control_poll_interval' in config else self._ros2_control_poll_interval_default
+        ros2_control_enabled = self._resolve_config_value('ros2_control_enabled', config, self._ros2_control_enabled_default, bool)
+        ros2_control_poll_interval = self._resolve_config_value('ros2_control_poll_interval', config, self._ros2_control_poll_interval_default, float)
         if ros2_control_enabled and self._ros2_control is None:
             self._ros2_control = Ros2ControlCollector(
                 node=self,
@@ -1739,7 +1764,7 @@ class WebBridge(Node):
 
         # Battery topic: the subscription's topic name is a constructor arg,
         # so it's (re)created here whenever the resolved topic changes.
-        battery_topic = config['battery_topic'] if 'battery_topic' in config else self._battery_topic_default
+        battery_topic = self._resolve_config_value('battery_topic', config, self._battery_topic_default)
         if self._battery_sub is None or self._battery_topic != battery_topic:
             if self._battery_sub is not None:
                 self.destroy_subscription(self._battery_sub)
@@ -1759,7 +1784,7 @@ class WebBridge(Node):
         # of per-action subscriptions. Turning on catches up on every action
         # already known (self._active_actions, populated by the graph scan
         # regardless of this flag); turning off tears all of them down.
-        goals_enabled = bool(config['goals_enabled']) if 'goals_enabled' in config else self._goals_enabled_default
+        goals_enabled = self._resolve_config_value('goals_enabled', config, self._goals_enabled_default, bool)
         if goals_enabled and not self._goals_enabled:
             for a in self._active_actions:
                 self._subscribe_action_status(a)
@@ -1776,7 +1801,7 @@ class WebBridge(Node):
         # (self._active_nodes, populated by the graph scan regardless of this
         # flag); turning off clears the cache so stale values don't keep
         # showing in the Params pane after the user asked this to stop.
-        params_enabled = bool(config['params_enabled']) if 'params_enabled' in config else self._params_enabled_default
+        params_enabled = self._resolve_config_value('params_enabled', config, self._params_enabled_default, bool)
         if params_enabled and not self._params_enabled:
             for fqn in self._active_nodes:
                 self._fetch_node_parameters_async(fqn)
@@ -1796,10 +1821,10 @@ class WebBridge(Node):
         # reconnects if its host/port changed while already in btcpp mode —
         # a running BTCollector is a live ZMQ connection bound to whatever
         # host/port it was constructed with.
-        bt_mode = config['bt_mode'] if 'bt_mode' in config else self._bt_mode_default
-        bt_host = config['bt_host'] if 'bt_host' in config else self._bt_host_default
-        bt_server_port = int(config['bt_server_port']) if 'bt_server_port' in config else self._bt_server_port_default
-        bt_publisher_port = int(config['bt_publisher_port']) if 'bt_publisher_port' in config else self._bt_publisher_port_default
+        bt_mode = self._resolve_config_value('bt_mode', config, self._bt_mode_default)
+        bt_host = self._resolve_config_value('bt_host', config, self._bt_host_default)
+        bt_server_port = self._resolve_config_value('bt_server_port', config, self._bt_server_port_default, int)
+        bt_publisher_port = self._resolve_config_value('bt_publisher_port', config, self._bt_publisher_port_default, int)
         bt_conn = (bt_host, bt_server_port, bt_publisher_port)
 
         if bt_mode != 'nav2' and self._nav2_bt_monitor_initialized:
@@ -1833,9 +1858,14 @@ class WebBridge(Node):
         # re-read into a brand-new threading.Timer on every debounce trigger,
         # not a fixed recurring ROS timer) — so there's nothing to construct
         # or defer here, just update the underlying ROS param when overridden.
-        if 'bag_output_dir' in config:
+        # A yaml override for either wins outright (the same precedence as
+        # every other field, just applied by skipping the cloud write instead
+        # of via _resolve_config_value — there's no separate "_default" to
+        # fall back to here, the ROS param itself already holds the
+        # yaml-or-hardcoded value and is simply left untouched).
+        if 'bag_output_dir' not in self._param_overrides and 'bag_output_dir' in config:
             self.set_parameters([Parameter('bag_output_dir', Parameter.Type.STRING, str(config['bag_output_dir']))])
-        if 'graph_debounce_interval' in config:
+        if 'graph_debounce_interval' not in self._param_overrides and 'graph_debounce_interval' in config:
             self.set_parameters([Parameter('graph_debounce_interval', Parameter.Type.DOUBLE, float(config['graph_debounce_interval']))])
 
         self.get_logger().info(
