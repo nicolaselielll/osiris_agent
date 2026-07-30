@@ -12,9 +12,10 @@ V=$1
 
 cd "$(dirname "$0")"
 
-# Update version in setup.py and __init__.py
-sed -i "s/version='.*'/version='$V'/" setup.py
-sed -i "s/__version__ = '.*'/__version__ = '$V'/" osiris_agent/__init__.py
+# Update version in setup.py and __init__.py (sed -i.bak works identically
+# on GNU and BSD/macOS sed, unlike bare -i which BSD parses differently)
+sed -i.bak "s/version='.*'/version='$V'/" setup.py && rm -f setup.py.bak
+sed -i.bak "s/__version__ = '.*'/__version__ = '$V'/" osiris_agent/__init__.py && rm -f osiris_agent/__init__.py.bak
 
 # Commit and tag
 git add .
