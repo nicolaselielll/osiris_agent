@@ -59,7 +59,12 @@ class WebBridge(Node):
         # just the hardcoded declare_parameter default." _apply_agent_config
         # needs that distinction to give a deliberate local override
         # precedence over the cloud agent_config (see _resolve_config_value).
-        self._param_overrides = set(self.get_parameter_overrides().keys())
+        # Node.get_parameter_overrides() isn't available on this rclpy
+        # version — self._parameter_overrides is the underlying dict rclpy
+        # itself populates from --params-file/CLI before any
+        # declare_parameter() call consumes it, and is what that method
+        # would have wrapped anyway.
+        self._param_overrides = set(self._parameter_overrides.keys())
 
         auth_token = os.environ.get('OSIRIS_AUTH_TOKEN')
         if not auth_token:
@@ -89,8 +94,8 @@ class WebBridge(Node):
         self.declare_parameter('bag_output_dir',            '~/ros2_bags')
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
-        # self.ws_url = f'{base_url}?robot=true&token={auth_token}'
-        self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
+        self.ws_url = f'{base_url}?robot=true&token={auth_token}'
+        # self.ws_url = f'ws://host.docker.internal:8080?robot=true&token={auth_token}'
 
         self.ws   = None
         self.loop = None
@@ -214,6 +219,7 @@ class WebBridge(Node):
         self._ros2_control_enabled_default = self.get_parameter('ros2_control_enabled').get_parameter_value().bool_value
         self._ros2_control_poll_interval_default = self.get_parameter('ros2_control_poll_interval').get_parameter_value().double_value
         self._ros2_control = None
+        self._ros2_control_poll_interval = None
         # Not constructed here — TfTreeCollector isn't free (real TF buffer/
         # listener), so building it now from the local param and possibly
         # tearing it straight down once agent_config arrives would be wasted
@@ -255,8 +261,12 @@ class WebBridge(Node):
         # resolve every toggle to its local param default rather than leaving
         # things like TF tree stuck at None forever. Not needed on later
         # reconnects — once a real config has arrived once, this is a no-op.
+        # Only relevant when actually waiting on the cloud in the first
+        # place — a yaml params file means there's nothing to wait for (see
+        # the immediate _apply_agent_config({}) call at the end of __init__),
+        # so no fallback timer is created in that case either.
         self._agent_config_received = False
-        self._agent_config_fallback_timer = self.create_timer(5.0, self._apply_agent_config_fallback)
+        self._agent_config_fallback_timer = None if self._param_overrides else self.create_timer(5.0, self._apply_agent_config_fallback)
 
         # ── Battery state subscription ────────────────────────────────────────
         # Not subscribed here — the topic name is a constructor arg to
@@ -286,6 +296,17 @@ class WebBridge(Node):
         self._bt_collector = None
         self._bt_collector_conn = None  # (host, server_port, publisher_port) BTCollector is currently connected with
         self._nav2_bt_monitor_initialized = False
+
+        # A yaml params file means the operator already fully specified how
+        # this run should behave — there's nothing to wait on the cloud for,
+        # so resolve and construct everything right now instead of leaving
+        # every feature at None until a WS connection (or the 5s fallback
+        # timer, not even created in this case) gets around to it. Passing
+        # {} as config makes _resolve_config_value fall through to each
+        # field's local_default unconditionally, same as it always would
+        # once self._param_overrides is non-empty.
+        if self._param_overrides:
+            self._apply_agent_config({})
 
         _watcher_status = (
             f'pid={watcher_proc.pid}' if watcher_proc is not None else 'not started'
@@ -1690,16 +1711,18 @@ class WebBridge(Node):
         self._apply_agent_config({})
 
     def _resolve_config_value(self, name, config, local_default, cast=None):
-        """Precedence for a single agent_config field: an explicit yaml/CLI
-        param override (--params-file) always wins — passing one is a
-        deliberate, intentional choice, and a cloud agent_config value
-        should never silently supersede it. Absent that, the cloud config
-        value if present, else the hardcoded declare_parameter default.
-        Checked via membership in self._param_overrides rather than value
-        equality, so "explicitly set to the same value as the default"
-        still counts as an override.
+        """All-or-nothing per agent run, not a per-field override: passing
+        --params-file at all is a deliberate choice to run off that yaml
+        file, so every field resolves from it (yaml value if the file sets
+        this one, else its hardcoded declare_parameter default) and the
+        cloud agent_config is ignored entirely for the whole run — not just
+        for the specific fields the yaml file happens to set. Without a
+        params file, every field resolves from the cloud config if present,
+        else the hardcoded default. self._param_overrides being non-empty at
+        all (regardless of which names it contains) is what decides which
+        source every field uses — the two sources never mix within a run.
         """
-        if name in self._param_overrides:
+        if self._param_overrides:
             return local_default
         if name in config:
             return cast(config[name]) if cast else config[name]
@@ -1746,16 +1769,24 @@ class WebBridge(Node):
             self._tf_tree_poll_timer = self.create_timer(tf_tree_poll_interval, self._poll_tf_tree)
             self._tf_tree_poll_interval = tf_tree_poll_interval
 
-        # ros2_control: same construct/destroy-at-most-once pattern as TF tree.
+        # ros2_control: same construct/destroy-at-most-once pattern as TF
+        # tree, plus the same reconnect-if-changed handling as bt_conn below
+        # — poll_interval is a constructor arg baked into the collector
+        # (rate-limit check in Ros2ControlCollector.poll()), not re-read
+        # live, so a changed interval while already enabled needs an actual
+        # destroy+reconstruct to ever take effect.
         ros2_control_enabled = self._resolve_config_value('ros2_control_enabled', config, self._ros2_control_enabled_default, bool)
         ros2_control_poll_interval = self._resolve_config_value('ros2_control_poll_interval', config, self._ros2_control_poll_interval_default, float)
-        if ros2_control_enabled and self._ros2_control is None:
+        if ros2_control_enabled and (self._ros2_control is None or self._ros2_control_poll_interval != ros2_control_poll_interval):
+            if self._ros2_control is not None:
+                self._ros2_control.destroy()
             self._ros2_control = Ros2ControlCollector(
                 node=self,
                 event_callback=self._on_ros2_control_event,
                 logger=self.get_logger(),
                 poll_interval=ros2_control_poll_interval,
             )
+            self._ros2_control_poll_interval = ros2_control_poll_interval
             self.get_logger().info('ros2_control monitoring started')
         elif not ros2_control_enabled and self._ros2_control is not None:
             self._ros2_control.destroy()
@@ -1858,14 +1889,14 @@ class WebBridge(Node):
         # re-read into a brand-new threading.Timer on every debounce trigger,
         # not a fixed recurring ROS timer) — so there's nothing to construct
         # or defer here, just update the underlying ROS param when overridden.
-        # A yaml override for either wins outright (the same precedence as
-        # every other field, just applied by skipping the cloud write instead
-        # of via _resolve_config_value — there's no separate "_default" to
-        # fall back to here, the ROS param itself already holds the
-        # yaml-or-hardcoded value and is simply left untouched).
-        if 'bag_output_dir' not in self._param_overrides and 'bag_output_dir' in config:
+        # Same all-or-nothing rule as _resolve_config_value: a yaml params
+        # file being present at all (regardless of whether it sets these two
+        # specific fields) means the cloud config is skipped for both — the
+        # ROS param already holds the yaml-or-hardcoded value and is simply
+        # left untouched.
+        if not self._param_overrides and 'bag_output_dir' in config:
             self.set_parameters([Parameter('bag_output_dir', Parameter.Type.STRING, str(config['bag_output_dir']))])
-        if 'graph_debounce_interval' not in self._param_overrides and 'graph_debounce_interval' in config:
+        if not self._param_overrides and 'graph_debounce_interval' in config:
             self.set_parameters([Parameter('graph_debounce_interval', Parameter.Type.DOUBLE, float(config['graph_debounce_interval']))])
 
         self.get_logger().info(
@@ -1873,6 +1904,38 @@ class WebBridge(Node):
             f'tf_tree_enabled={tf_tree_enabled}, goals_enabled={goals_enabled}, '
             f'params_enabled={params_enabled}, bt_mode={bt_mode}'
         )
+
+        # Ground truth for the client: what this agent is ACTUALLY running
+        # with right now, for every field — as opposed to the cloud
+        # agent_config, which can be completely irrelevant (yaml-file runs
+        # ignore it outright) or simply stale until this agent reconnects.
+        # Sent on every _apply_agent_config call (every connect/reconnect,
+        # and the 5s fallback), so the client always has a current answer,
+        # never a guess based on pane data being empty. bag_output_dir and
+        # graph_debounce_interval are read fresh here rather than reusing a
+        # local var — they're the two fields actually pushed through
+        # set_parameters() above rather than tracked as plain instance
+        # state, so this is the one place their resolved value lives.
+        self._enqueue({
+            'type': 'resolved_agent_config',
+            'config': {
+                'telemetry_enabled': self._telemetry_enabled,
+                'goals_enabled': goals_enabled,
+                'params_enabled': params_enabled,
+                'tf_tree_enabled': tf_tree_enabled,
+                'tf_tree_poll_interval': tf_tree_poll_interval,
+                'ros2_control_enabled': ros2_control_enabled,
+                'ros2_control_poll_interval': ros2_control_poll_interval,
+                'battery_topic': battery_topic,
+                'bt_mode': bt_mode,
+                'bt_host': bt_host,
+                'bt_server_port': bt_server_port,
+                'bt_publisher_port': bt_publisher_port,
+                'bag_output_dir': self.get_parameter('bag_output_dir').get_parameter_value().string_value,
+                'graph_debounce_interval': self.get_parameter('graph_debounce_interval').get_parameter_value().double_value,
+            },
+            'timestamp': time.time(),
+        })
 
     def _collect_telemetry(self):
         if not self.ws or not self.loop:
