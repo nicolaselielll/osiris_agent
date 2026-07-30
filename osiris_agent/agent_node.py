@@ -1916,8 +1916,16 @@ class WebBridge(Node):
         # local var — they're the two fields actually pushed through
         # set_parameters() above rather than tracked as plain instance
         # state, so this is the one place their resolved value lives.
+        #
+        # yaml_override is metadata about the SOURCE these values were
+        # resolved from, not a config value itself — a yaml/CLI params file
+        # being passed at all means the client shouldn't claim a restart
+        # will sync Cloud Config (it never will, as long as that file keeps
+        # getting passed); it should instead tell the operator how to
+        # actually switch back to cloud-driven config.
         self._enqueue({
             'type': 'resolved_agent_config',
+            'yaml_override': bool(self._param_overrides),
             'config': {
                 'telemetry_enabled': self._telemetry_enabled,
                 'goals_enabled': goals_enabled,
