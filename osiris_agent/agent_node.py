@@ -1,5 +1,6 @@
 import asyncio
 import http.client
+import math
 import os
 import platform
 import random
@@ -401,6 +402,8 @@ class WebBridge(Node):
                 topic = data.get('topic')
                 if topic:
                     self._unsubscribe_from_topic(topic)
+            elif msg_type == 'lidar_snapshot_request':
+                self._handle_lidar_snapshot_request(data)
             elif msg_type == 'error':
                 self.get_logger().warning(f"Gateway error: {data.get('message', '')}")
             elif msg_type == 'bag_start_record':
@@ -1030,6 +1033,115 @@ class WebBridge(Node):
                 asyncio.run_coroutine_threadsafe(
                     self._send_bridge_subscriptions(), self.loop
                 )
+
+    # ──────────────────────────────────────────────
+    # LiDAR one-shot snapshot (wall line-fitting ground truth)
+    # ──────────────────────────────────────────────
+
+    def _handle_lidar_snapshot_request(self, data: dict):
+        """Fire-once LaserScan capture: subscribe, wait for exactly one
+        message, unsubscribe, relay it back. Deliberately separate from
+        _subscribe_to_topic/_topic_subs (the continuous gateway-requested
+        subscription path) — /scan only needs a point-in-time read for wall
+        line-fitting, not continuous logging, and keeping it out of
+        _topic_subs means it never counts against MAX_SUBSCRIPTIONS or shows
+        up in bridge_subscriptions. See project_lidar_heading_plan_executor
+        memory for why.
+        """
+        topic_name = data.get('topic') or '/scan'
+        request_id = data.get('request_id', '')
+        timeout_s = 3.0
+
+        types = dict(self.get_topic_names_and_types()).get(topic_name)
+        if not types:
+            self.get_logger().warning(f"[lidar_snapshot] topic not found: {topic_name}")
+            self._send_lidar_snapshot_failed(request_id, 'topic_not_found')
+            return
+        if 'sensor_msgs/msg/LaserScan' not in types:
+            self.get_logger().warning(f"[lidar_snapshot] {topic_name} is not a LaserScan ({types})")
+            self._send_lidar_snapshot_failed(request_id, 'not_a_laserscan')
+            return
+
+        msg_class = get_message(types[0])
+        lock = threading.Lock()
+        state = {'done': False}
+        sub_holder = {}
+
+        # Guards against both the scan callback and the timeout firing —
+        # whichever gets here first wins, the other is a no-op. Both can run
+        # on different threads (rclpy executor thread vs. the timer's own
+        # thread), so this needs the lock, not just a plain flag check.
+        def finish(success, msg=None, reason=None):
+            with lock:
+                if state['done']:
+                    return
+                state['done'] = True
+            sub = sub_holder.pop('sub', None)
+            if sub is not None:
+                # Same destroy_subscription call _unsubscribe_from_topic already
+                # makes elsewhere in this file — just invoked from inside the
+                # subscription's own callback here instead of a separate
+                # gateway-driven unsubscribe. Worth double-checking on real
+                # hardware if this ever hangs instead of returning cleanly.
+                self.destroy_subscription(sub)
+            timer = sub_holder.pop('timer', None)
+            if timer is not None:
+                timer.cancel()
+            if success:
+                self._send_lidar_snapshot_result(request_id, topic_name, msg)
+            else:
+                self._send_lidar_snapshot_failed(request_id, reason)
+
+        def on_scan(msg):
+            finish(True, msg=msg)
+
+        sub_holder['sub'] = self.create_subscription(msg_class, topic_name, on_scan, QoSProfile(depth=1))
+
+        timer = threading.Timer(timeout_s, lambda: finish(False, reason='timeout'))
+        timer.daemon = True
+        sub_holder['timer'] = timer
+        timer.start()
+
+    @staticmethod
+    def _json_safe_floats(values):
+        """Replaces inf/-inf/nan with None. json.dumps happily emits the bare
+        Infinity/NaN tokens for these (Python-specific, not valid JSON), which
+        makes the gateway's JSON.parse throw on the whole message — and
+        LaserScan.ranges is exactly where this bites, since out-of-range
+        readings are routinely inf, not just an edge case."""
+        return [v if isinstance(v, (int, float)) and math.isfinite(v) else None for v in values]
+
+    def _send_lidar_snapshot_result(self, request_id: str, topic_name: str, msg):
+        if not self.loop:
+            return
+        data = message_to_ordereddict(msg)
+        if 'ranges' in data:
+            data['ranges'] = self._json_safe_floats(data['ranges'])
+        if 'intensities' in data:
+            data['intensities'] = self._json_safe_floats(data['intensities'])
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(json.dumps({
+                'type': 'lidar_snapshot_result',
+                'request_id': request_id,
+                'topic': topic_name,
+                'data': data,
+                'timestamp': time.time(),
+            })),
+            self.loop,
+        )
+
+    def _send_lidar_snapshot_failed(self, request_id: str, reason: str):
+        if not self.loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(json.dumps({
+                'type': 'lidar_snapshot_failed',
+                'request_id': request_id,
+                'reason': reason,
+                'timestamp': time.time(),
+            })),
+            self.loop,
+        )
 
     # ── Bag recording ──────────────────────────────────────────────────────────
 
