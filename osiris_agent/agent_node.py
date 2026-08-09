@@ -22,6 +22,7 @@ import json
 
 from rcl_interfaces.msg import ParameterEvent
 from rcl_interfaces.srv import GetParameters, ListParameters
+from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import Empty as EmptyMsg
 from rclpy.parameter import Parameter, parameter_value_to_python
@@ -47,6 +48,41 @@ RECONNECT_MAX_DELAY        = 30    # seconds
 _SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
 
 ACTION_FEEDBACK_MIN_INTERVAL = 0.2  # seconds between forwarded feedback messages per action (5 Hz cap)
+
+# Fixed enum of Nav2 actions send_command_request can trigger — deliberately
+# not a generic "call any action with any payload" capability. Each entry:
+# action_name = the ROS2 action server this sends goals to.
+# module/cls   = lazily imported (nav2_msgs may not be installed everywhere).
+# precondition_nodes = lifecycle-managed nodes that must be 'active' (per
+#   _lifecycle_state_cache) beyond the action server itself existing.
+#
+# navigate_to_pose (absolute map-frame navigation) was deliberately left out
+# for now — its precondition check would need more than a lifecycle-active
+# check on /amcl (that only confirms AMCL is running, not that it's actually
+# converged to a good estimate), it has no way to be pointed anywhere useful
+# yet (no named-locations system resolving something like "kitchen" to real
+# coordinates), and no established workflow needs it — route steps are
+# drive/turn/lidar_snapshot only. Revisit once those exist.
+COMMAND_DEFS = {
+    'spin': {
+        'action_name': '/spin',
+        'module': 'nav2_msgs.action',
+        'cls_name': 'Spin',
+        'precondition_nodes': [],
+    },
+    # Straight-line relative drive, robot-base-frame — same nav2_behaviors
+    # family as spin, no localization dependency. This is deliberately what
+    # route "drive" steps use: it doesn't need AMCL to be trustworthy, and
+    # it's guaranteed to be a straight line, not just *a* planned path — both
+    # matter for the LiDAR wall-normal ground-truth technique specifically.
+    'drive': {
+        'action_name': '/drive_on_heading',
+        'module': 'nav2_msgs.action',
+        'cls_name': 'DriveOnHeading',
+        'precondition_nodes': [],
+    },
+}
+COMMAND_SERVER_DISCOVERY_GRACE_S = 5.0  # server_is_ready() can lag right after ActionClient creation
 
 class WebBridge(Node):
 
@@ -171,6 +207,21 @@ class WebBridge(Node):
         self._lifecycle_subs: dict[str, rclpy.subscription.Subscription] = {}  # topic → sub
         self._lifecycle_state_cache: dict[str, str] = {}   # node_fqn → state label
         self._pending_lifecycle_fetches: set[str] = set()  # node_fqns with in-flight get_state calls
+
+        # ── Command sending (send_command_request / cancel_command_request) ───
+        # Fixed enum of known Nav2 actions the agent will send goals to —
+        # deliberately not a generic "call any action" capability, same
+        # bounded-blast-radius reasoning that ruled out generic CLI/service
+        # execution elsewhere in this project. Goal PROGRESS/OUTCOME is not
+        # re-reported here — it already flows through the existing generic
+        # _on_action_status/_on_action_feedback pipeline (goal_event etc.),
+        # which monitors every action in the graph regardless of who sent the
+        # goal. This section only handles: precondition check, sending,
+        # accept/reject, and the manual-cancel channel.
+        self._command_action_clients: dict[str, object] = {}  # command name → ActionClient
+        self._active_command_lock = threading.Lock()
+        self._active_command_pending = False       # True from claim until accept/reject is known
+        self._active_command_goal_handle = None     # set once accepted, cleared on terminal/cancel
 
         # ── Snapshot & dirty-flag ─────────────────────────────────────────────
         self._last_sent_nodes:    dict | None = None
@@ -404,6 +455,10 @@ class WebBridge(Node):
                     self._unsubscribe_from_topic(topic)
             elif msg_type == 'lidar_snapshot_request':
                 self._handle_lidar_snapshot_request(data)
+            elif msg_type == 'send_command_request':
+                self._handle_send_command_request(data)
+            elif msg_type == 'cancel_command_request':
+                self._handle_cancel_command_request(data)
             elif msg_type == 'error':
                 self.get_logger().warning(f"Gateway error: {data.get('message', '')}")
             elif msg_type == 'bag_start_record':
@@ -1067,11 +1122,32 @@ class WebBridge(Node):
         state = {'done': False}
         sub_holder = {}
 
+        # Best-effort live TF lookup, started alongside the /scan
+        # subscription so /tf_static (latched, arrives near-instantly to a
+        # fresh subscriber) has the whole scan-capture window to show up
+        # before on_scan actually needs it. Deliberately its own Buffer/
+        # Listener, not self._tf_tree (the separate tf_tree_enabled
+        # feature's own collector) — that one is only constructed when the
+        # operator has that unrelated feature turned on, and even then only
+        # exposes whole-tree snapshots, not a targeted two-frame lookup. See
+        # project_lidar_front_angle memory for why this exists at all.
+        tf_buffer = None
+        tf_holder = {}
+        try:
+            import tf2_ros
+            candidate_buffer = tf2_ros.Buffer()
+            tf_holder['listener'] = tf2_ros.TransformListener(candidate_buffer, self, spin_thread=False)
+            tf_buffer = candidate_buffer
+        except Exception as e:
+            tf_buffer = None
+            tf_holder.pop('listener', None)
+            self.get_logger().debug(f"[lidar_snapshot] TF listener unavailable: {e}")
+
         # Guards against both the scan callback and the timeout firing —
         # whichever gets here first wins, the other is a no-op. Both can run
         # on different threads (rclpy executor thread vs. the timer's own
         # thread), so this needs the lock, not just a plain flag check.
-        def finish(success, msg=None, reason=None):
+        def finish(success, msg=None, reason=None, front_angle_rad=None):
             with lock:
                 if state['done']:
                     return
@@ -1087,13 +1163,17 @@ class WebBridge(Node):
             timer = sub_holder.pop('timer', None)
             if timer is not None:
                 timer.cancel()
+            # Same "drop the reference, destructor unregisters the
+            # subscriptions" cleanup TfTreeCollector.destroy() itself uses.
+            tf_holder.pop('listener', None)
             if success:
-                self._send_lidar_snapshot_result(request_id, topic_name, msg)
+                self._send_lidar_snapshot_result(request_id, topic_name, msg, front_angle_rad)
             else:
                 self._send_lidar_snapshot_failed(request_id, reason)
 
         def on_scan(msg):
-            finish(True, msg=msg)
+            front_angle_rad = self._lookup_lidar_front_angle(tf_buffer, msg.header.frame_id)
+            finish(True, msg=msg, front_angle_rad=front_angle_rad)
 
         sub_holder['sub'] = self.create_subscription(msg_class, topic_name, on_scan, QoSProfile(depth=1))
 
@@ -1101,6 +1181,42 @@ class WebBridge(Node):
         timer.daemon = True
         sub_holder['timer'] = timer
         timer.start()
+
+    @staticmethod
+    def _wrap_to_pi(angle: float) -> float:
+        while angle > math.pi:
+            angle -= 2 * math.pi
+        while angle <= -math.pi:
+            angle += 2 * math.pi
+        return angle
+
+    def _lookup_lidar_front_angle(self, tf_buffer, scan_frame_id: str):
+        """Best-effort: the robot's true front, expressed as an angle in the
+        LiDAR's own raw scan coordinates. Angle 0 in a LaserScan always
+        points along the sensor frame's own local +X axis — if that frame
+        is itself mounted rotated by some yaw relative to base_link (a real
+        situation on custom builds, not just a theoretical one — see
+        project_lidar_front_angle memory), true front ends up at -yaw in
+        the scan's own numbering, not at 0.
+
+        Returns None on any failure (no listener, frame not published yet,
+        base_link doesn't exist) — this only ever reports what TF actually
+        said, never a fallback guess. The caller/gateway decides what to do
+        with "unknown".
+        """
+        if tf_buffer is None or not scan_frame_id:
+            return None
+        try:
+            from rclpy.time import Time as RclpyTime
+            # No timeout arg: this is a non-blocking cache read against
+            # whatever /tf_static has already delivered, not a spin-and-wait
+            # call — safe to call from inside a message callback.
+            t = tf_buffer.lookup_transform('base_link', scan_frame_id, RclpyTime())
+        except Exception:
+            return None
+        q = t.transform.rotation
+        yaw = math.atan2(2 * (q.w * q.z + q.x * q.y), 1 - 2 * (q.y * q.y + q.z * q.z))
+        return self._wrap_to_pi(-yaw)
 
     @staticmethod
     def _json_safe_floats(values):
@@ -1111,7 +1227,7 @@ class WebBridge(Node):
         readings are routinely inf, not just an edge case."""
         return [v if isinstance(v, (int, float)) and math.isfinite(v) else None for v in values]
 
-    def _send_lidar_snapshot_result(self, request_id: str, topic_name: str, msg):
+    def _send_lidar_snapshot_result(self, request_id: str, topic_name: str, msg, front_angle_rad=None):
         if not self.loop:
             return
         data = message_to_ordereddict(msg)
@@ -1119,14 +1235,20 @@ class WebBridge(Node):
             data['ranges'] = self._json_safe_floats(data['ranges'])
         if 'intensities' in data:
             data['intensities'] = self._json_safe_floats(data['intensities'])
+        payload = {
+            'type': 'lidar_snapshot_result',
+            'request_id': request_id,
+            'topic': topic_name,
+            'data': data,
+            'timestamp': time.time(),
+        }
+        # Only present when a live TF lookup actually succeeded — the
+        # gateway falls back to its own cached/default value otherwise, so
+        # this must be omitted rather than sent as 0 when unknown.
+        if front_angle_rad is not None:
+            payload['front_angle_rad'] = front_angle_rad
         asyncio.run_coroutine_threadsafe(
-            self._send_queue.put(json.dumps({
-                'type': 'lidar_snapshot_result',
-                'request_id': request_id,
-                'topic': topic_name,
-                'data': data,
-                'timestamp': time.time(),
-            })),
+            self._send_queue.put(json.dumps(payload)),
             self.loop,
         )
 
@@ -1608,6 +1730,198 @@ class WebBridge(Node):
             'feedback': feedback_data,
             'timestamp': now,
         })
+
+    # ──────────────────────────────────────────────
+    # Command sending (send_command_request / cancel_command_request)
+    # ──────────────────────────────────────────────
+
+    def _get_command_action_client(self, command: str):
+        """Lazily imports the action type and creates (once) the ActionClient
+        for this command. Returns None if the type isn't importable (package
+        not installed) — a permanent condition for this process, not worth
+        retrying on every request."""
+        if command in self._command_action_clients:
+            return self._command_action_clients[command]
+
+        command_def = COMMAND_DEFS[command]
+        try:
+            module = __import__(command_def['module'], fromlist=[command_def['cls_name']])
+            msg_cls = getattr(module, command_def['cls_name'])
+        except ImportError as e:
+            self.get_logger().warning(f'[command] {command} unavailable, import failed: {e}')
+            self._command_action_clients[command] = None
+            return None
+
+        client = ActionClient(self, msg_cls, command_def['action_name'])
+        self._command_action_clients[command] = client
+        return client
+
+    def _build_command_goal(self, command: str, params: dict, msg_cls):
+        if command == 'spin':
+            goal = msg_cls.Goal()
+            goal.target_yaw = float(params.get('target_yaw_rad', 0.0))
+            return goal
+
+        if command == 'drive':
+            goal = msg_cls.Goal()
+            # target is a relative point in the robot's own base frame — x is
+            # straight ahead (negative = backward), y/z stay 0 for a pure
+            # straight-line drive. NOT verified against a real Nav2 install;
+            # this is DriveOnHeading.action's documented shape, flag if the
+            # field names don't match on hardware.
+            goal.target.x = float(params.get('distance_m', 0.0))
+            goal.target.y = 0.0
+            goal.target.z = 0.0
+            goal.speed = float(params.get('speed_mps', 0.15))
+            return goal
+
+        raise ValueError(f'no goal builder for command {command}')
+
+    def _handle_send_command_request(self, data: dict):
+        request_id = data.get('request_id', '')
+        command = data.get('command')
+        params = data.get('params') or {}
+
+        command_def = COMMAND_DEFS.get(command)
+        if not command_def:
+            self._send_command_rejected(request_id, 'unknown_command')
+            return
+
+        if not self._goals_enabled:
+            self._send_command_rejected(request_id, 'goals_disabled')
+            return
+
+        # Only one AI/user-commanded goal in flight at a time — claim the
+        # slot immediately so two overlapping requests can't both pass this
+        # check before either resolves. Cleared on reject, on accept-failure,
+        # and once the accepted goal reaches a terminal state (_on_goal_result).
+        with self._active_command_lock:
+            if self._active_command_pending or self._active_command_goal_handle is not None:
+                self._send_command_rejected(request_id, 'command_already_in_progress')
+                return
+            self._active_command_pending = True
+
+        def _release_pending():
+            with self._active_command_lock:
+                self._active_command_pending = False
+
+        client = self._get_command_action_client(command)
+        if client is None:
+            _release_pending()
+            self._send_command_rejected(request_id, 'action_type_unavailable')
+            return
+
+        # Non-blocking — deliberately not wait_for_server(), which blocks the
+        # asyncio loop thread this runs on for up to its whole timeout and
+        # would freeze all other WS traffic while waiting. If the server
+        # isn't known-ready right now, fail fast rather than stall.
+        if not client.server_is_ready():
+            _release_pending()
+            self._send_command_rejected(request_id, 'action_server_not_available')
+            return
+
+        # Precondition: the action server existing isn't enough on its own for
+        # commands that depend on more than that (none currently do — both
+        # spin and drive only need their own server up, no lifecycle-managed
+        # dependency — but this stays in place for whatever needs it next).
+        # Reuses _lifecycle_state_cache, which the graph watcher already keeps
+        # live via transition-event subscriptions (see _on_lifecycle_transition),
+        # not a one-off snapshot.
+        for node_fqn in command_def['precondition_nodes']:
+            state = self._lifecycle_state_cache.get(node_fqn)
+            if state != 'active':
+                _release_pending()
+                self._send_command_rejected(request_id, f'precondition_failed:{node_fqn}_not_active')
+                return
+
+        try:
+            module = __import__(command_def['module'], fromlist=[command_def['cls_name']])
+            msg_cls = getattr(module, command_def['cls_name'])
+            goal_msg = self._build_command_goal(command, params, msg_cls)
+        except Exception as e:
+            _release_pending()
+            self._send_command_rejected(request_id, f'invalid_params:{e}')
+            return
+
+        send_future = client.send_goal_async(goal_msg)
+        send_future.add_done_callback(
+            lambda fut, rid=request_id, cmd=command: self._on_command_send_response(fut, rid, cmd)
+        )
+
+    def _on_command_send_response(self, future, request_id: str, command: str):
+        try:
+            goal_handle = future.result()
+        except Exception as e:
+            with self._active_command_lock:
+                self._active_command_pending = False
+            self._send_command_rejected(request_id, f'send_failed:{e}')
+            return
+
+        if not goal_handle.accepted:
+            with self._active_command_lock:
+                self._active_command_pending = False
+            self._send_command_rejected(request_id, 'goal_rejected_by_server')
+            return
+
+        with self._active_command_lock:
+            self._active_command_pending = False
+            self._active_command_goal_handle = goal_handle
+
+        self._enqueue({
+            'type': 'command_accepted',
+            'request_id': request_id,
+            'command': command,
+            'goal_id': bytes(goal_handle.goal_id.uuid).hex(),
+            'timestamp': time.time(),
+        })
+
+        # Progress/outcome is already reported via the existing generic
+        # goal_event pipeline (_on_action_status monitors every action in the
+        # graph, not just ones this code sent). This callback exists only to
+        # release the "one command at a time" slot once this goal is done, so
+        # a finished goal doesn't block a later one forever.
+        result_future = goal_handle.get_result_async()
+        result_future.add_done_callback(lambda fut, gh=goal_handle: self._on_command_goal_result(gh))
+
+    def _on_command_goal_result(self, goal_handle):
+        with self._active_command_lock:
+            if self._active_command_goal_handle is goal_handle:
+                self._active_command_goal_handle = None
+
+    def _send_command_rejected(self, request_id: str, reason: str):
+        self._enqueue({
+            'type': 'command_rejected',
+            'request_id': request_id,
+            'reason': reason,
+            'timestamp': time.time(),
+        })
+
+    def _handle_cancel_command_request(self, data: dict):
+        """Manual stop — bypasses the AI entirely by design. Cancels whatever
+        command is currently active/in-flight, regardless of what requested
+        it or what conversation (if any) triggered it."""
+        request_id = data.get('request_id', '')
+        with self._active_command_lock:
+            goal_handle = self._active_command_goal_handle
+        if goal_handle is None:
+            self._enqueue({
+                'type': 'cancel_failed',
+                'request_id': request_id,
+                'reason': 'no_active_command',
+                'timestamp': time.time(),
+            })
+            return
+
+        cancel_future = goal_handle.cancel_goal_async()
+
+        def _on_cancel_done(fut, rid=request_id):
+            self._enqueue({
+                'type': 'command_cancelled',
+                'request_id': rid,
+                'timestamp': time.time(),
+            })
+
+        cancel_future.add_done_callback(_on_cancel_done)
 
     # ──────────────────────────────────────────────
     # C++ graph watcher integration
