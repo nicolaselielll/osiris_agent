@@ -84,6 +84,11 @@ COMMAND_DEFS = {
 }
 COMMAND_SERVER_DISCOVERY_GRACE_S = 5.0  # server_is_ready() can lag right after ActionClient creation
 
+# Default time_allowance for Spin/DriveOnHeading goals when the caller doesn't
+# specify one (see _build_command_goal) — Nav2 treats an unset/zero Duration
+# as unbounded, which was the actual behavior before this default existed.
+DEFAULT_TIME_ALLOWANCE_S = 60.0
+
 # Safety-valve for the "one command at a time" slot: normally it's released by
 # _on_command_goal_result, which only fires once the goal's result actually
 # arrives — itself dependent on the goal cleanly reaching a terminal state on
@@ -1780,23 +1785,48 @@ class WebBridge(Node):
         self._command_action_clients[command] = client
         return client
 
+    @staticmethod
+    def _seconds_to_duration(seconds: float):
+        from builtin_interfaces.msg import Duration
+        d = Duration()
+        d.sec = int(seconds)
+        d.nanosec = int(round((seconds - d.sec) * 1e9))
+        return d
+
     def _build_command_goal(self, command: str, params: dict, msg_cls):
+        # time_allowance and disable_collision_checks are shared by both
+        # Spin.action and DriveOnHeading.action (verified against the real
+        # nav2_msgs action definitions, same as target_yaw/target/speed
+        # below). time_allowance previously went unset — a zero Duration,
+        # which nav2_behaviors treats as unbounded — meaning a behavior stuck
+        # never reaching its stop condition (a real bug seen on this exact
+        # robot) had no time-based backstop at all. DEFAULT_TIME_ALLOWANCE_S
+        # gives every command a bounded worst-case runtime by default while
+        # staying overridable; still comfortably under the gateway's own
+        # ROUTE_STEP_GOAL_TIMEOUT_MS wait-for-terminal ceiling (120s), so
+        # Nav2 gets a chance to self-abort before that gives up waiting.
+        time_allowance_s = float(params.get('time_allowance_s', DEFAULT_TIME_ALLOWANCE_S))
+        disable_collision_checks = bool(params.get('disable_collision_checks', False))
+
         if command == 'spin':
             goal = msg_cls.Goal()
             goal.target_yaw = float(params.get('target_yaw_rad', 0.0))
+            goal.time_allowance = self._seconds_to_duration(time_allowance_s)
+            goal.disable_collision_checks = disable_collision_checks
             return goal
 
         if command == 'drive':
             goal = msg_cls.Goal()
             # target is a relative point in the robot's own base frame — x is
             # straight ahead (negative = backward), y/z stay 0 for a pure
-            # straight-line drive. NOT verified against a real Nav2 install;
-            # this is DriveOnHeading.action's documented shape, flag if the
-            # field names don't match on hardware.
+            # straight-line drive. Field names verified against the real
+            # DriveOnHeading.action definition.
             goal.target.x = float(params.get('distance_m', 0.0))
             goal.target.y = 0.0
             goal.target.z = 0.0
             goal.speed = float(params.get('speed_mps', 0.15))
+            goal.time_allowance = self._seconds_to_duration(time_allowance_s)
+            goal.disable_collision_checks = disable_collision_checks
             return goal
 
         raise ValueError(f'no goal builder for command {command}')
