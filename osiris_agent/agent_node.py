@@ -84,19 +84,6 @@ COMMAND_DEFS = {
 }
 COMMAND_SERVER_DISCOVERY_GRACE_S = 5.0  # server_is_ready() can lag right after ActionClient creation
 
-# Safety-valve for the "one command at a time" slot: normally it's released by
-# _on_command_goal_result, which only fires once the goal's result actually
-# arrives — itself dependent on the goal cleanly reaching a terminal state on
-# the ROS2 side. A behavior that never calls succeed()/abort()/is never
-# properly cancelled leaves that callback permanently unfired, wedging every
-# future send_command_request behind 'command_already_in_progress' until the
-# agent process is restarted. This bounds that: same generous "a slow command
-# is normal, not a hang" reasoning as the gateway's own ROUTE_STEP_GOAL_
-# TIMEOUT_MS, just enforced agent-side too since the gateway's wait is a
-# separate, shorter, per-HTTP-request thing that timing out doesn't clear
-# this slot either.
-ACTIVE_COMMAND_TIMEOUT_S = 120.0
-
 class WebBridge(Node):
 
     def __init__(self, watcher_proc=None):
@@ -235,9 +222,6 @@ class WebBridge(Node):
         self._active_command_lock = threading.Lock()
         self._active_command_pending = False       # True from claim until accept/reject is known
         self._active_command_goal_handle = None     # set once accepted, cleared on terminal/cancel
-        self._active_command_timeout_timer = None   # force-releases the slot if the goal never
-                                                      # produces a result at all (see _on_command_
-                                                      # send_response / _force_release_active_command)
 
         # ── Snapshot & dirty-flag ─────────────────────────────────────────────
         self._last_sent_nodes:    dict | None = None
@@ -1890,13 +1874,6 @@ class WebBridge(Node):
         with self._active_command_lock:
             self._active_command_pending = False
             self._active_command_goal_handle = goal_handle
-            timer = threading.Timer(
-                ACTIVE_COMMAND_TIMEOUT_S,
-                lambda gh=goal_handle: self._force_release_active_command(gh),
-            )
-            timer.daemon = True
-            self._active_command_timeout_timer = timer
-            timer.start()
 
         self._enqueue({
             'type': 'command_accepted',
@@ -1909,11 +1886,8 @@ class WebBridge(Node):
         # Progress/outcome is already reported via the existing generic
         # goal_event pipeline (_on_action_status monitors every action in the
         # graph, not just ones this code sent). This callback exists only to
-        # release the "one command at a time" slot once this goal is done —
-        # the normal path. _force_release_active_command (via the timer
-        # started above) is the fallback for a goal that never gets here at
-        # all, e.g. a behavior that never reaches a terminal state on its own
-        # and doesn't cleanly terminate after a cancel either.
+        # release the "one command at a time" slot once this goal is done, so
+        # a finished goal doesn't block a later one forever.
         result_future = goal_handle.get_result_async()
         result_future.add_done_callback(lambda fut, gh=goal_handle: self._on_command_goal_result(gh))
 
@@ -1921,28 +1895,6 @@ class WebBridge(Node):
         with self._active_command_lock:
             if self._active_command_goal_handle is goal_handle:
                 self._active_command_goal_handle = None
-                if self._active_command_timeout_timer is not None:
-                    self._active_command_timeout_timer.cancel()
-                    self._active_command_timeout_timer = None
-
-    def _force_release_active_command(self, goal_handle):
-        """Fires from the timeout timer, on whatever thread threading.Timer
-        uses — not the ROS executor thread, same as the other threading-based
-        timers in this file (_trigger_graph_poll). Only acts if this is still
-        the SAME goal that's still stuck; a goal that finished normally
-        already cleared both the handle and this timer together in
-        _on_command_goal_result, so a late/stale timer firing is a no-op."""
-        with self._active_command_lock:
-            if self._active_command_goal_handle is not goal_handle:
-                return
-            self._active_command_goal_handle = None
-            self._active_command_timeout_timer = None
-        self.get_logger().warning(
-            f'[command] goal {bytes(goal_handle.goal_id.uuid).hex()} never reached a terminal '
-            f'state within {ACTIVE_COMMAND_TIMEOUT_S}s — force-releasing the command slot so '
-            f'future commands aren\'t blocked. The underlying ROS goal may still be running; '
-            f'this only unblocks send_command_request, it does not cancel anything.'
-        )
 
     def _send_command_rejected(self, request_id: str, reason: str):
         self._enqueue({
