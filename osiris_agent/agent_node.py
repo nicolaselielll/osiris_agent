@@ -1793,26 +1793,49 @@ class WebBridge(Node):
         d.nanosec = int(round((seconds - d.sec) * 1e9))
         return d
 
-    def _build_command_goal(self, command: str, params: dict, msg_cls):
+    def _apply_shared_goal_fields(self, goal, command: str, time_allowance_s: float, disable_collision_checks: bool):
         # time_allowance and disable_collision_checks are shared by both
         # Spin.action and DriveOnHeading.action (verified against the real
-        # nav2_msgs action definitions, same as target_yaw/target/speed
-        # below). time_allowance previously went unset — a zero Duration,
-        # which nav2_behaviors treats as unbounded — meaning a behavior stuck
-        # never reaching its stop condition (a real bug seen on this exact
-        # robot) had no time-based backstop at all. DEFAULT_TIME_ALLOWANCE_S
-        # gives every command a bounded worst-case runtime by default while
-        # staying overridable; still comfortably under the gateway's own
-        # ROUTE_STEP_GOAL_TIMEOUT_MS wait-for-terminal ceiling (120s), so
-        # Nav2 gets a chance to self-abort before that gives up waiting.
+        # nav2_msgs action definitions, same as target_yaw/target/speed in
+        # the callers below). time_allowance previously went unset — a zero
+        # Duration, which nav2_behaviors treats as unbounded — meaning a
+        # behavior stuck never reaching its stop condition (a real bug seen
+        # on this exact robot) had no time-based backstop at all.
+        # DEFAULT_TIME_ALLOWANCE_S gives every command a bounded worst-case
+        # runtime by default while staying overridable; still comfortably
+        # under the gateway's own ROUTE_STEP_GOAL_TIMEOUT_MS wait-for-
+        # terminal ceiling (120s), so Nav2 gets a chance to self-abort before
+        # that gives up waiting.
+        goal.time_allowance = self._seconds_to_duration(time_allowance_s)
+
+        # disable_collision_checks was added to Spin.action/DriveOnHeading.
+        # action after Humble (confirmed absent there against the real
+        # nav2_msgs source — Humble's goal only has target_yaw/target/speed/
+        # time_allowance) — a real version this project needs to keep
+        # working against, not a hypothetical. Older Nav2 installs have no
+        # way to disable the check at all, so it's always effectively off
+        # regardless of what's asked; hasattr avoids the AttributeError
+        # ROS2's slotted generated message classes raise for an unknown
+        # field. An explicit request that can't be honored is logged rather
+        # than silently dropped, but still proceeds with checking ON (the
+        # safe fallback, and the only option this install actually has).
+        if hasattr(goal, 'disable_collision_checks'):
+            goal.disable_collision_checks = disable_collision_checks
+        elif disable_collision_checks:
+            self.get_logger().warning(
+                f'[command] disable_collision_checks was requested for {command} but this '
+                f"Nav2 install's {type(goal).__name__} has no such field (added after Humble) "
+                f'— proceeding with collision checking ON.'
+            )
+
+    def _build_command_goal(self, command: str, params: dict, msg_cls):
         time_allowance_s = float(params.get('time_allowance_s', DEFAULT_TIME_ALLOWANCE_S))
         disable_collision_checks = bool(params.get('disable_collision_checks', False))
 
         if command == 'spin':
             goal = msg_cls.Goal()
             goal.target_yaw = float(params.get('target_yaw_rad', 0.0))
-            goal.time_allowance = self._seconds_to_duration(time_allowance_s)
-            goal.disable_collision_checks = disable_collision_checks
+            self._apply_shared_goal_fields(goal, command, time_allowance_s, disable_collision_checks)
             return goal
 
         if command == 'drive':
@@ -1825,8 +1848,7 @@ class WebBridge(Node):
             goal.target.y = 0.0
             goal.target.z = 0.0
             goal.speed = float(params.get('speed_mps', 0.15))
-            goal.time_allowance = self._seconds_to_duration(time_allowance_s)
-            goal.disable_collision_checks = disable_collision_checks
+            self._apply_shared_goal_fields(goal, command, time_allowance_s, disable_collision_checks)
             return goal
 
         raise ValueError(f'no goal builder for command {command}')
