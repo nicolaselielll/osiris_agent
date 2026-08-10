@@ -26,7 +26,7 @@ from rclpy.action import ActionClient
 from rclpy.node import Node
 from std_msgs.msg import Empty as EmptyMsg
 from rclpy.parameter import Parameter, parameter_value_to_python
-from rclpy.qos import QoSProfile
+from rclpy.qos import QoSProfile, qos_profile_action_status_default
 from rosidl_runtime_py import message_to_ordereddict
 from rosidl_runtime_py.utilities import get_message
 
@@ -1648,11 +1648,19 @@ class WebBridge(Node):
             return
         try:
             from action_msgs.msg import GoalStatusArray
+            # Action status publishers use RELIABLE + TRANSIENT_LOCAL
+            # (rcl_action_qos_profile_status_default), not the plain default
+            # (VOLATILE) QoSProfile(depth=10) used elsewhere — a durability
+            # mismatch here means a subscription created after a goal already
+            # reached a terminal state (agent restart, resubscribe, or any
+            # gap in this specific subscription's lifetime) would never
+            # receive that goal's actual last status. qos_profile_action_
+            # status_default is rclpy's own copy of that exact profile.
             sub = self.create_subscription(
                 GoalStatusArray,
                 f'{action_name}/_action/status',
                 lambda msg, a=action_name: self._on_action_status(msg, a),
-                QoSProfile(depth=10),
+                qos_profile_action_status_default,
             )
             self._action_status_subs[action_name] = sub
             self.get_logger().info(f'[actions] subscribed to status for {action_name}')
