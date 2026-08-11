@@ -147,6 +147,9 @@ class WebBridge(Node):
         self.declare_parameter('tf_tree_poll_interval',   0.2)
         self.declare_parameter('graph_debounce_interval',   1.0)
         self.declare_parameter('bag_output_dir',            '~/ros2_bags')
+        # Max rate (Hz) topic_data messages get forwarded at, per topic; 0
+        # disables the throttle entirely. See _on_topic_msg.
+        self.declare_parameter('topic_data_rate_hz',         10.0)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -172,6 +175,11 @@ class WebBridge(Node):
         self._topic_rate_timestamps: dict[str, deque] = {}
         self._topic_rate_lock = threading.Lock()
         self._RATE_WINDOW_S = 5.0
+        # Last-forwarded time per topic, used to cap how often topic_data
+        # actually gets serialized and sent (see _on_topic_msg) — independent
+        # of _topic_rate_timestamps above, which keeps sampling every real
+        # receipt so rate_hz stays accurate regardless of this throttle.
+        self._topic_data_throttle: dict[str, float] = {}
 
         # ── Existence caches (set of fully-qualified names) ───────────────────
         self._active_nodes:    set[str] = set()
@@ -1104,6 +1112,7 @@ class WebBridge(Node):
             sub = self._topic_subs.pop(topic_name, None)
         if sub:
             self.destroy_subscription(sub)
+            self._topic_data_throttle.pop(topic_name, None)
             self.get_logger().info(f"Unsubscribed from {topic_name}")
             if self.loop:
                 asyncio.run_coroutine_threadsafe(
@@ -1542,6 +1551,22 @@ class WebBridge(Node):
         ts = time.time()
         with self._topic_rate_lock:
             self._topic_rate_timestamps.setdefault(topic_name, deque()).append(ts)
+
+        # Cap how often a given topic's data actually gets forwarded — a fast
+        # topic (odom, joint_states, ...) publishing at 30-50+ Hz is far past
+        # what's perceptible in Watch/Plot, and every message costs a DB row
+        # on the gateway besides. rate_hz itself stays accurate since it's
+        # computed from _topic_rate_timestamps above, sampled every receipt
+        # regardless of this throttle. Full-fidelity capture, when actually
+        # needed, goes through bag recording instead of this live stream.
+        # Read fresh (not cached) same as graph_debounce_interval/bag_output_dir
+        # — cheap local lookup, and lets a config change take effect without
+        # a reconnect. Hz (not a raw interval) since that's the unit rate_hz
+        # is already shown in everywhere else in the UI; 0 means uncapped.
+        rate_hz = self.get_parameter('topic_data_rate_hz').get_parameter_value().double_value
+        if rate_hz > 0 and ts - self._topic_data_throttle.get(topic_name, 0.0) < 1.0 / rate_hz:
+            return
+        self._topic_data_throttle[topic_name] = ts
 
         asyncio.run_coroutine_threadsafe(
             self._send_queue.put(json.dumps({
@@ -2417,21 +2442,24 @@ class WebBridge(Node):
 
         self._bt_mode = bt_mode
 
-        # bag_output_dir / graph_debounce_interval: every consumer already
-        # calls self.get_parameter(...) fresh at time of use (a plain path
-        # string re-read on each bag list/download/record; a plain float
-        # re-read into a brand-new threading.Timer on every debounce trigger,
-        # not a fixed recurring ROS timer) — so there's nothing to construct
-        # or defer here, just update the underlying ROS param when overridden.
-        # Same all-or-nothing rule as _resolve_config_value: a yaml params
-        # file being present at all (regardless of whether it sets these two
-        # specific fields) means the cloud config is skipped for both — the
-        # ROS param already holds the yaml-or-hardcoded value and is simply
-        # left untouched.
+        # bag_output_dir / graph_debounce_interval / topic_data_rate_hz:
+        # every consumer already calls self.get_parameter(...) fresh at time
+        # of use (a plain path string re-read on each bag list/download/
+        # record; a plain float re-read into a brand-new threading.Timer on
+        # every debounce trigger, not a fixed recurring ROS timer; a plain
+        # float re-read on every topic message in _on_topic_msg) — so
+        # there's nothing to construct or defer here, just update the
+        # underlying ROS param when overridden. Same all-or-nothing rule as
+        # _resolve_config_value: a yaml params file being present at all
+        # (regardless of whether it sets these specific fields) means the
+        # cloud config is skipped for all three — the ROS param already
+        # holds the yaml-or-hardcoded value and is simply left untouched.
         if not self._param_overrides and 'bag_output_dir' in config:
             self.set_parameters([Parameter('bag_output_dir', Parameter.Type.STRING, str(config['bag_output_dir']))])
         if not self._param_overrides and 'graph_debounce_interval' in config:
             self.set_parameters([Parameter('graph_debounce_interval', Parameter.Type.DOUBLE, float(config['graph_debounce_interval']))])
+        if not self._param_overrides and 'topic_data_rate_hz' in config:
+            self.set_parameters([Parameter('topic_data_rate_hz', Parameter.Type.DOUBLE, float(config['topic_data_rate_hz']))])
 
         self.get_logger().info(
             f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}, '
@@ -2475,6 +2503,7 @@ class WebBridge(Node):
                 'bt_publisher_port': bt_publisher_port,
                 'bag_output_dir': self.get_parameter('bag_output_dir').get_parameter_value().string_value,
                 'graph_debounce_interval': self.get_parameter('graph_debounce_interval').get_parameter_value().double_value,
+                'topic_data_rate_hz': self.get_parameter('topic_data_rate_hz').get_parameter_value().double_value,
             },
             'timestamp': time.time(),
         })
