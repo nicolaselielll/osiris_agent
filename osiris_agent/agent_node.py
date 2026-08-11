@@ -149,7 +149,7 @@ class WebBridge(Node):
         self.declare_parameter('bag_output_dir',            '~/ros2_bags')
         # Max rate (Hz) topic_data messages get forwarded at, per topic; 0
         # disables the throttle entirely. See _on_topic_msg.
-        self.declare_parameter('topic_data_rate_hz',         10.0)
+        self.declare_parameter('topic_data_rate_hz',         50.0)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
