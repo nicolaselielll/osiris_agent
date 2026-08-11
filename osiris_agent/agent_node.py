@@ -3030,52 +3030,72 @@ class WebBridge(Node):
 
 def main(args=None):
     import shutil
+    import stat
     import subprocess
+    import time
     import importlib.resources
+
+    def _is_elf(path):
+        # Reject non-ELF binaries (e.g. a macOS Mach-O that accidentally ended
+        # up in the PyPI wheel) before trying to run them.
+        try:
+            with open(path, 'rb') as f:
+                return f.read(4) == b'\x7fELF'
+        except Exception:
+            return False
+
+    def _try_launch(path):
+        """Spawn a candidate binary and verify it doesn't die immediately.
+        An ABI/symbol mismatch against whatever rclcpp is actually loaded
+        (e.g. `symbol lookup error: undefined symbol: ...`) surfaces as an
+        exit within milliseconds, so a short grace period is enough to tell
+        a working binary from a broken one. Returns the live Popen on
+        success, or None (having logged why) on early exit."""
+        try:
+            os.chmod(path, os.stat(path).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            proc = subprocess.Popen([path], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        except OSError as e:
+            print(f'[osiris] graph_watcher candidate {path} could not be started: {e}', flush=True)
+            return None
+        time.sleep(0.5)
+        rc = proc.poll()
+        if rc is not None:
+            try:
+                err = proc.stderr.read().decode(errors='replace').strip()
+            except Exception:
+                err = ''
+            print(
+                f'[osiris] graph_watcher candidate {path} exited immediately (rc={rc})'
+                + (f': {err}' if err else ''),
+                flush=True,
+            )
+            return None
+        return proc
 
     # Locate the graph_watcher binary:
     # 1. Prefer PATH (colcon dev workspace with source install/setup.bash)
-    # 2. Fall back to distro+arch-specific binary:  bin/graph_watcher_{arch}_{distro}
-    #    (e.g. graph_watcher_aarch64_lyrical, graph_watcher_x86_64_jazzy)
-    # 3. Fall back to arch-only binary:             bin/graph_watcher_{arch}
-    # 4. Fall back to bin/graph_watcher (legacy / colcon-installed generic name)
+    # 2. Otherwise try bundled binaries in preference order, actually
+    #    launching each and keeping the first one that survives the startup
+    #    grace period above:
+    #      a. distro+arch-specific   bin/graph_watcher_{arch}_{distro}
+    #         (e.g. graph_watcher_aarch64_lyrical, graph_watcher_x86_64_jazzy)
+    #      b. any other distro-tagged binary for this arch — covers the case
+    #         where $ROS_DISTRO wasn't set/exported, or names a distro we
+    #         haven't built for, but another build happens to be ABI-compatible
+    #      c. arch-only              bin/graph_watcher_{arch}
+    #      d. bin/graph_watcher      (legacy / colcon-installed generic name)
     _watcher_proc = None
     _watcher_bin = shutil.which('graph_watcher')
-    if _watcher_bin is None:
-        try:
-            _arch = platform.machine()  # 'x86_64' or 'aarch64'
-            _distro = os.environ.get('ROS_DISTRO', '')  # e.g. 'humble', 'jazzy', 'lyrical'
-            _pkg = importlib.resources.files('osiris_agent')
-            _candidates = []
-            if _distro:
-                _candidates.append(f'bin/graph_watcher_{_arch}_{_distro}')
-            _candidates += [f'bin/graph_watcher_{_arch}', 'bin/graph_watcher']
-            for _name in _candidates:
-                _candidate = _pkg.joinpath(_name)
-                if _candidate.is_file():  # type: ignore[attr-defined]
-                    _watcher_bin = str(_candidate)
-                    break
-        except Exception:
+
+    if _watcher_bin is not None:
+        if sys.platform != 'linux':
+            import logging
+            logging.getLogger(__name__).warning(
+                f"graph_watcher is a Linux binary and cannot run on {sys.platform} — "
+                "graph events will not be available."
+            )
             _watcher_bin = None
-
-    if _watcher_bin and sys.platform != 'linux':
-        import logging
-        logging.getLogger(__name__).warning(
-            f"graph_watcher is a Linux binary and cannot run on {sys.platform} — "
-            "graph events will not be available."
-        )
-        _watcher_bin = None
-
-    if _watcher_bin:
-        # Sanity-check: reject non-ELF binaries (e.g. a macOS Mach-O that
-        # accidentally ended up in the PyPI wheel) before trying to run them.
-        _watcher_bin_ok = False
-        try:
-            with open(_watcher_bin, 'rb') as _f:
-                _watcher_bin_ok = _f.read(4) == b'\x7fELF'
-        except Exception:
-            pass
-        if not _watcher_bin_ok:
+        elif not _is_elf(_watcher_bin):
             import logging
             logging.getLogger(__name__).error(
                 f"osiris_graph_watcher binary at '{_watcher_bin}' is not a Linux ELF "
@@ -3083,20 +3103,49 @@ def main(args=None):
                 "Graph events will not be available."
             )
             _watcher_bin = None
+        else:
+            _watcher_proc = _try_launch(_watcher_bin)
+            if _watcher_proc is None:
+                _watcher_bin = None
 
-    if _watcher_bin:
-        import stat
-        os.chmod(_watcher_bin, os.stat(_watcher_bin).st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
-        _watcher_proc = subprocess.Popen(
-            [_watcher_bin],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
+    if _watcher_bin is None and sys.platform == 'linux':
+        try:
+            _arch = platform.machine()  # 'x86_64' or 'aarch64'
+            _distro = os.environ.get('ROS_DISTRO', '')  # e.g. 'humble', 'jazzy', 'lyrical'
+            _bin_dir = importlib.resources.files('osiris_agent').joinpath('bin')
+
+            _candidates = []
+            if _distro:
+                _candidates.append(f'graph_watcher_{_arch}_{_distro}')
+            try:
+                for _entry in sorted(_bin_dir.iterdir(), key=lambda p: p.name):  # type: ignore[attr-defined]
+                    if _entry.name.startswith(f'graph_watcher_{_arch}_') and _entry.name not in _candidates:
+                        _candidates.append(_entry.name)
+            except Exception:
+                pass
+            _candidates += [f'graph_watcher_{_arch}', 'graph_watcher']
+
+            for _name in _candidates:
+                _candidate = _bin_dir.joinpath(_name)
+                if not _candidate.is_file():  # type: ignore[attr-defined]
+                    continue
+                _candidate = str(_candidate)
+                if not _is_elf(_candidate):
+                    continue
+                _proc = _try_launch(_candidate)
+                if _proc is not None:
+                    _watcher_bin = _candidate
+                    _watcher_proc = _proc
+                    break
+        except Exception:
+            _watcher_bin = None
+
+    if _watcher_proc is not None:
         print(f'[osiris] graph_watcher started: {_watcher_bin} (pid={_watcher_proc.pid})', flush=True)
     else:
         import logging
         logging.getLogger(__name__).warning(
-            "osiris_graph_watcher not found — graph events will not be available."
+            "osiris_graph_watcher not found or failed to start — graph events will not be available."
         )
 
     rclpy.init(args=args)
