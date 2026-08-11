@@ -19,6 +19,8 @@ setup(
             'bin/graph_watcher_x86_64',
             'bin/graph_watcher_aarch64',
             'bin/graph_watcher_aarch64_lyrical',
+            'bin/graph_watcher_x86_64_jazzy',
+            'bin/graph_watcher_aarch64_jazzy',
         ],
     },
     license='Apache-2.0',

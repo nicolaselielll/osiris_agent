@@ -64,8 +64,69 @@ jobs:
           name: graph_watcher_aarch64
           path: osiris_agent/bin/graph_watcher_aarch64
 
+  # ROS2 distros are not binary-ABI-compatible with each other (rclcpp/rcutils
+  # symbols can move between releases — see the QOSEventHandlerBase /
+  # rcutils_strnlen "undefined symbol" crashes a Humble-linked binary hits on
+  # a Jazzy system). The two jobs above are Humble builds, used as the
+  # last-resort fallback candidate; these two build the real thing for Jazzy,
+  # named graph_watcher_{arch}_jazzy to match agent_node.py's distro-specific
+  # lookup so Jazzy robots get a binary actually linked against Jazzy's rclcpp.
+  build-x86_64-jazzy:
+    runs-on: ubuntu-latest
+    container:
+      image: ros:jazzy-ros-base
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build graph_watcher (x86_64, jazzy)
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          BUILD_DIR=$(mktemp -d)
+          cmake -S graph_watcher -B "$BUILD_DIR" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$BUILD_DIR" --parallel
+          cp "$BUILD_DIR/graph_watcher" osiris_agent/bin/graph_watcher_x86_64_jazzy
+          chmod +x osiris_agent/bin/graph_watcher_x86_64_jazzy
+        shell: bash
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graph_watcher_x86_64_jazzy
+          path: osiris_agent/bin/graph_watcher_x86_64_jazzy
+
+  build-aarch64-jazzy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
+
+      - name: Build graph_watcher (aarch64, jazzy)
+        run: |
+          docker run --rm \
+            --platform linux/arm64 \
+            -v "$PWD/graph_watcher":/ws/src/graph_watcher:ro \
+            -v "$PWD/osiris_agent/bin":/out \
+            ros:jazzy-ros-base \
+            bash -c '
+              set -e
+              source /opt/ros/jazzy/setup.bash
+              cd /ws
+              colcon build --packages-select graph_watcher \
+                --cmake-args -DCMAKE_BUILD_TYPE=Release
+              cp install/graph_watcher/lib/graph_watcher/graph_watcher /out/graph_watcher_aarch64_jazzy
+              chmod +x /out/graph_watcher_aarch64_jazzy
+            '
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: graph_watcher_aarch64_jazzy
+          path: osiris_agent/bin/graph_watcher_aarch64_jazzy
+
   commit-binaries:
-    needs: [build-x86_64, build-aarch64]
+    needs: [build-x86_64, build-aarch64, build-x86_64-jazzy, build-aarch64-jazzy]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -82,14 +143,28 @@ jobs:
           name: graph_watcher_aarch64
           path: osiris_agent/bin/
 
+      - uses: actions/download-artifact@v4
+        with:
+          name: graph_watcher_x86_64_jazzy
+          path: osiris_agent/bin/
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: graph_watcher_aarch64_jazzy
+          path: osiris_agent/bin/
+
       - name: Commit updated binaries
         run: |
           chmod +x osiris_agent/bin/graph_watcher_x86_64
           chmod +x osiris_agent/bin/graph_watcher_aarch64
+          chmod +x osiris_agent/bin/graph_watcher_x86_64_jazzy
+          chmod +x osiris_agent/bin/graph_watcher_aarch64_jazzy
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add osiris_agent/bin/graph_watcher_x86_64 \
-                  osiris_agent/bin/graph_watcher_aarch64
+                  osiris_agent/bin/graph_watcher_aarch64 \
+                  osiris_agent/bin/graph_watcher_x86_64_jazzy \
+                  osiris_agent/bin/graph_watcher_aarch64_jazzy
           git diff --staged --quiet || \
             git commit -m "build: update graph_watcher binaries [skip ci]"
           git pull --rebase origin main
