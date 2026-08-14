@@ -89,6 +89,13 @@ COMMAND_SERVER_DISCOVERY_GRACE_S = 5.0  # server_is_ready() can lag right after 
 # as unbounded, which was the actual behavior before this default existed.
 DEFAULT_TIME_ALLOWANCE_S = 60.0
 
+# How old a cached battery/dock reading is allowed to be before a send_command
+# request treats it as unknown rather than trusting it (see
+# _check_battery_and_dock_preconditions). Covers both "never received a
+# message" and "the publisher went away" with the same fail-closed check —
+# either way, no reading newer than this means no trustworthy current answer.
+STATUS_STALE_AFTER_S = 10.0
+
 # Safety-valve for the "one command at a time" slot: normally it's released by
 # _on_command_goal_result, which only fires once the goal's result actually
 # arrives — itself dependent on the goal cleanly reaching a terminal state on
@@ -133,6 +140,19 @@ class WebBridge(Node):
         self.declare_parameter('ros2_control_enabled',        False)
         self.declare_parameter('ros2_control_poll_interval',    2.0)
         self.declare_parameter('battery_topic',          '/battery_state')
+        # Toggle + value, same split as tf_tree_enabled/tf_tree_poll_interval
+        # and ros2_control_enabled/ros2_control_poll_interval above — not a
+        # 0/empty sentinel on the value itself, so a real threshold/topic can
+        # be kept configured while toggled off, and so there's an actual
+        # switch in the UI rather than "clear the field to disable it". Both
+        # default off — forcing either on by default would start rejecting
+        # drive/spin on any robot whose battery topic doesn't report a usable
+        # percentage, or that has no dock at all. See
+        # _check_battery_and_dock_preconditions.
+        self.declare_parameter('battery_check_enabled',  False)
+        self.declare_parameter('battery_min_percent',    30.0)
+        self.declare_parameter('dock_check_enabled',     False)
+        self.declare_parameter('dock_status_topic',      '/dock_status')
         # Replaces the old bt_collector_enabled boolean — Nav2 BT and BT.CPP
         # share a single event pipeline (_on_bt_event/_cached_bt_tree_event,
         # no source tagging), so both being active at once would already
@@ -277,6 +297,7 @@ class WebBridge(Node):
         self._last_net_io       = None
         self._last_io_time:     float | None = None
         self._last_battery_state: dict | None = None
+        self._last_battery_state_time: float | None = None
         psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
         # Starts at the local ROS param (yaml value if the user set one, else
         # its declared default of True) — overridden by the gateway's
@@ -357,6 +378,21 @@ class WebBridge(Node):
         self._battery_topic_default = self.get_parameter('battery_topic').get_parameter_value().string_value
         self._battery_sub = None
         self._battery_topic = None
+        self._battery_check_enabled_default = self.get_parameter('battery_check_enabled').get_parameter_value().bool_value
+        self._battery_check_enabled = self._battery_check_enabled_default
+        self._battery_min_percent_default = self.get_parameter('battery_min_percent').get_parameter_value().double_value
+        self._battery_min_percent = self._battery_min_percent_default
+
+        # ── Dock status subscription ────────────────────────────────────────
+        # Same deferred-construction reasoning as battery above — topic name
+        # is a constructor arg, resolved once by _apply_agent_config.
+        self._dock_check_enabled_default = self.get_parameter('dock_check_enabled').get_parameter_value().bool_value
+        self._dock_check_enabled = self._dock_check_enabled_default
+        self._dock_status_topic_default = self.get_parameter('dock_status_topic').get_parameter_value().string_value
+        self._dock_status_sub = None
+        self._dock_status_topic = None
+        self._last_dock_status: dict | None = None
+        self._last_dock_status_time: float | None = None
 
         # ── WebSocket thread ──────────────────────────────────────────────────
         threading.Thread(target=self._run_ws_client, daemon=True).start()
@@ -1878,6 +1914,48 @@ class WebBridge(Node):
 
         raise ValueError(f'no goal builder for command {command}')
 
+    def _check_battery_and_dock_preconditions(self) -> str | None:
+        """Returns a precondition_failed:* reason string if it isn't safe to
+        move right now, else None. Each check is independently opt-in via its
+        own toggle (battery_check_enabled / dock_check_enabled) — a robot
+        that hasn't turned one on just doesn't get gated by it at all. Once
+        enabled, this is universal and unconditional: it applies to every
+        command in COMMAND_DEFS the same way, with no way for a caller to
+        pass a flag to skip it (unlike disable_collision_checks, which is a
+        deliberate per-call opt-out of a different check).
+
+        Fails closed on missing/stale data, not just on an actual bad
+        reading: no cached value at all, or one older than
+        STATUS_STALE_AFTER_S, is treated the same as an unsafe reading
+        ('_unknown' reasons below) rather than silently letting the command
+        through. This covers both "never received a message on this topic"
+        (e.g. a latched publisher whose replay our subscription's QoS
+        doesn't match — see the config doc for _dock_status_sub) and "the
+        publisher died" with the same mechanism.
+        """
+        now = time.time()
+
+        if self._battery_check_enabled:
+            if self._last_battery_state is None or self._last_battery_state_time is None:
+                return 'precondition_failed:battery_unknown'
+            if now - self._last_battery_state_time > STATUS_STALE_AFTER_S:
+                return 'precondition_failed:battery_unknown'
+            percent = self._last_battery_state.get('percent')
+            if percent is None:
+                return 'precondition_failed:battery_unknown'
+            if percent < self._battery_min_percent:
+                return 'precondition_failed:battery_low'
+
+        if self._dock_check_enabled:
+            if self._last_dock_status is None or self._last_dock_status_time is None:
+                return 'precondition_failed:dock_status_unknown'
+            if now - self._last_dock_status_time > STATUS_STALE_AFTER_S:
+                return 'precondition_failed:dock_status_unknown'
+            if self._last_dock_status.get('is_docked'):
+                return 'precondition_failed:docked'
+
+        return None
+
     def _handle_send_command_request(self, data: dict):
         request_id = data.get('request_id', '')
         command = data.get('command')
@@ -1934,6 +2012,16 @@ class WebBridge(Node):
                 _release_pending()
                 self._send_command_rejected(request_id, f'precondition_failed:{node_fqn}_not_active')
                 return
+
+        # Battery/dock safety check — universal across every command in
+        # COMMAND_DEFS, not per-command opt-in like precondition_nodes above,
+        # and not something the caller can pass a flag to skip. See
+        # _check_battery_and_dock_preconditions for what each check requires.
+        safety_reason = self._check_battery_and_dock_preconditions()
+        if safety_reason:
+            _release_pending()
+            self._send_command_rejected(request_id, safety_reason)
+            return
 
         try:
             module = __import__(command_def['module'], fromlist=[command_def['cls_name']])
@@ -2370,6 +2458,38 @@ class WebBridge(Node):
                 self.get_logger().warning(f'Battery state monitoring unavailable: {e}')
             self._battery_topic = battery_topic
 
+        self._battery_check_enabled = self._resolve_config_value('battery_check_enabled', config, self._battery_check_enabled_default, bool)
+        self._battery_min_percent = self._resolve_config_value('battery_min_percent', config, self._battery_min_percent_default, float)
+
+        # Dock status topic — same (re)subscribe-on-change pattern as battery
+        # above, and subscribed whenever a topic is configured regardless of
+        # dock_check_enabled (same as battery_sub existing independently of
+        # battery_check_enabled) — so the cache is already warm by the time
+        # the operator flips the check on, instead of guaranteeing an initial
+        # dock_status_unknown rejection while waiting for the first message.
+        # lazily imported since opennav_docking_msgs is Nav2-docking-specific,
+        # not guaranteed installed on every robot (same reasoning as
+        # nav2_msgs elsewhere).
+        self._dock_check_enabled = self._resolve_config_value('dock_check_enabled', config, self._dock_check_enabled_default, bool)
+        dock_status_topic = self._resolve_config_value('dock_status_topic', config, self._dock_status_topic_default)
+        if self._dock_status_sub is None or self._dock_status_topic != dock_status_topic:
+            if self._dock_status_sub is not None:
+                self.destroy_subscription(self._dock_status_sub)
+                self._dock_status_sub = None
+                self._last_dock_status = None
+                self._last_dock_status_time = None
+            if dock_status_topic:
+                try:
+                    from opennav_docking_msgs.msg import DockStatus
+                    self._dock_status_sub = self.create_subscription(
+                        DockStatus, dock_status_topic,
+                        self._on_dock_status, 10,
+                    )
+                    self.get_logger().info(f'Dock status subscription active on {dock_status_topic}')
+                except Exception as e:
+                    self.get_logger().warning(f'Dock status monitoring unavailable: {e}')
+            self._dock_status_topic = dock_status_topic
+
         # Goals: no single collector object to construct/destroy — just a set
         # of per-action subscriptions. Turning on catches up on every action
         # already known (self._active_actions, populated by the graph scan
@@ -2497,6 +2617,10 @@ class WebBridge(Node):
                 'ros2_control_enabled': ros2_control_enabled,
                 'ros2_control_poll_interval': ros2_control_poll_interval,
                 'battery_topic': battery_topic,
+                'battery_check_enabled': self._battery_check_enabled,
+                'battery_min_percent': self._battery_min_percent,
+                'dock_check_enabled': self._dock_check_enabled,
+                'dock_status_topic': dock_status_topic,
                 'bt_mode': bt_mode,
                 'bt_host': bt_host,
                 'bt_server_port': bt_server_port,
@@ -2520,7 +2644,8 @@ class WebBridge(Node):
         })
 
     def _on_battery_state(self, msg) -> None:
-        """Cache the latest BatteryState message for inclusion in telemetry snapshots."""
+        """Cache the latest BatteryState message for inclusion in telemetry snapshots
+        and for the send_command battery-level precondition check."""
         try:
             self._last_battery_state = {
                 'percent':  round(float(msg.percentage) * 100.0, 1) if msg.percentage == msg.percentage else None,  # NaN guard
@@ -2529,6 +2654,19 @@ class WebBridge(Node):
                 'status':   int(msg.power_supply_status),
                 'present':  bool(msg.present),
             }
+            self._last_battery_state_time = time.time()
+        except Exception:
+            pass
+
+    def _on_dock_status(self, msg) -> None:
+        """Cache the latest opennav_docking_msgs/DockStatus message for the
+        send_command docked-status precondition check."""
+        try:
+            self._last_dock_status = {
+                'is_docked':   bool(msg.is_docked),
+                'is_charging': bool(msg.is_charging),
+            }
+            self._last_dock_status_time = time.time()
         except Exception:
             pass
 
@@ -2606,13 +2744,25 @@ class WebBridge(Node):
         # the top N CPU consumers, to avoid per-second syscalls against every
         # process on the host and to avoid leaking the full host process list
         # (cmdline can contain secrets) over the wire.
+        #
+        # psutil.Process.cpu_percent() is normalized to a SINGLE core by
+        # default (100% = one core fully saturated, so a process pegging 2 of
+        # 4 cores reports ~200%) — a different convention than cpu_now above,
+        # which psutil already normalizes to the whole system (0-100%). Divide
+        # by logical core count here so both numbers in this same pane mean
+        # the same thing: percent of total system CPU capacity.
+        try:
+            logical_cpus = psutil.cpu_count(logical=True) or 1
+        except Exception:
+            logical_cpus = 1
+
         processes = []
         try:
             candidates = []
             for proc in psutil.process_iter(['pid', 'name', 'cpu_percent']):
                 try:
                     info = proc.info
-                    candidates.append((round(info['cpu_percent'] or 0.0, 1), proc))
+                    candidates.append((round((info['cpu_percent'] or 0.0) / logical_cpus, 1), proc))
                 except (psutil.NoSuchProcess, psutil.AccessDenied):
                     continue
             candidates.sort(key=lambda c: c[0], reverse=True)
