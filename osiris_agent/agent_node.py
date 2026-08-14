@@ -40,6 +40,15 @@ from .tf_tree_collector import TfTreeCollector
 # ──────────────────────────────────────────────
 TELEMETRY_INTERVAL         = 1.0   # seconds between telemetry samples
 MAX_TELEMETRY_PROCESSES    = 15    # cap on processes reported per telemetry sample
+# The process list is by far the most expensive part of a telemetry sample —
+# a full psutil.process_iter() pass over every process on the host, then a
+# oneshot() deep read (cmdline/memory/username/threads) for the top N — for
+# something that doesn't meaningfully change second to second the way
+# cpu/ram/disk/net do. Computed and sent only once every this many ticks;
+# cpu/ram/disk/net/battery stay on the plain 1Hz TELEMETRY_INTERVAL. The
+# client is expected to hold onto the last processes list it received
+# in between (see stores/robot.js's telemetry handler), not clear it.
+TELEMETRY_PROCESS_EVERY_N_TICKS = 5
 MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
 RECONNECT_MAX_DELAY        = 30    # seconds
@@ -298,6 +307,7 @@ class WebBridge(Node):
         self._last_io_time:     float | None = None
         self._last_battery_state: dict | None = None
         self._last_battery_state_time: float | None = None
+        self._telemetry_tick = 0  # counts periodic samples — see TELEMETRY_PROCESS_EVERY_N_TICKS
         psutil.cpu_percent(interval=None)  # prime — first call always returns 0.0
         # Starts at the local ROS param (yaml value if the user set one, else
         # its declared default of True) — overridden by the gateway's
@@ -2637,9 +2647,11 @@ class WebBridge(Node):
             return
         if not self._telemetry_enabled:
             return
+        self._telemetry_tick += 1
+        include_processes = (self._telemetry_tick % TELEMETRY_PROCESS_EVERY_N_TICKS == 0)
         self._enqueue({
             'type': 'telemetry',
-            'data': self._get_telemetry_snapshot(),
+            'data': self._get_telemetry_snapshot(include_processes=include_processes),
             'timestamp': time.time(),
         })
 
@@ -2670,7 +2682,7 @@ class WebBridge(Node):
         except Exception:
             pass
 
-    def _get_telemetry_snapshot(self) -> dict:
+    def _get_telemetry_snapshot(self, include_processes: bool = True) -> dict:
         cpu_now = round(psutil.cpu_percent(interval=None), 1)
 
         vm = psutil.virtual_memory()
@@ -2756,37 +2768,41 @@ class WebBridge(Node):
         except Exception:
             logical_cpus = 1
 
+        # Skipped entirely (not just omitted from the result) on ticks that
+        # don't need it — this is the expensive part TELEMETRY_PROCESS_EVERY_N_
+        # TICKS exists to avoid paying every second, not just a smaller payload.
         processes = []
-        try:
-            candidates = []
-            for proc in psutil.process_iter(['pid', 'name', 'cpu_percent']):
-                try:
-                    info = proc.info
-                    candidates.append((round((info['cpu_percent'] or 0.0) / logical_cpus, 1), proc))
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-            candidates.sort(key=lambda c: c[0], reverse=True)
+        if include_processes:
+            try:
+                candidates = []
+                for proc in psutil.process_iter(['pid', 'name', 'cpu_percent']):
+                    try:
+                        info = proc.info
+                        candidates.append((round((info['cpu_percent'] or 0.0) / logical_cpus, 1), proc))
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+                candidates.sort(key=lambda c: c[0], reverse=True)
 
-            for cpu_percent, proc in candidates[:MAX_TELEMETRY_PROCESSES]:
-                try:
-                    with proc.oneshot():
-                        cmdline = proc.cmdline()
-                        mem_info = proc.memory_info()
-                        processes.append({
-                            'pid':          proc.pid,
-                            'name':         proc.name(),
-                            'cmdline':      ' '.join(cmdline)[:256] if cmdline else '',
-                            'num_threads':  proc.num_threads(),
-                            'username':     proc.username(),
-                            'memory_mb':    round(mem_info.rss / (1024 * 1024), 1) if mem_info else 0,
-                            'cpu_percent':  cpu_percent,
-                        })
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    continue
-        except Exception:
-            pass
+                for cpu_percent, proc in candidates[:MAX_TELEMETRY_PROCESSES]:
+                    try:
+                        with proc.oneshot():
+                            cmdline = proc.cmdline()
+                            mem_info = proc.memory_info()
+                            processes.append({
+                                'pid':          proc.pid,
+                                'name':         proc.name(),
+                                'cmdline':      ' '.join(cmdline)[:256] if cmdline else '',
+                                'num_threads':  proc.num_threads(),
+                                'username':     proc.username(),
+                                'memory_mb':    round(mem_info.rss / (1024 * 1024), 1) if mem_info else 0,
+                                'cpu_percent':  cpu_percent,
+                            })
+                    except (psutil.NoSuchProcess, psutil.AccessDenied):
+                        continue
+            except Exception:
+                pass
 
-        return {
+        snapshot = {
             'cpu': {
                 'now':        cpu_now,
                 'throttling': None,
@@ -2811,8 +2827,15 @@ class WebBridge(Node):
                 'rx_mbps': net_rx_mbps,
             },
             'battery':   self._last_battery_state,
-            'processes': processes,
         }
+        # Present only on ticks that actually computed it — absent, not an
+        # empty list, so the client can tell "no update this tick" apart from
+        # "genuinely no processes" and hold onto whatever it already has
+        # (see stores/robot.js's telemetry handler) instead of blanking the
+        # UI for the 4 out of 5 ticks this is skipped.
+        if include_processes:
+            snapshot['processes'] = processes
+        return snapshot
 
     def _get_cpu_model(self) -> str | None:
         try:
