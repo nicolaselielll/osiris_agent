@@ -530,6 +530,10 @@ class WebBridge(Node):
                     self._unsubscribe_from_topic(topic)
             elif msg_type == 'lidar_snapshot_request':
                 self._handle_lidar_snapshot_request(data)
+            elif msg_type == 'topic_live_snapshot_request':
+                self._handle_topic_live_snapshot_request(data)
+            elif msg_type == 'bundle_capture_request':
+                self._handle_bundle_capture_request(data)
             elif msg_type == 'send_command_request':
                 self._handle_send_command_request(data)
             elif msg_type == 'cancel_command_request':
@@ -1201,23 +1205,9 @@ class WebBridge(Node):
         # Best-effort live TF lookup, started alongside the /scan
         # subscription so /tf_static (latched, arrives near-instantly to a
         # fresh subscriber) has the whole scan-capture window to show up
-        # before on_scan actually needs it. Deliberately its own Buffer/
-        # Listener, not self._tf_tree (the separate tf_tree_enabled
-        # feature's own collector) — that one is only constructed when the
-        # operator has that unrelated feature turned on, and even then only
-        # exposes whole-tree snapshots, not a targeted two-frame lookup. See
-        # project_lidar_front_angle memory for why this exists at all.
-        tf_buffer = None
-        tf_holder = {}
-        try:
-            import tf2_ros
-            candidate_buffer = tf2_ros.Buffer()
-            tf_holder['listener'] = tf2_ros.TransformListener(candidate_buffer, self, spin_thread=False)
-            tf_buffer = candidate_buffer
-        except Exception as e:
-            tf_buffer = None
-            tf_holder.pop('listener', None)
-            self.get_logger().debug(f"[lidar_snapshot] TF listener unavailable: {e}")
+        # before on_scan actually needs it. See _start_lidar_tf_listener for
+        # why this is its own Buffer/Listener rather than self._tf_tree.
+        tf_buffer, tf_holder = self._start_lidar_tf_listener()
 
         # Guards against both the scan callback and the timeout firing —
         # whichever gets here first wins, the other is a no-op. Both can run
@@ -1334,6 +1324,243 @@ class WebBridge(Node):
         asyncio.run_coroutine_threadsafe(
             self._send_queue.put(json.dumps({
                 'type': 'lidar_snapshot_failed',
+                'request_id': request_id,
+                'reason': reason,
+                'timestamp': time.time(),
+            })),
+            self.loop,
+        )
+
+    @staticmethod
+    def _json_safe_deep(value):
+        """Recursively replaces inf/-inf/nan with None throughout an
+        arbitrary nested dict/list structure, as message_to_ordereddict
+        produces for ANY message type — same reasoning as _json_safe_floats
+        (LaserScan.ranges), generalized because a generic topic snapshot has
+        no fixed field name to special-case; any float field on any message
+        type could be non-finite."""
+        if isinstance(value, float):
+            return value if math.isfinite(value) else None
+        if isinstance(value, dict):
+            return {k: WebBridge._json_safe_deep(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [WebBridge._json_safe_deep(v) for v in value]
+        return value
+
+    def _start_one_shot_capture(self, topic_name, on_message, on_timeout, on_not_found, timeout_s=3.0):
+        """Shared subscribe-wait-one-message-unsubscribe mechanics, factored
+        out of _handle_topic_live_snapshot_request so _handle_bundle_capture_
+        request can run several of these in parallel behind a shared
+        completion barrier instead of duplicating the subscribe/timeout/
+        cleanup dance per capture. Whichever of on_message/on_timeout fires
+        is entirely this function's own business — the caller's callbacks
+        just react, they don't need to track the subscription or timer
+        themselves. on_not_found fires synchronously, before anything is
+        subscribed, if the topic doesn't currently exist."""
+        types = dict(self.get_topic_names_and_types()).get(topic_name)
+        if not types:
+            on_not_found()
+            return
+
+        msg_class = get_message(types[0])
+        lock = threading.Lock()
+        state = {'done': False}
+        holder = {}
+
+        # Same "whichever fires first wins" guard as the lidar snapshot's
+        # own finish() — the message callback and the timeout can each fire
+        # from a different thread.
+        def finish(success, msg=None):
+            with lock:
+                if state['done']:
+                    return
+                state['done'] = True
+            sub = holder.pop('sub', None)
+            if sub is not None:
+                self.destroy_subscription(sub)
+            timer = holder.pop('timer', None)
+            if timer is not None:
+                timer.cancel()
+            if success:
+                on_message(msg)
+            else:
+                on_timeout()
+
+        holder['sub'] = self.create_subscription(msg_class, topic_name, lambda msg: finish(True, msg), QoSProfile(depth=1))
+
+        timer = threading.Timer(timeout_s, lambda: finish(False))
+        timer.daemon = True
+        holder['timer'] = timer
+        timer.start()
+
+    def _start_lidar_tf_listener(self):
+        """Best-effort TF listener for a single scan capture, factored out of
+        _handle_lidar_snapshot_request so _handle_bundle_capture_request's own
+        lidar_wall_fit capture can reuse it too. Deliberately its own Buffer/
+        Listener, not self._tf_tree — see project_lidar_front_angle memory for
+        why. Returns (tf_buffer, holder); tf_buffer is None on any failure.
+        Caller drops the reference (holder.pop('listener', None)) once done
+        with it, same cleanup TfTreeCollector.destroy() itself uses."""
+        tf_buffer = None
+        tf_holder = {}
+        try:
+            import tf2_ros
+            candidate_buffer = tf2_ros.Buffer()
+            tf_holder['listener'] = tf2_ros.TransformListener(candidate_buffer, self, spin_thread=False)
+            tf_buffer = candidate_buffer
+        except Exception as e:
+            tf_buffer = None
+            tf_holder.pop('listener', None)
+            self.get_logger().debug(f"[tf_listener] unavailable: {e}")
+        return tf_buffer, tf_holder
+
+    def _handle_topic_live_snapshot_request(self, data: dict):
+        """Fire-once capture for ANY topic: subscribe, wait for exactly one
+        message, unsubscribe, relay it back. Generalized from
+        _handle_lidar_snapshot_request (no LaserScan type check, no TF
+        front-angle lookup — those are wall-fit-specific) so the AI can read
+        a topic's current value (e.g. /odom) without paying for a lasting
+        subscription and continuous logging when it only needs one moment
+        in time. Deliberately separate from _subscribe_to_topic/_topic_subs
+        (the continuous gateway-requested subscription path) for the same
+        reason the lidar one is: never counts against MAX_SUBSCRIPTIONS,
+        never shows up in bridge_subscriptions, never persisted as a log
+        row — this is a pure ephemeral request/response value, not meant to
+        be a durable history."""
+        topic_name = data.get('topic')
+        request_id = data.get('request_id', '')
+
+        if not topic_name:
+            self._send_topic_live_snapshot_failed(request_id, 'topic_required')
+            return
+
+        self._start_one_shot_capture(
+            topic_name,
+            on_message=lambda msg: self._send_topic_live_snapshot_result(request_id, topic_name, msg),
+            on_timeout=lambda: self._send_topic_live_snapshot_failed(request_id, 'timeout'),
+            on_not_found=lambda: self._send_topic_live_snapshot_failed(request_id, 'topic_not_found'),
+        )
+
+    def _handle_bundle_capture_request(self, data: dict):
+        """Captures any number of topics + optionally a lidar wall-fit's raw
+        scan, all in parallel, joined into ONE combined result once every
+        requested capture has resolved (success or failure each) — see
+        project_lidar_heading_plan_executor memory (bundles): this is what
+        lets the AI correlate values by exact-match run_id/moment instead of
+        timestamp proximity, which is ambiguous once more than one run
+        happens in the same session.
+
+        Each capture reuses _start_one_shot_capture — this only coordinates
+        them behind a shared pending set, it doesn't reimplement the
+        subscribe/timeout/cleanup mechanics. The wall-fit computation itself
+        does NOT happen here — this only captures the raw /scan message and,
+        best-effort, its TF front-angle; the gateway resolves the actual
+        heading/distance (see resolveWallFit), same division of
+        responsibility as the dedicated lidar-snapshot path.
+        """
+        request_id = data.get('request_id', '')
+        topics = data.get('topics') or []
+        lidar_wall_fit = data.get('lidar_wall_fit')
+        lidar_topic = (lidar_wall_fit or {}).get('topic') or '/scan'
+
+        lock = threading.Lock()
+        results = {}
+        pending = set(topics)
+        if lidar_wall_fit is not None:
+            pending.add('lidar_wall_fit')
+
+        if not pending:
+            self._send_bundle_capture_result(request_id, {})
+            return
+
+        def resolve(name, success, value=None, reason=None):
+            with lock:
+                if name not in pending:
+                    return
+                pending.discard(name)
+                results[name] = {'status': 'success', **(value or {})} if success else {'status': 'failed', 'reason': reason}
+                still_pending = bool(pending)
+            if not still_pending:
+                self._send_bundle_capture_result(request_id, results)
+
+        for t in topics:
+            self._start_one_shot_capture(
+                t,
+                on_message=lambda msg, t=t: resolve(t, True, {'data': self._json_safe_deep(message_to_ordereddict(msg))}),
+                on_timeout=lambda t=t: resolve(t, False, reason='timeout'),
+                on_not_found=lambda t=t: resolve(t, False, reason='topic_not_found'),
+            )
+
+        if lidar_wall_fit is not None:
+            tf_buffer, tf_holder = self._start_lidar_tf_listener()
+
+            def _on_lidar_msg(msg):
+                front_angle_rad = self._lookup_lidar_front_angle(tf_buffer, msg.header.frame_id)
+                tf_holder.pop('listener', None)
+                resolve('lidar_wall_fit', True, {
+                    'raw_scan': self._json_safe_deep(message_to_ordereddict(msg)),
+                    'front_angle_rad': front_angle_rad,
+                })
+
+            def _on_lidar_timeout():
+                tf_holder.pop('listener', None)
+                resolve('lidar_wall_fit', False, reason='timeout')
+
+            def _on_lidar_not_found():
+                tf_holder.pop('listener', None)
+                resolve('lidar_wall_fit', False, reason='topic_not_found')
+
+            self._start_one_shot_capture(lidar_topic, _on_lidar_msg, _on_lidar_timeout, _on_lidar_not_found)
+
+    def _send_bundle_capture_result(self, request_id: str, captures: dict):
+        if not self.loop:
+            return
+        payload = {
+            'type': 'bundle_capture_result',
+            'request_id': request_id,
+            'captures': captures,
+            'timestamp': time.time(),
+        }
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(json.dumps(payload)),
+            self.loop,
+        )
+
+    def _send_bundle_capture_failed(self, request_id: str, reason: str):
+        if not self.loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(json.dumps({
+                'type': 'bundle_capture_failed',
+                'request_id': request_id,
+                'reason': reason,
+                'timestamp': time.time(),
+            })),
+            self.loop,
+        )
+
+    def _send_topic_live_snapshot_result(self, request_id: str, topic_name: str, msg):
+        if not self.loop:
+            return
+        data = self._json_safe_deep(message_to_ordereddict(msg))
+        payload = {
+            'type': 'topic_live_snapshot_result',
+            'request_id': request_id,
+            'topic': topic_name,
+            'data': data,
+            'timestamp': time.time(),
+        }
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(json.dumps(payload)),
+            self.loop,
+        )
+
+    def _send_topic_live_snapshot_failed(self, request_id: str, reason: str):
+        if not self.loop:
+            return
+        asyncio.run_coroutine_threadsafe(
+            self._send_queue.put(json.dumps({
+                'type': 'topic_live_snapshot_failed',
                 'request_id': request_id,
                 'reason': reason,
                 'timestamp': time.time(),
