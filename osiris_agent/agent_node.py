@@ -497,7 +497,10 @@ class WebBridge(Node):
                 except (asyncio.CancelledError, Exception):
                     pass
             if self.ws is not None:
-                self.get_logger().warning('Disconnected from gateway')
+                if self.ws.close_code == 4429:
+                    self.get_logger().warning('Storage limit reached')
+                else:
+                    self.get_logger().warning('Disconnected from gateway')
             self.ws = None
 
     async def _send_loop(self, ws):
