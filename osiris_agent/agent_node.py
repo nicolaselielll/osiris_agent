@@ -53,6 +53,31 @@ MAX_SUBSCRIPTIONS          = 100   # hard cap on gateway-requested topic subs
 RECONNECT_INITIAL_DELAY    = 1     # seconds
 RECONNECT_MAX_DELAY        = 30    # seconds
 
+# ROS2 message types whose payload is dominated by one large byte array. For
+# these, _on_topic_msg strips that field out of the JSON topic_data message
+# and sends it as a separate raw binary WS frame instead — see _on_topic_msg
+# and BINARY_MARKER_KEY. message_to_ordereddict + json.dumps would otherwise
+# turn e.g. a 640x480 rgb8 Image's ~920KB data field into a JSON array of
+# ints (commas, digit characters, no base64 even) — 3-6x the raw byte count,
+# and by far the single biggest source of avoidable bytes on the agent's
+# uplink. All four types below happen to name the field 'data'; the field for
+# OccupancyGrid is int8 (needs sign-aware decoding on the way back, see
+# BINARY_MARKER_KEY), the other three are uint8.
+BINARY_PAYLOAD_FIELD = 'data'
+BINARY_PAYLOAD_TYPES = {
+    'sensor_msgs/msg/Image':          False,  # uint8[]
+    'sensor_msgs/msg/CompressedImage': False,  # uint8[]
+    'sensor_msgs/msg/PointCloud2':    False,  # uint8[]
+    'nav_msgs/msg/OccupancyGrid':     True,   # int8[] — signed, see BINARY_MARKER_KEY
+}
+# Marker substituted for BINARY_PAYLOAD_FIELD in the JSON header — must match
+# the gateway's BINARY_MARKER_KEY (index.js) exactly, it's the two ends of one
+# wire protocol. 'len' is the byte count the binary frame right behind this
+# header is expected to carry (gateway-side sanity check only); 'signed' says
+# whether those bytes are int8 (two's-complement, e.g. OccupancyGrid's -1
+# "unknown" cells) or plain uint8.
+BINARY_MARKER_KEY = '__osiris_binary__'
+
 # Services to suppress from graph output (internal ROS2 plumbing)
 _SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
 
@@ -196,6 +221,11 @@ class WebBridge(Node):
         # ── Topic subscriptions (gateway-requested) ──────────────────────────
         self._topic_subs: dict[str, rclpy.subscription.Subscription] = {}
         self._topic_subs_lock = threading.Lock()
+        # topic -> resolved ROS2 type string, set alongside _topic_subs. Lets
+        # _on_topic_msg decide whether this topic's messages get the binary
+        # WS-frame treatment (see BINARY_PAYLOAD_TYPES) without re-querying
+        # the graph on every single message.
+        self._topic_msg_types: dict[str, str] = {}
         # Rolling window of receipt timestamps per subscribed topic, used to
         # recompute each topic's rate_hz on a 1Hz timer (see _publish_topic_rates)
         # rather than piggybacking a value on topic_data itself — a piggybacked
@@ -1153,6 +1183,7 @@ class WebBridge(Node):
         )
         with self._topic_subs_lock:
             self._topic_subs[topic_name] = sub
+            self._topic_msg_types[topic_name] = types[0]
 
         self.get_logger().info(f"Subscribed to {topic_name}")
         if self.loop:
@@ -1163,6 +1194,7 @@ class WebBridge(Node):
     def _unsubscribe_from_topic(self, topic_name: str):
         with self._topic_subs_lock:
             sub = self._topic_subs.pop(topic_name, None)
+            self._topic_msg_types.pop(topic_name, None)
         if sub:
             self.destroy_subscription(sub)
             self._topic_data_throttle.pop(topic_name, None)
@@ -1844,11 +1876,40 @@ class WebBridge(Node):
             return
         self._topic_data_throttle[topic_name] = ts
 
+        data = message_to_ordereddict(msg)
+
+        # For the byte-array-dominated types (see BINARY_PAYLOAD_TYPES), pull
+        # the array out and send it as a raw binary WS frame instead of
+        # leaving it for json.dumps to inflate into a comma-separated array
+        # of ints. See BINARY_MARKER_KEY and the gateway's isBinary handler
+        # for the other half of this.
+        with self._topic_subs_lock:
+            msg_type = self._topic_msg_types.get(topic_name)
+        signed = BINARY_PAYLOAD_TYPES.get(msg_type)
+        raw = data.get(BINARY_PAYLOAD_FIELD) if signed is not None else None
+        if raw is not None:
+            # message_to_ordereddict gives back a plain list of already
+            # correctly-signed Python ints (e.g. -1 for an OccupancyGrid
+            # "unknown" cell). `& 0xFF` takes each one to its two's-complement
+            # byte value regardless of signedness — the same bit pattern
+            # either way — which is exactly what bytes() needs and exactly
+            # what the gateway's Int8Array/Uint8Array reinterprets on the way
+            # back using the 'signed' flag below.
+            payload = bytes(b & 0xFF for b in raw)
+            data[BINARY_PAYLOAD_FIELD] = {BINARY_MARKER_KEY: {'len': len(payload), 'signed': signed}}
+            self._enqueue_binary_topic_data({
+                'type': 'topic_data',
+                'topic': topic_name,
+                'data': data,
+                'timestamp': ts,
+            }, payload)
+            return
+
         asyncio.run_coroutine_threadsafe(
             self._send_queue.put(json.dumps({
                 'type': 'topic_data',
                 'topic': topic_name,
-                'data': message_to_ordereddict(msg),
+                'data': data,
                 'timestamp': ts,
             })),
             self.loop,
@@ -3146,6 +3207,29 @@ class WebBridge(Node):
         if self.ws and self.loop:
             asyncio.run_coroutine_threadsafe(
                 self._send_queue.put(json.dumps(payload)),
+                self.loop,
+            )
+
+    async def _put_pair(self, header: str, payload: bytes):
+        # Two sequential puts on the *same* coroutine, not two separate
+        # _enqueue calls. _send_queue is unbounded, so asyncio.Queue.put()
+        # never actually suspends (see its source: the full() wait loop is
+        # skipped entirely) — these two puts land back-to-back with no
+        # window for another thread's run_coroutine_threadsafe call to slip
+        # a different message in between. That matters here specifically:
+        # the gateway pairs this header with whichever binary frame arrives
+        # right after it, so the two must never be split by an unrelated
+        # topic's message landing between them.
+        await self._send_queue.put(header)
+        await self._send_queue.put(payload)
+
+    def _enqueue_binary_topic_data(self, header: dict, payload: bytes):
+        """Like _enqueue, but for a topic_data message whose byte-array field
+        was pulled out into a raw binary WS frame (see _on_topic_msg) — sends
+        the JSON header and that frame as one atomic pair. See _put_pair."""
+        if self.ws and self.loop:
+            asyncio.run_coroutine_threadsafe(
+                self._put_pair(json.dumps(header), payload),
                 self.loop,
             )
 
