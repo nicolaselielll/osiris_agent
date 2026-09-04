@@ -202,8 +202,27 @@ class WebBridge(Node):
         self.declare_parameter('graph_debounce_interval',   1.0)
         self.declare_parameter('bag_output_dir',            '~/ros2_bags')
         # Max rate (Hz) topic_data messages get forwarded at, per topic; 0
-        # disables the throttle entirely. See _on_topic_msg.
+        # disables the throttle entirely. See _on_topic_msg. This is the
+        # DEFAULT applied to every topic - a specific topic in
+        # self._topic_limit_overrides (set live via agent_config's
+        # 'topic_limits', see _apply_agent_config) takes precedence over it.
         self.declare_parameter('topic_data_rate_hz',         50.0)
+        # Same default-with-per-topic-override relationship as
+        # topic_data_rate_hz above, just bytes/sec instead of messages/sec —
+        # this is what actually protects against a single heavy topic (a
+        # pointcloud, an uncompressed image) rather than just a chatty one. 0
+        # disables it. See _topic_data_over_budget.
+        self.declare_parameter('topic_data_max_bytes_per_sec', 0.0)
+        # Connection-wide budgets, shared across every subscribed topic - the
+        # actual constraint being protected is the agent's one uplink, which
+        # no per-topic cap alone can protect (five topics each individually
+        # "within budget" can still saturate the link combined). Only
+        # topic_data competes for these; graph state, lifecycle events, etc.
+        # go through plain _enqueue and are never throttled here on purpose,
+        # so control-plane traffic never starves because the sensor stream is
+        # busy. Both 0 = unlimited. See _topic_data_over_budget.
+        self.declare_parameter('global_topic_data_max_bytes_per_sec', 0.0)
+        self.declare_parameter('global_topic_data_max_msgs_per_sec',  0.0)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -239,6 +258,23 @@ class WebBridge(Node):
         # of _topic_rate_timestamps above, which keeps sampling every real
         # receipt so rate_hz stays accurate regardless of this throttle.
         self._topic_data_throttle: dict[str, float] = {}
+        # topic -> (window_start_ts, bytes_forwarded_in_window), and the
+        # connection-wide equivalent right below — both only ever touched
+        # from _on_topic_msg, which (like _topic_data_throttle above) only
+        # ever runs on the single ROS executor thread, so neither needs a
+        # lock. See _topic_data_over_budget.
+        self._topic_byte_bucket: dict[str, tuple[float, int]] = {}
+        self._global_topic_data_bucket: tuple[float, int, int] = (0.0, 0, 0)  # (window_start_ts, bytes, msgs)
+        # topic -> {'rate_hz': float, 'max_bytes_per_sec': float} — per-topic
+        # overrides of the topic_data_rate_hz/topic_data_max_bytes_per_sec
+        # defaults above, set live from agent_config's 'topic_limits' (see
+        # _apply_agent_config). Written from the asyncio-loop thread
+        # (_apply_agent_config, via _receive_loop) and read from the ROS
+        # executor thread (_on_topic_msg) — genuinely cross-thread, unlike
+        # the two buckets above, hence the lock (same reasoning as
+        # _topic_subs_lock guarding _topic_msg_types).
+        self._topic_limit_overrides: dict[str, dict] = {}
+        self._topic_limit_lock = threading.Lock()
 
         # ── Existence caches (set of fully-qualified names) ───────────────────
         self._active_nodes:    set[str] = set()
@@ -1860,6 +1896,12 @@ class WebBridge(Node):
         with self._topic_rate_lock:
             self._topic_rate_timestamps.setdefault(topic_name, deque()).append(ts)
 
+        # Per-topic overrides (set live via agent_config's 'topic_limits',
+        # see _apply_agent_config) take precedence over the two defaults
+        # below when present for this topic.
+        with self._topic_limit_lock:
+            override = self._topic_limit_overrides.get(topic_name, {})
+
         # Cap how often a given topic's data actually gets forwarded — a fast
         # topic (odom, joint_states, ...) publishing at 30-50+ Hz is far past
         # what's perceptible in Watch/Plot, and every message costs a DB row
@@ -1871,7 +1913,9 @@ class WebBridge(Node):
         # — cheap local lookup, and lets a config change take effect without
         # a reconnect. Hz (not a raw interval) since that's the unit rate_hz
         # is already shown in everywhere else in the UI; 0 means uncapped.
-        rate_hz = self.get_parameter('topic_data_rate_hz').get_parameter_value().double_value
+        rate_hz = override.get('rate_hz')
+        if rate_hz is None:
+            rate_hz = self.get_parameter('topic_data_rate_hz').get_parameter_value().double_value
         if rate_hz > 0 and ts - self._topic_data_throttle.get(topic_name, 0.0) < 1.0 / rate_hz:
             return
         self._topic_data_throttle[topic_name] = ts
@@ -1896,6 +1940,8 @@ class WebBridge(Node):
             # what the gateway's Int8Array/Uint8Array reinterprets on the way
             # back using the 'signed' flag below.
             payload = bytes(b & 0xFF for b in raw)
+            if self._topic_data_over_budget(topic_name, len(payload), ts, override):
+                return
             data[BINARY_PAYLOAD_FIELD] = {BINARY_MARKER_KEY: {'len': len(payload), 'signed': signed}}
             self._enqueue_binary_topic_data({
                 'type': 'topic_data',
@@ -1905,15 +1951,64 @@ class WebBridge(Node):
             }, payload)
             return
 
-        asyncio.run_coroutine_threadsafe(
-            self._send_queue.put(json.dumps({
-                'type': 'topic_data',
-                'topic': topic_name,
-                'data': data,
-                'timestamp': ts,
-            })),
-            self.loop,
+        body = json.dumps({
+            'type': 'topic_data',
+            'topic': topic_name,
+            'data': data,
+            'timestamp': ts,
+        })
+        if self._topic_data_over_budget(topic_name, len(body), ts, override):
+            return
+        asyncio.run_coroutine_threadsafe(self._send_queue.put(body), self.loop)
+
+    def _topic_data_over_budget(self, topic_name: str, size: int, ts: float, override: dict) -> bool:
+        """True if forwarding `size` more bytes for `topic_name` right now
+        would exceed that topic's own bytes/sec budget or the connection
+        -wide budget shared across every subscribed topic (see the three
+        topic_data_max_bytes_per_sec / global_topic_data_max_* parameters
+        and self._topic_limit_overrides). Only topic_data competes for
+        either budget — graph state, lifecycle events, etc. go through plain
+        _enqueue and are never throttled here, on purpose: the point is
+        protecting the heavy sensor stream without ever starving the small
+        control-plane traffic that the rest of the UI depends on.
+
+        Both budgets are simple 1-second buckets that reset once a full
+        second has elapsed since the window opened, rather than a true
+        sliding window — coarser, but consistent with the Hz throttle's own
+        granularity above and much cheaper than tracking individual message
+        timestamps per topic.
+        """
+        topic_cap = override.get('max_bytes_per_sec')
+        if topic_cap is None:
+            topic_cap = self.get_parameter('topic_data_max_bytes_per_sec').get_parameter_value().double_value
+        global_byte_cap = self.get_parameter('global_topic_data_max_bytes_per_sec').get_parameter_value().double_value
+        global_msg_cap  = self.get_parameter('global_topic_data_max_msgs_per_sec').get_parameter_value().double_value
+
+        t_start, t_bytes = self._topic_byte_bucket.get(topic_name, (ts, 0))
+        if ts - t_start >= 1.0:
+            t_start, t_bytes = ts, 0
+
+        g_start, g_bytes, g_msgs = self._global_topic_data_bucket
+        if ts - g_start >= 1.0:
+            g_start, g_bytes, g_msgs = ts, 0, 0
+
+        over_budget = (
+            (topic_cap > 0 and t_bytes + size > topic_cap) or
+            (global_byte_cap > 0 and g_bytes + size > global_byte_cap) or
+            (global_msg_cap > 0 and g_msgs + 1 > global_msg_cap)
         )
+        # Window boundaries roll over either way, even when dropping this
+        # message — otherwise a window that opened before a cap was ever hit
+        # could never advance past its 1s mark while messages keep getting
+        # dropped, wedging the topic permanently. Only the running totals
+        # skip the increment when the message is actually dropped.
+        if over_budget:
+            self._topic_byte_bucket[topic_name] = (t_start, t_bytes)
+            self._global_topic_data_bucket = (g_start, g_bytes, g_msgs)
+        else:
+            self._topic_byte_bucket[topic_name] = (t_start, t_bytes + size)
+            self._global_topic_data_bucket = (g_start, g_bytes + size, g_msgs + 1)
+        return over_budget
 
     def _publish_topic_rates(self):
         """Periodic 1Hz timer callback — recomputes every subscribed topic's
@@ -2863,24 +2958,50 @@ class WebBridge(Node):
 
         self._bt_mode = bt_mode
 
-        # bag_output_dir / graph_debounce_interval / topic_data_rate_hz:
-        # every consumer already calls self.get_parameter(...) fresh at time
-        # of use (a plain path string re-read on each bag list/download/
-        # record; a plain float re-read into a brand-new threading.Timer on
-        # every debounce trigger, not a fixed recurring ROS timer; a plain
-        # float re-read on every topic message in _on_topic_msg) — so
-        # there's nothing to construct or defer here, just update the
-        # underlying ROS param when overridden. Same all-or-nothing rule as
+        # bag_output_dir / graph_debounce_interval / topic_data_rate_hz /
+        # topic_data_max_bytes_per_sec / global_topic_data_max_bytes_per_sec /
+        # global_topic_data_max_msgs_per_sec: every consumer already calls
+        # self.get_parameter(...) fresh at time of use (a plain path string
+        # re-read on each bag list/download/record; a plain float re-read
+        # into a brand-new threading.Timer on every debounce trigger, not a
+        # fixed recurring ROS timer; a plain float re-read on every topic
+        # message in _on_topic_msg/_topic_data_over_budget) — so there's
+        # nothing to construct or defer here, just update the underlying ROS
+        # param when overridden. Same all-or-nothing rule as
         # _resolve_config_value: a yaml params file being present at all
         # (regardless of whether it sets these specific fields) means the
-        # cloud config is skipped for all three — the ROS param already
-        # holds the yaml-or-hardcoded value and is simply left untouched.
+        # cloud config is skipped for all six — the ROS param already holds
+        # the yaml-or-hardcoded value and is simply left untouched.
         if not self._param_overrides and 'bag_output_dir' in config:
             self.set_parameters([Parameter('bag_output_dir', Parameter.Type.STRING, str(config['bag_output_dir']))])
         if not self._param_overrides and 'graph_debounce_interval' in config:
             self.set_parameters([Parameter('graph_debounce_interval', Parameter.Type.DOUBLE, float(config['graph_debounce_interval']))])
         if not self._param_overrides and 'topic_data_rate_hz' in config:
             self.set_parameters([Parameter('topic_data_rate_hz', Parameter.Type.DOUBLE, float(config['topic_data_rate_hz']))])
+        if not self._param_overrides and 'topic_data_max_bytes_per_sec' in config:
+            self.set_parameters([Parameter('topic_data_max_bytes_per_sec', Parameter.Type.DOUBLE, float(config['topic_data_max_bytes_per_sec']))])
+        if not self._param_overrides and 'global_topic_data_max_bytes_per_sec' in config:
+            self.set_parameters([Parameter('global_topic_data_max_bytes_per_sec', Parameter.Type.DOUBLE, float(config['global_topic_data_max_bytes_per_sec']))])
+        if not self._param_overrides and 'global_topic_data_max_msgs_per_sec' in config:
+            self.set_parameters([Parameter('global_topic_data_max_msgs_per_sec', Parameter.Type.DOUBLE, float(config['global_topic_data_max_msgs_per_sec']))])
+
+        # topic_limits: per-topic {rate_hz, max_bytes_per_sec} overrides of
+        # the two topic_data_* defaults above (see _topic_limit_overrides,
+        # _on_topic_msg, _topic_data_over_budget). Not a set_parameters call
+        # like the six scalars above — ROS2 declared parameters are a flat,
+        # known-in-advance namespace, a poor fit for a dynamic topic-name-
+        # keyed map — so this is plain instance state instead, consulted
+        # fresh on every topic message exactly like the scalar params are.
+        # Same all-or-nothing yaml-override rule: a params-file run clears
+        # it rather than leaving stale overrides from a previous cloud push.
+        with self._topic_limit_lock:
+            if self._param_overrides:
+                self._topic_limit_overrides = {}
+            elif 'topic_limits' in config:
+                self._topic_limit_overrides = dict(config['topic_limits'] or {})
+            # Snapshot for the resolved_agent_config ground-truth send below —
+            # taken under the same lock rather than re-read there unguarded.
+            _topic_limits_snapshot = dict(self._topic_limit_overrides)
 
         self.get_logger().info(
             f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}, '
@@ -2929,6 +3050,10 @@ class WebBridge(Node):
                 'bag_output_dir': self.get_parameter('bag_output_dir').get_parameter_value().string_value,
                 'graph_debounce_interval': self.get_parameter('graph_debounce_interval').get_parameter_value().double_value,
                 'topic_data_rate_hz': self.get_parameter('topic_data_rate_hz').get_parameter_value().double_value,
+                'topic_data_max_bytes_per_sec': self.get_parameter('topic_data_max_bytes_per_sec').get_parameter_value().double_value,
+                'global_topic_data_max_bytes_per_sec': self.get_parameter('global_topic_data_max_bytes_per_sec').get_parameter_value().double_value,
+                'global_topic_data_max_msgs_per_sec': self.get_parameter('global_topic_data_max_msgs_per_sec').get_parameter_value().double_value,
+                'topic_limits': _topic_limits_snapshot,
             },
             'timestamp': time.time(),
         })
