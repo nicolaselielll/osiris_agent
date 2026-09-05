@@ -3182,10 +3182,25 @@ class WebBridge(Node):
             # taken under the same lock rather than re-read there unguarded.
             _topic_limits_snapshot = dict(self._topic_limit_overrides)
 
+        # Deliberately includes every topic_data/image field, not just the
+        # five original toggles above — this line predated the bandwidth-cap
+        # and JPEG re-encode work and was never extended, so a live push that
+        # only touched e.g. image_jpeg_quality logged nothing to distinguish
+        # it from a no-op call. Same silent-config smell _rate_throttle_drop_logged
+        # / _budget_drop_logged were added for; read fresh off the ROS params
+        # (not local vars) so this is accurate regardless of which fields this
+        # particular call actually touched.
         self.get_logger().info(
             f'Applied agent_config: telemetry_enabled={self._telemetry_enabled}, '
             f'tf_tree_enabled={tf_tree_enabled}, goals_enabled={goals_enabled}, '
-            f'params_enabled={params_enabled}, bt_mode={bt_mode}'
+            f'params_enabled={params_enabled}, bt_mode={bt_mode}, '
+            f'topic_data_rate_hz={self.get_parameter("topic_data_rate_hz").get_parameter_value().double_value:.1f}, '
+            f'topic_data_max_bytes_per_sec={self.get_parameter("topic_data_max_bytes_per_sec").get_parameter_value().double_value:.0f}, '
+            f'global_topic_data_max_bytes_per_sec={self.get_parameter("global_topic_data_max_bytes_per_sec").get_parameter_value().double_value:.0f}, '
+            f'global_topic_data_max_msgs_per_sec={self.get_parameter("global_topic_data_max_msgs_per_sec").get_parameter_value().double_value:.0f}, '
+            f'image_jpeg_quality={self.get_parameter("image_jpeg_quality").get_parameter_value().integer_value}, '
+            f'image_max_dimension={self.get_parameter("image_max_dimension").get_parameter_value().integer_value}, '
+            f'topic_limits={_topic_limits_snapshot}'
         )
 
         # Ground truth for the client: what this agent is ACTUALLY running
