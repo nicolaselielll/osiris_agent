@@ -293,6 +293,16 @@ class WebBridge(Node):
         # rate only updates when a new message arrives, so it freezes at its last
         # value instead of decaying toward zero once a topic goes quiet.
         self._topic_rate_timestamps: dict[str, deque] = {}
+        # Same idea as _topic_rate_timestamps, (ts, size) pairs instead of
+        # bare timestamps - the bytes/sec counterpart shown next to rate_hz
+        # in the UI (see _publish_topic_rates). Deliberately separate from
+        # _topic_byte_bucket below: that one is a 1s enforcement bucket that
+        # resets on a hard boundary (fine for a threshold check, useless for
+        # display - read at the wrong instant it'd show a stale zero right
+        # after a reset even at full rate). Same lock/window as
+        # _topic_rate_timestamps since both only ever feed that one
+        # 1Hz report.
+        self._topic_byte_timestamps: dict[str, deque] = {}
         self._topic_rate_lock = threading.Lock()
         self._RATE_WINDOW_S = 5.0
         # Last-forwarded time per topic, used to cap how often topic_data
@@ -2093,6 +2103,14 @@ class WebBridge(Node):
         granularity above and much cheaper than tracking individual message
         timestamps per topic.
         """
+        # Recorded unconditionally, before any cap is even read - same
+        # "measure the real thing, not what Osiris decided to let through"
+        # reasoning as _topic_rate_timestamps in _on_topic_msg. A topic
+        # capped hard enough to drop every message would otherwise report
+        # 0 B/s, hiding exactly the number someone raising that cap needs.
+        with self._topic_rate_lock:
+            self._topic_byte_timestamps.setdefault(topic_name, deque()).append((ts, size))
+
         topic_cap = override.get('max_bytes_per_sec')
         if topic_cap is None:
             topic_cap = self.get_parameter('topic_data_max_bytes_per_sec').get_parameter_value().double_value
@@ -2186,10 +2204,11 @@ class WebBridge(Node):
 
     def _publish_topic_rates(self):
         """Periodic 1Hz timer callback — recomputes every subscribed topic's
-        rate_hz from a rolling window of receipt timestamps and pushes it as its
-        own message, independent of whether that topic published anything this
-        tick. This is what makes a quiet topic's rate correctly decay to 0
-        instead of freezing at its last computed value."""
+        rate_hz and bytes/sec from rolling windows of receipt timestamps/sizes
+        and pushes them as one message, independent of whether that topic
+        published anything this tick. This is what makes a quiet topic's
+        numbers correctly decay to 0 instead of freezing at their last
+        computed value."""
         if not self.ws or not self.loop:
             return
 
@@ -2199,6 +2218,7 @@ class WebBridge(Node):
         now = time.time()
         cutoff = now - self._RATE_WINDOW_S
         rates = {}
+        byte_rates = {}
         with self._topic_rate_lock:
             for topic in subscribed:
                 buf = self._topic_rate_timestamps.get(topic)
@@ -2208,14 +2228,25 @@ class WebBridge(Node):
                     rates[topic] = round(len(buf) / self._RATE_WINDOW_S, 2)
                 else:
                     rates[topic] = 0.0
-            # Drop buffers for topics no longer subscribed so this dict doesn't
+
+                byte_buf = self._topic_byte_timestamps.get(topic)
+                if byte_buf:
+                    while byte_buf and byte_buf[0][0] < cutoff:
+                        byte_buf.popleft()
+                    byte_rates[topic] = round(sum(size for _, size in byte_buf) / self._RATE_WINDOW_S, 1)
+                else:
+                    byte_rates[topic] = 0.0
+            # Drop buffers for topics no longer subscribed so these dicts don't
             # grow unbounded across repeated subscribe/unsubscribe cycles.
             for stale in set(self._topic_rate_timestamps) - set(subscribed):
                 del self._topic_rate_timestamps[stale]
+            for stale in set(self._topic_byte_timestamps) - set(subscribed):
+                del self._topic_byte_timestamps[stale]
 
         self._enqueue({
             'type': 'topic_rates',
             'rates': rates,
+            'byte_rates': byte_rates,
             'timestamp': now,
         })
 
