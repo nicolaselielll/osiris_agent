@@ -38,6 +38,7 @@ setup(
         'psutil',
         'pyzmq',
         'msgpack',
+        'Pillow',
     ],
     extras_require={
         'ros': ['rclpy'],

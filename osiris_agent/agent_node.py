@@ -1,5 +1,6 @@
 import asyncio
 import http.client
+import io
 import math
 import os
 import platform
@@ -18,6 +19,19 @@ from pathlib import Path
 import psutil
 import rclpy
 import websockets
+
+# Pillow re-encodes raw sensor_msgs/Image frames to JPEG before they hit the
+# binary-framing path (see _reencode_image_jpeg) - a real install_requires
+# dependency (setup.py), but imported defensively rather than unconditionally:
+# an agent updated via `git pull` without a matching `pip install -e .` would
+# otherwise hard-crash at startup over what's really just a bandwidth nicety.
+# Missing Pillow just means Image topics keep sending raw pixel bytes, same
+# as before this feature existed.
+try:
+    from PIL import Image as PILImage
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
 import json
 
 from rcl_interfaces.msg import ParameterEvent
@@ -77,6 +91,22 @@ BINARY_PAYLOAD_TYPES = {
 # whether those bytes are int8 (two's-complement, e.g. OccupancyGrid's -1
 # "unknown" cells) or plain uint8.
 BINARY_MARKER_KEY = '__osiris_binary__'
+
+# sensor_msgs/Image encodings _reencode_image_jpeg knows how to decode -
+# (PIL mode, PIL raw-decoder rawmode) pairs. PIL's 'raw' decoder accepts
+# rawmode directly as e.g. 'BGR'/'BGRA' and does the channel reorder itself,
+# so bgr8/bgra8 (by far the most common OpenCV-sourced encodings) need no
+# manual byte-swapping - just the right rawmode string. Depth encodings
+# (16UC1, 32FC1, ...) and bayer/YUV formats aren't listed; those topics keep
+# sending raw bytes exactly as before this feature existed.
+IMAGE_ENCODING_PIL_MODES = {
+    'rgb8':  ('RGB', 'RGB'),
+    'bgr8':  ('RGB', 'BGR'),
+    'mono8': ('L', 'L'),
+    'rgba8': ('RGBA', 'RGBA'),
+    'bgra8': ('RGBA', 'BGRA'),
+}
+_IMAGE_ENCODING_CHANNELS = {'L': 1, 'RGB': 3, 'BGR': 3, 'RGBA': 4, 'BGRA': 4}
 
 # Services to suppress from graph output (internal ROS2 plumbing)
 _SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
@@ -223,6 +253,18 @@ class WebBridge(Node):
         # busy. Both 0 = unlimited. See _topic_data_over_budget.
         self.declare_parameter('global_topic_data_max_bytes_per_sec', 0.0)
         self.declare_parameter('global_topic_data_max_msgs_per_sec',  0.0)
+        # sensor_msgs/Image only (CompressedImage is already compressed by
+        # the camera driver, left untouched) - re-encoded to JPEG before
+        # binary framing, see _reencode_image_jpeg. Unlike the caps above,
+        # these default ON rather than to a disabled/0 state: raw
+        # uncompressed pixel bytes are close to worst case for a live feed,
+        # so a sane default (unlike an opt-in cap) makes the agent better
+        # out of the box, not just capable of being tuned. Same default-
+        # with-per-topic-override relationship as topic_data_rate_hz - an
+        # override in self._topic_limit_overrides ('jpeg_quality'/
+        # 'max_dimension') takes precedence per topic.
+        self.declare_parameter('image_jpeg_quality', 70)     # 1-95, JPEG quality
+        self.declare_parameter('image_max_dimension', 640)   # long edge, px; 0 = never resize
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -275,6 +317,11 @@ class WebBridge(Node):
         # _topic_subs_lock guarding _topic_msg_types).
         self._topic_limit_overrides: dict[str, dict] = {}
         self._topic_limit_lock = threading.Lock()
+        # Topics whose Image encoding _reencode_image_jpeg doesn't recognize
+        # (a depth/bayer/YUV camera, say) - warned once per topic rather than
+        # once per frame, since the encoding is a fixed property of the
+        # topic and will never suddenly become supported mid-stream.
+        self._image_reencode_unsupported_warned: set[str] = set()
 
         # ── Existence caches (set of fully-qualified names) ───────────────────
         self._active_nodes:    set[str] = set()
@@ -1940,9 +1987,36 @@ class WebBridge(Node):
             # what the gateway's Int8Array/Uint8Array reinterprets on the way
             # back using the 'signed' flag below.
             payload = bytes(b & 0xFF for b in raw)
+
+            # Image only (CompressedImage is already compressed by the
+            # camera driver) - re-encode to JPEG before the budget check
+            # below, so the cap is enforced against the actual bytes going
+            # out, not the raw pixel size this replaces. Falls through with
+            # the original raw payload untouched if Pillow isn't installed,
+            # the encoding isn't one this recognizes, or the buffer doesn't
+            # match the declared dimensions.
+            image_marker_extra = None
+            if msg_type == 'sensor_msgs/msg/Image':
+                quality = override.get('jpeg_quality')
+                if quality is None:
+                    quality = self.get_parameter('image_jpeg_quality').get_parameter_value().integer_value
+                max_dimension = override.get('max_dimension')
+                if max_dimension is None:
+                    max_dimension = self.get_parameter('image_max_dimension').get_parameter_value().integer_value
+                reencoded = self._reencode_image_jpeg(
+                    payload, data.get('width'), data.get('height'), data.get('encoding'),
+                    quality, max_dimension, topic_name,
+                )
+                if reencoded is not None:
+                    payload, out_width, out_height = reencoded
+                    image_marker_extra = {'format': 'jpeg', 'width': out_width, 'height': out_height}
+
             if self._topic_data_over_budget(topic_name, len(payload), ts, override):
                 return
-            data[BINARY_PAYLOAD_FIELD] = {BINARY_MARKER_KEY: {'len': len(payload), 'signed': signed}}
+            marker = {'len': len(payload), 'signed': signed}
+            if image_marker_extra is not None:
+                marker.update(image_marker_extra)
+            data[BINARY_PAYLOAD_FIELD] = {BINARY_MARKER_KEY: marker}
             self._enqueue_binary_topic_data({
                 'type': 'topic_data',
                 'topic': topic_name,
@@ -2009,6 +2083,54 @@ class WebBridge(Node):
             self._topic_byte_bucket[topic_name] = (t_start, t_bytes + size)
             self._global_topic_data_bucket = (g_start, g_bytes + size, g_msgs + 1)
         return over_budget
+
+    def _reencode_image_jpeg(self, raw: bytes, width, height, encoding, quality, max_dimension, topic_name: str):
+        """Re-encodes a raw sensor_msgs/Image byte buffer to JPEG via Pillow
+        - a raw rgb8/bgr8 frame is close to the worst case possible per byte
+        actually sent, so this is the real bandwidth win for a live camera
+        feed (the binary framing above just removes JSON's own encoding
+        overhead, it doesn't touch the pixel data's size at all).
+
+        Returns (jpeg_bytes, out_width, out_height) on success, None if
+        Pillow isn't installed, the encoding isn't one of the common ones in
+        IMAGE_ENCODING_PIL_MODES (a depth/bayer/YUV camera), or the buffer's
+        length doesn't match what width/height/encoding declare (a corrupt
+        or partial frame) - callers fall back to sending the original raw
+        bytes exactly as before this feature existed. Never raises; a
+        genuine encode failure is caught and treated the same as an
+        unsupported encoding.
+        """
+        if not _PIL_AVAILABLE or not width or not height:
+            return None
+        modes = IMAGE_ENCODING_PIL_MODES.get(encoding)
+        if modes is None:
+            if topic_name not in self._image_reencode_unsupported_warned:
+                self._image_reencode_unsupported_warned.add(topic_name)
+                self.get_logger().info(
+                    f"[image] {topic_name}: encoding '{encoding}' not supported for JPEG "
+                    f"re-encode, sending raw pixel bytes"
+                )
+            return None
+        pil_mode, raw_mode = modes
+        expected_len = width * height * _IMAGE_ENCODING_CHANNELS[raw_mode]
+        if len(raw) != expected_len:
+            return None
+        try:
+            img = PILImage.frombuffer(pil_mode, (width, height), raw, 'raw', raw_mode, 0, 1)
+            if pil_mode == 'RGBA':
+                # JPEG has no alpha channel - drop it rather than fail the
+                # whole re-encode over a channel nothing downstream reads yet.
+                img = img.convert('RGB')
+            if max_dimension and max(img.width, img.height) > max_dimension:
+                scale = max_dimension / max(img.width, img.height)
+                new_size = (max(1, round(img.width * scale)), max(1, round(img.height * scale)))
+                img = img.resize(new_size, PILImage.BILINEAR)
+            buf = io.BytesIO()
+            img.save(buf, format='JPEG', quality=quality)
+            return buf.getvalue(), img.width, img.height
+        except Exception as e:
+            self.get_logger().warning(f'[image] {topic_name}: JPEG re-encode failed: {e}')
+            return None
 
     def _publish_topic_rates(self):
         """Periodic 1Hz timer callback — recomputes every subscribed topic's
@@ -2960,17 +3082,18 @@ class WebBridge(Node):
 
         # bag_output_dir / graph_debounce_interval / topic_data_rate_hz /
         # topic_data_max_bytes_per_sec / global_topic_data_max_bytes_per_sec /
-        # global_topic_data_max_msgs_per_sec: every consumer already calls
+        # global_topic_data_max_msgs_per_sec / image_jpeg_quality /
+        # image_max_dimension: every consumer already calls
         # self.get_parameter(...) fresh at time of use (a plain path string
         # re-read on each bag list/download/record; a plain float re-read
         # into a brand-new threading.Timer on every debounce trigger, not a
-        # fixed recurring ROS timer; a plain float re-read on every topic
+        # fixed recurring ROS timer; a plain float/int re-read on every topic
         # message in _on_topic_msg/_topic_data_over_budget) — so there's
         # nothing to construct or defer here, just update the underlying ROS
         # param when overridden. Same all-or-nothing rule as
         # _resolve_config_value: a yaml params file being present at all
         # (regardless of whether it sets these specific fields) means the
-        # cloud config is skipped for all six — the ROS param already holds
+        # cloud config is skipped for all eight — the ROS param already holds
         # the yaml-or-hardcoded value and is simply left untouched.
         if not self._param_overrides and 'bag_output_dir' in config:
             self.set_parameters([Parameter('bag_output_dir', Parameter.Type.STRING, str(config['bag_output_dir']))])
@@ -2984,6 +3107,10 @@ class WebBridge(Node):
             self.set_parameters([Parameter('global_topic_data_max_bytes_per_sec', Parameter.Type.DOUBLE, float(config['global_topic_data_max_bytes_per_sec']))])
         if not self._param_overrides and 'global_topic_data_max_msgs_per_sec' in config:
             self.set_parameters([Parameter('global_topic_data_max_msgs_per_sec', Parameter.Type.DOUBLE, float(config['global_topic_data_max_msgs_per_sec']))])
+        if not self._param_overrides and 'image_jpeg_quality' in config:
+            self.set_parameters([Parameter('image_jpeg_quality', Parameter.Type.INTEGER, int(config['image_jpeg_quality']))])
+        if not self._param_overrides and 'image_max_dimension' in config:
+            self.set_parameters([Parameter('image_max_dimension', Parameter.Type.INTEGER, int(config['image_max_dimension']))])
 
         # topic_limits: per-topic {rate_hz, max_bytes_per_sec} overrides of
         # the two topic_data_* defaults above (see _topic_limit_overrides,
@@ -3053,6 +3180,8 @@ class WebBridge(Node):
                 'topic_data_max_bytes_per_sec': self.get_parameter('topic_data_max_bytes_per_sec').get_parameter_value().double_value,
                 'global_topic_data_max_bytes_per_sec': self.get_parameter('global_topic_data_max_bytes_per_sec').get_parameter_value().double_value,
                 'global_topic_data_max_msgs_per_sec': self.get_parameter('global_topic_data_max_msgs_per_sec').get_parameter_value().double_value,
+                'image_jpeg_quality': self.get_parameter('image_jpeg_quality').get_parameter_value().integer_value,
+                'image_max_dimension': self.get_parameter('image_max_dimension').get_parameter_value().integer_value,
                 'topic_limits': _topic_limits_snapshot,
             },
             'timestamp': time.time(),
