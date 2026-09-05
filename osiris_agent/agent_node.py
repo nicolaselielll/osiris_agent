@@ -322,6 +322,17 @@ class WebBridge(Node):
         # once per frame, since the encoding is a fixed property of the
         # topic and will never suddenly become supported mid-stream.
         self._image_reencode_unsupported_warned: set[str] = set()
+        # topic -> last time _topic_data_over_budget logged a drop for it,
+        # throttled to once per 5s per topic rather than once per dropped
+        # frame (which, under a tight budget, could be every single frame).
+        self._budget_drop_logged: dict[str, float] = {}
+        # Same idea, for the Hz throttle in _on_topic_msg below - a topic
+        # forwarding far below its real publish rate with nothing in the log
+        # explaining why is exactly what made a low topic_data_rate_hz/
+        # per-topic rate_hz override (agent_config, possibly set weeks ago
+        # for a since-forgotten reason) hard to tell apart from a genuine
+        # processing bottleneck or a slow source.
+        self._rate_throttle_drop_logged: dict[str, float] = {}
 
         # ── Existence caches (set of fully-qualified names) ───────────────────
         self._active_nodes:    set[str] = set()
@@ -1977,6 +1988,10 @@ class WebBridge(Node):
         if rate_hz is None:
             rate_hz = self.get_parameter('topic_data_rate_hz').get_parameter_value().double_value
         if rate_hz > 0 and ts - self._topic_data_throttle.get(topic_name, 0.0) < 1.0 / rate_hz:
+            if ts - self._rate_throttle_drop_logged.get(topic_name, 0.0) >= 5.0:
+                self._rate_throttle_drop_logged[topic_name] = ts
+                source = 'per-topic override' if override.get('rate_hz') is not None else 'topic_data_rate_hz default'
+                self.get_logger().warning(f'[topic_data] {topic_name}: Hz-throttled to {rate_hz:.2f} Hz ({source})')
             return
         self._topic_data_throttle[topic_name] = ts
 
@@ -2092,11 +2107,22 @@ class WebBridge(Node):
         if ts - g_start >= 1.0:
             g_start, g_bytes, g_msgs = ts, 0, 0
 
-        over_budget = (
-            (topic_cap > 0 and t_bytes + size > topic_cap) or
-            (global_byte_cap > 0 and g_bytes + size > global_byte_cap) or
-            (global_msg_cap > 0 and g_msgs + 1 > global_msg_cap)
-        )
+        # Which specific cap tripped, if any - not just a bool. A silent
+        # bool here was exactly what made an unexpectedly-low forwarded rate
+        # (a topic capped far below its real publish rate, with nothing in
+        # the log explaining why) hard to tell apart from a genuinely slow
+        # source, a Hz-throttle, or a processing bottleneck elsewhere.
+        reason = None
+        if topic_cap > 0 and t_bytes + size > topic_cap:
+            reason = f'topic byte budget ({t_bytes + size:.0f}/{topic_cap:.0f} B/s)'
+        elif global_byte_cap > 0 and g_bytes + size > global_byte_cap:
+            reason = f'global byte budget ({g_bytes + size:.0f}/{global_byte_cap:.0f} B/s)'
+        elif global_msg_cap > 0 and g_msgs + 1 > global_msg_cap:
+            reason = f'global msg-rate budget ({g_msgs + 1:.0f}/{global_msg_cap:.0f} msg/s)'
+        over_budget = reason is not None
+        if over_budget and ts - self._budget_drop_logged.get(topic_name, 0.0) >= 5.0:
+            self._budget_drop_logged[topic_name] = ts
+            self.get_logger().warning(f'[topic_data] {topic_name}: dropping ({size} bytes) - over {reason}')
         # Window boundaries roll over either way, even when dropping this
         # message — otherwise a window that opened before a cap was ever hit
         # could never advance past its 1s mark while messages keep getting
