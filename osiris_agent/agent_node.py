@@ -2001,13 +2001,14 @@ class WebBridge(Node):
             # back using the 'signed' flag below.
             payload = bytes(b & 0xFF for b in raw)
 
-            # Image only (CompressedImage is already compressed by the
-            # camera driver) - re-encode to JPEG before the budget check
-            # below, so the cap is enforced against the actual bytes going
-            # out, not the raw pixel size this replaces. Falls through with
-            # the original raw payload untouched if Pillow isn't installed,
-            # the encoding isn't one this recognizes, or the buffer doesn't
-            # match the declared dimensions.
+            # Image: re-encode to JPEG before the budget check below, so the
+            # cap is enforced against the actual bytes going out, not the raw
+            # pixel size this replaces. Falls through with the original raw
+            # payload untouched if Pillow isn't installed, the encoding isn't
+            # one this recognizes, or the buffer doesn't match the declared
+            # dimensions. CompressedImage: already compressed by the camera
+            # driver, nothing to re-encode, just marked the same way (see
+            # the elif below) for the gateway's benefit.
             image_marker_extra = None
             if msg_type == 'sensor_msgs/msg/Image':
                 quality = override.get('jpeg_quality')
@@ -2023,6 +2024,18 @@ class WebBridge(Node):
                 if reencoded is not None:
                     payload, out_width, out_height = reencoded
                     image_marker_extra = {'format': 'jpeg', 'width': out_width, 'height': out_height}
+            elif msg_type == 'sensor_msgs/msg/CompressedImage':
+                # Already compressed by the driver - nothing to re-encode,
+                # just marked the same way a re-encoded Image is so the
+                # gateway relays it as base64 instead of reconstructing a
+                # JSON array of decimal ints (see index.js's isBinary
+                # handler) - the same win Image gets, for the same reason
+                # (it's already-compressed opaque bytes, not raw pixels a
+                # future consumer would index into numerically). No
+                # width/height here - CompressedImage's own ROS message
+                # doesn't carry them, they're implicit in the compressed
+                # bytes themselves.
+                image_marker_extra = {'format': data.get('format') or 'unknown'}
 
             if self._topic_data_over_budget(topic_name, len(payload), ts, override):
                 return
