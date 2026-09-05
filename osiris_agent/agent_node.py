@@ -635,7 +635,20 @@ class WebBridge(Node):
                 continue
             msg_type = data.get('type')
             if msg_type == 'agent_config':
-                self._apply_agent_config(data.get('config') or {})
+                # _apply_agent_config does an int()/float() conversion per
+                # field with nothing catching a malformed one (a corrupted
+                # Firestore doc, say) - left uncaught, that exception would
+                # propagate out of this whole loop and be treated as a
+                # WebSocket error by _client_loop_with_reconnect, tearing
+                # down and reconnecting the entire connection over what
+                # should be a one-field problem. Caught here instead: this
+                # one push is dropped (the agent keeps whatever config it
+                # already had), the connection and everything else on it
+                # keeps running.
+                try:
+                    self._apply_agent_config(data.get('config') or {})
+                except Exception as e:
+                    self.get_logger().error(f'Failed to apply agent_config: {e}')
             elif msg_type == 'subscribe':
                 topic = data.get('topic')
                 if topic:
