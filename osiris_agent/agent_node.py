@@ -1692,9 +1692,65 @@ class WebBridge(Node):
         )
 
     def _send_topic_live_snapshot_result(self, request_id: str, topic_name: str, msg):
+        """Sends a one-shot capture's result. Binary-payload types (Image/
+        CompressedImage/PointCloud2/OccupancyGrid) get the same treatment
+        _on_topic_msg gives the continuous topic_data stream - a raw pixel/
+        point byte array as a JSON array of decimal ints is exactly the
+        3-6x-inflated waste here it would be there, and for Image
+        specifically a giant int array isn't something a vision model can
+        even look at; it needs to actually be a JPEG (get_camera_snapshot's
+        whole reason for existing). Deliberately no budget check here - a
+        one-shot capture isn't part of the rate/byte-budget system that
+        governs the continuous stream, and shouldn't be silently dropped by
+        a cap that has nothing to do with this specific request. Type is
+        re-resolved fresh (this topic was never added to _topic_msg_types -
+        that's populated by the continuous, gateway-requested subscription
+        path only) via the same lookup _start_one_shot_capture itself uses.
+        """
         if not self.loop:
             return
-        data = self._json_safe_deep(message_to_ordereddict(msg))
+        data = message_to_ordereddict(msg)
+
+        types = dict(self.get_topic_names_and_types()).get(topic_name)
+        msg_type = types[0] if types else None
+        signed = BINARY_PAYLOAD_TYPES.get(msg_type)
+        raw = data.get(BINARY_PAYLOAD_FIELD) if signed is not None else None
+        if raw is not None:
+            payload_bytes = bytes(b & 0xFF for b in raw)
+            image_marker_extra = None
+            if msg_type == 'sensor_msgs/msg/Image':
+                quality = self.get_parameter('image_jpeg_quality').get_parameter_value().integer_value
+                max_dimension = self.get_parameter('image_max_dimension').get_parameter_value().integer_value
+                reencoded = self._reencode_image_jpeg(
+                    payload_bytes, data.get('width'), data.get('height'), data.get('encoding'),
+                    quality, max_dimension, topic_name,
+                )
+                if reencoded is not None:
+                    payload_bytes, out_width, out_height = reencoded
+                    image_marker_extra = {'format': 'jpeg', 'width': out_width, 'height': out_height}
+            elif msg_type == 'sensor_msgs/msg/CompressedImage':
+                image_marker_extra = {'format': data.get('format') or 'unknown'}
+
+            marker = {'len': len(payload_bytes), 'signed': signed}
+            if image_marker_extra is not None:
+                marker.update(image_marker_extra)
+            # Replace the (potentially huge) raw array with the small marker
+            # dict BEFORE the recursive NaN-scrub below, not after - no
+            # reason to walk hundreds of thousands of already-extracted ints
+            # a second time.
+            data[BINARY_PAYLOAD_FIELD] = {BINARY_MARKER_KEY: marker}
+            data = self._json_safe_deep(data)
+            header = {
+                'type': 'topic_live_snapshot_result',
+                'request_id': request_id,
+                'topic': topic_name,
+                'data': data,
+                'timestamp': time.time(),
+            }
+            self._enqueue_binary_topic_data(header, payload_bytes)
+            return
+
+        data = self._json_safe_deep(data)
         payload = {
             'type': 'topic_live_snapshot_result',
             'request_id': request_id,
