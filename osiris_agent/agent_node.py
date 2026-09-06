@@ -304,6 +304,19 @@ class WebBridge(Node):
         # _topic_rate_timestamps since both only ever feed that one
         # 1Hz report.
         self._topic_byte_timestamps: dict[str, deque] = {}
+        # Same two rolling windows again, but recorded only for a message
+        # that actually gets sent (see _topic_data_over_budget's own
+        # not-over-budget branch, the one place both the Hz throttle above
+        # and the byte budget have already been survived) - the "what's
+        # really going out" counterpart to _topic_rate_timestamps/
+        # _topic_byte_timestamps above, which measure demand before either
+        # gate. Shown in the UI as "source -> delivered" instead of
+        # "source -> configured limit", since delivered can genuinely sit
+        # anywhere under a byte cap depending on how frames happen to size
+        # that second - a hardcoded target was never an honest answer to
+        # "what's actually arriving".
+        self._topic_delivered_rate_timestamps: dict[str, deque] = {}
+        self._topic_delivered_byte_timestamps: dict[str, deque] = {}
         self._topic_rate_lock = threading.Lock()
         self._RATE_WINDOW_S = 5.0
         # Last-forwarded time per topic, used to cap how often topic_data
@@ -2288,6 +2301,16 @@ class WebBridge(Node):
         else:
             self._topic_byte_bucket[topic_name] = (t_start, t_bytes + size)
             self._global_topic_data_bucket = (g_start, g_bytes + size, g_msgs + 1)
+            # This message is actually being sent - the one point that's
+            # true for every topic_data message, binary or plain JSON,
+            # regardless of which of the two callers above got here. A
+            # message dropped by the Hz throttle earlier in _on_topic_msg
+            # never reaches this function at all, so recording only here
+            # already accounts for both gates without checking either
+            # explicitly.
+            with self._topic_rate_lock:
+                self._topic_delivered_rate_timestamps.setdefault(topic_name, deque()).append(ts)
+                self._topic_delivered_byte_timestamps.setdefault(topic_name, deque()).append((ts, size))
         return over_budget
 
     def _reencode_image_jpeg(self, raw: bytes, width, height, encoding, quality, max_dimension, topic_name: str):
@@ -2340,11 +2363,13 @@ class WebBridge(Node):
 
     def _publish_topic_rates(self):
         """Periodic 1Hz timer callback — recomputes every subscribed topic's
-        rate_hz and bytes/sec from rolling windows of receipt timestamps/sizes
-        and pushes them as one message, independent of whether that topic
-        published anything this tick. This is what makes a quiet topic's
-        numbers correctly decay to 0 instead of freezing at their last
-        computed value."""
+        rate_hz/bytes_per_sec (demand: sampled on receipt, before the Hz
+        throttle or byte budget get a say) and delivered_rate/delivered_bytes
+        (reality: sampled only for a message that actually got sent, see
+        _topic_data_over_budget) from rolling windows, and pushes all four as
+        one message - independent of whether that topic published anything
+        this tick, which is what makes a quiet topic's numbers correctly
+        decay to 0 instead of freezing at their last computed value."""
         if not self.ws or not self.loop:
             return
 
@@ -2353,36 +2378,48 @@ class WebBridge(Node):
 
         now = time.time()
         cutoff = now - self._RATE_WINDOW_S
+
+        def _drain(buckets: dict, topic: str, is_pair: bool):
+            """Shared cutoff/average logic for all four rolling windows below
+            - rates/byte_rates (demand, before either gate) and
+            delivered_rates/delivered_byte_rates (after both gates) all have
+            the exact same shape, just fed from a different timestamp buffer."""
+            buf = buckets.get(topic)
+            if not buf:
+                return 0.0
+            if is_pair:
+                while buf and buf[0][0] < cutoff:
+                    buf.popleft()
+                return round(sum(size for _, size in buf) / self._RATE_WINDOW_S, 1)
+            while buf and buf[0] < cutoff:
+                buf.popleft()
+            return round(len(buf) / self._RATE_WINDOW_S, 2)
+
         rates = {}
         byte_rates = {}
+        delivered_rates = {}
+        delivered_byte_rates = {}
         with self._topic_rate_lock:
             for topic in subscribed:
-                buf = self._topic_rate_timestamps.get(topic)
-                if buf:
-                    while buf and buf[0] < cutoff:
-                        buf.popleft()
-                    rates[topic] = round(len(buf) / self._RATE_WINDOW_S, 2)
-                else:
-                    rates[topic] = 0.0
-
-                byte_buf = self._topic_byte_timestamps.get(topic)
-                if byte_buf:
-                    while byte_buf and byte_buf[0][0] < cutoff:
-                        byte_buf.popleft()
-                    byte_rates[topic] = round(sum(size for _, size in byte_buf) / self._RATE_WINDOW_S, 1)
-                else:
-                    byte_rates[topic] = 0.0
+                rates[topic] = _drain(self._topic_rate_timestamps, topic, is_pair=False)
+                byte_rates[topic] = _drain(self._topic_byte_timestamps, topic, is_pair=True)
+                delivered_rates[topic] = _drain(self._topic_delivered_rate_timestamps, topic, is_pair=False)
+                delivered_byte_rates[topic] = _drain(self._topic_delivered_byte_timestamps, topic, is_pair=True)
             # Drop buffers for topics no longer subscribed so these dicts don't
             # grow unbounded across repeated subscribe/unsubscribe cycles.
-            for stale in set(self._topic_rate_timestamps) - set(subscribed):
-                del self._topic_rate_timestamps[stale]
-            for stale in set(self._topic_byte_timestamps) - set(subscribed):
-                del self._topic_byte_timestamps[stale]
+            for bucket in (
+                self._topic_rate_timestamps, self._topic_byte_timestamps,
+                self._topic_delivered_rate_timestamps, self._topic_delivered_byte_timestamps,
+            ):
+                for stale in set(bucket) - set(subscribed):
+                    del bucket[stale]
 
         self._enqueue({
             'type': 'topic_rates',
             'rates': rates,
             'byte_rates': byte_rates,
+            'delivered_rates': delivered_rates,
+            'delivered_byte_rates': delivered_byte_rates,
             'timestamp': now,
         })
 
