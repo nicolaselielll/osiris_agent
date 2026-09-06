@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import http.client
 import io
 import math
@@ -1638,7 +1639,7 @@ class WebBridge(Node):
         for t in topics:
             self._start_one_shot_capture(
                 t,
-                on_message=lambda msg, t=t: resolve(t, True, {'data': self._json_safe_deep(message_to_ordereddict(msg))}),
+                on_message=lambda msg, t=t: resolve(t, True, {'data': self._encode_bundle_capture_data(t, msg)}),
                 on_timeout=lambda t=t: resolve(t, False, reason='timeout'),
                 on_not_found=lambda t=t: resolve(t, False, reason='topic_not_found'),
             )
@@ -1663,6 +1664,85 @@ class WebBridge(Node):
                 resolve('lidar_wall_fit', False, reason='topic_not_found')
 
             self._start_one_shot_capture(lidar_topic, _on_lidar_msg, _on_lidar_timeout, _on_lidar_not_found)
+
+    def _encode_bundle_capture_data(self, topic_name: str, msg) -> dict:
+        """Converts one bundle-captured message to a JSON-safe dict, with an
+        Image/CompressedImage frame embedded as an inline base64 string +
+        __osiris_binary__ marker (see _capture_image_as_base64) instead of a
+        giant array of decimal ints - the same problem
+        _send_topic_live_snapshot_result was fixed for (see its own
+        docstring), reached here by a different path since
+        _handle_bundle_capture_request builds each capture's data inline
+        rather than going through that function.
+
+        Deliberately NOT a separate binary WS frame the way the continuous
+        topic_data stream and the single-topic one-shot snapshot both do it
+        - a bundle joins several topics into ONE combined message, and the
+        existing protocol only pairs one pending binary frame per JSON
+        header (see the gateway's ws._pendingBinaryTopicData), so it has no
+        room for several at once without a real protocol extension. Base64
+        inline costs ~1.37x over raw bytes, same as the gateway's own
+        relay - irrelevant for an occasional labeled capture (max 10 topics,
+        never a 10Hz stream), so this is the pragmatic fix rather than
+        building multi-binary-frame support nothing else needs yet.
+
+        Only Image/CompressedImage get this treatment. PointCloud2/
+        OccupancyGrid are deliberately left alone: message_to_ordereddict
+        already gives their byte field as a plain int list, which is the
+        exact same shape a "fix" would produce anyway (unlike Image, there's
+        no compression step to gain anything from) - see
+        _capture_image_as_base64's own None return for these.
+        """
+        data = message_to_ordereddict(msg)
+        types = dict(self.get_topic_names_and_types()).get(topic_name)
+        msg_type = types[0] if types else None
+        encoded = self._capture_image_as_base64(topic_name, data, msg_type)
+        if encoded is not None:
+            base64_str, marker = encoded
+            data[BINARY_PAYLOAD_FIELD] = base64_str
+            data[BINARY_MARKER_KEY] = marker
+        return self._json_safe_deep(data)
+
+    def _capture_image_as_base64(self, topic_name: str, data: dict, msg_type: str):
+        """For an Image/CompressedImage message already run through
+        message_to_ordereddict, returns (base64_str, marker) - marker
+        shaped exactly like what a client already gets from the gateway's
+        own binary reconstruction (format/width/height/len/encoding), so
+        any existing consumer's `__osiris_binary__.encoding === 'base64'`
+        check (Camera.vue's isRenderable, get_camera_snapshot's own
+        renderability check) works identically regardless of which path
+        produced it. Returns None for any other type, or if an Image's
+        JPEG re-encode itself fails (unsupported encoding, corrupt frame,
+        Pillow unavailable) - callers leave `data` untouched in that case,
+        same fallback-to-raw behavior _on_topic_msg/_send_topic_live_snapshot_
+        result already have.
+
+        Uses the agent-wide default quality/dimension, same as
+        _send_topic_live_snapshot_result - a one-shot/bundle capture isn't
+        tied to a specific subscription's topic_limits override.
+        """
+        raw = data.get(BINARY_PAYLOAD_FIELD)
+        if raw is None:
+            return None
+        payload_bytes = bytes(b & 0xFF for b in raw)
+        if msg_type == 'sensor_msgs/msg/Image':
+            quality = self.get_parameter('image_jpeg_quality').get_parameter_value().integer_value
+            max_dimension = self.get_parameter('image_max_dimension').get_parameter_value().integer_value
+            reencoded = self._reencode_image_jpeg(
+                payload_bytes, data.get('width'), data.get('height'), data.get('encoding'),
+                quality, max_dimension, topic_name,
+            )
+            if reencoded is None:
+                return None
+            payload_bytes, out_width, out_height = reencoded
+            marker = {'format': 'jpeg', 'width': out_width, 'height': out_height}
+        elif msg_type == 'sensor_msgs/msg/CompressedImage':
+            marker = {'format': data.get('format') or 'unknown'}
+        else:
+            return None
+        marker['len'] = len(payload_bytes)
+        marker['encoding'] = 'base64'
+        return base64.b64encode(payload_bytes).decode('ascii'), marker
 
     def _send_bundle_capture_result(self, request_id: str, captures: dict):
         if not self.loop:
