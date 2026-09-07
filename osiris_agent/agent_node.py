@@ -1,5 +1,6 @@
 import asyncio
 import base64
+import copy
 import http.client
 import io
 import math
@@ -78,6 +79,15 @@ RECONNECT_MAX_DELAY        = 30    # seconds
 # uplink. All four types below happen to name the field 'data'; the field for
 # OccupancyGrid is int8 (needs sign-aware decoding on the way back, see
 # BINARY_MARKER_KEY), the other three are uint8.
+# Hard, non-overridable ceiling on pointcloud_max_points (see
+# _resolve_pointcloud_max_points) - a last-resort safety valve against a
+# typo or runaway driver, not a constraint on reasonable per-topic choices.
+# At ~16 bytes/point (xyz+intensity float32), 300k points is ~4.8MB/message
+# - at a real sensor's publish rate this is real sustained memory/bandwidth
+# pressure on the agent (a few MB/s adds up to a GB in seconds), so the
+# ceiling sits there rather than higher.
+POINTCLOUD_MAX_POINTS_HARD_CEILING = 300_000
+
 BINARY_PAYLOAD_FIELD = 'data'
 BINARY_PAYLOAD_TYPES = {
     'sensor_msgs/msg/Image':          False,  # uint8[]
@@ -108,6 +118,12 @@ IMAGE_ENCODING_PIL_MODES = {
     'bgra8': ('RGBA', 'BGRA'),
 }
 _IMAGE_ENCODING_CHANNELS = {'L': 1, 'RGB': 3, 'BGR': 3, 'RGBA': 4, 'BGRA': 4}
+
+# sensor_msgs/msg/PointField.datatype -> byte size. Fixed by the ROS message
+# definition itself (INT8=1 ... FLOAT64=8), not something a driver can
+# redefine, so this table never needs updating per-robot the way the image
+# encoding one above sometimes might.
+POINTFIELD_DATATYPE_SIZES = {1: 1, 2: 1, 3: 2, 4: 2, 5: 4, 6: 4, 7: 4, 8: 8}
 
 # Services to suppress from graph output (internal ROS2 plumbing)
 _SUPPRESSED_SERVICE_PREFIXES = ('/ros2cli_daemon',)
@@ -266,6 +282,15 @@ class WebBridge(Node):
         # 'max_dimension') takes precedence per topic.
         self.declare_parameter('image_jpeg_quality', 70)     # 1-95, JPEG quality
         self.declare_parameter('image_max_dimension', 640)   # long edge, px; 0 = never resize
+        # sensor_msgs/PointCloud2 only - see _downsample_pointcloud. Same
+        # default-on, default-with-per-topic-override shape as the image
+        # params above (topic_limits keys: 'pointcloud_max_points'/
+        # 'pointcloud_keep_intensity'/'pointcloud_keep_rgb'). Trims to xyz
+        # only and caps the point count by default to keep large point
+        # clouds from consuming excess bandwidth/storage.
+        self.declare_parameter('pointcloud_max_points', 65000)
+        self.declare_parameter('pointcloud_keep_intensity', False)
+        self.declare_parameter('pointcloud_keep_rgb', False)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -1699,12 +1724,13 @@ class WebBridge(Node):
         never a 10Hz stream), so this is the pragmatic fix rather than
         building multi-binary-frame support nothing else needs yet.
 
-        Only Image/CompressedImage get this treatment. PointCloud2/
-        OccupancyGrid are deliberately left alone: message_to_ordereddict
-        already gives their byte field as a plain int list, which is the
-        exact same shape a "fix" would produce anyway (unlike Image, there's
-        no compression step to gain anything from) - see
-        _capture_image_as_base64's own None return for these.
+        Image/CompressedImage get the base64 treatment above.
+        PointCloud2 gets the same trim/cap _on_topic_msg applies to the
+        continuous stream (see the elif below) - still a plain int list
+        afterward, just a smaller one; no compression step exists for it
+        the way JPEG is for Image. OccupancyGrid is the one type still left
+        fully untouched here - no trim exists for it yet, for any capture
+        path.
         """
         data = message_to_ordereddict(msg)
         types = dict(self.get_topic_names_and_types()).get(topic_name)
@@ -1714,6 +1740,33 @@ class WebBridge(Node):
             base64_str, marker = encoded
             data[BINARY_PAYLOAD_FIELD] = base64_str
             data[BINARY_MARKER_KEY] = marker
+        elif msg_type == 'sensor_msgs/msg/PointCloud2':
+            # Same trim/cap _on_topic_msg applies to the continuous stream -
+            # a bundled point cloud is just as oversized otherwise, and
+            # unlike the other two capture paths this one has nowhere to
+            # put a binary frame at all (see this function's own docstring),
+            # so an untrimmed cloud here goes straight into json_data at
+            # full size. Global defaults only, same as _capture_image_as_base64
+            # uses for JPEG quality/dimension - no per-call override for a
+            # bundle capture.
+            raw = data.get(BINARY_PAYLOAD_FIELD)
+            if raw is not None:
+                payload = bytes(b & 0xFF for b in raw)
+                max_points = self._resolve_pointcloud_max_points()
+                keep_intensity = self.get_parameter('pointcloud_keep_intensity').get_parameter_value().bool_value
+                keep_rgb = self.get_parameter('pointcloud_keep_rgb').get_parameter_value().bool_value
+                downsampled = self._downsample_pointcloud(payload, data, max_points, keep_intensity, keep_rgb, topic_name)
+                if downsampled is not None:
+                    payload, new_fields, new_point_step, out_points = downsampled
+                    data['fields'] = new_fields
+                    data['point_step'] = new_point_step
+                    data['width'] = out_points
+                    data['height'] = 1
+                    data['row_step'] = new_point_step * out_points
+                    # No binary frame/marker for this type (see _on_topic_msg's
+                    # own comment) - stays a plain list of decimal ints, just
+                    # a smaller one now.
+                    data[BINARY_PAYLOAD_FIELD] = list(payload)
         return self._json_safe_deep(data)
 
     def _capture_image_as_base64(self, topic_name: str, data: dict, msg_type: str):
@@ -1722,7 +1775,7 @@ class WebBridge(Node):
         shaped exactly like what a client already gets from the gateway's
         own binary reconstruction (format/width/height/len/encoding), so
         any existing consumer's `__osiris_binary__.encoding === 'base64'`
-        check (Camera.vue's isRenderable, get_camera_snapshot's own
+        check (Camera.vue's isRenderable, get_live_topic_snapshot's own
         renderability check) works identically regardless of which path
         produced it. Returns None for any other type, or if an Image's
         JPEG re-encode itself fails (unsupported encoding, corrupt frame,
@@ -1791,7 +1844,7 @@ class WebBridge(Node):
         point byte array as a JSON array of decimal ints is exactly the
         3-6x-inflated waste here it would be there, and for Image
         specifically a giant int array isn't something a vision model can
-        even look at; it needs to actually be a JPEG (get_camera_snapshot's
+        even look at; it needs to actually be a JPEG (get_live_topic_snapshot's
         whole reason for existing). Deliberately no budget check here - a
         one-shot capture isn't part of the rate/byte-budget system that
         governs the continuous stream, and shouldn't be silently dropped by
@@ -1823,6 +1876,23 @@ class WebBridge(Node):
                     image_marker_extra = {'format': 'jpeg', 'width': out_width, 'height': out_height}
             elif msg_type == 'sensor_msgs/msg/CompressedImage':
                 image_marker_extra = {'format': data.get('format') or 'unknown'}
+            elif msg_type == 'sensor_msgs/msg/PointCloud2':
+                # Same trim/cap _on_topic_msg applies to the continuous
+                # stream - a one-shot capture of a real point cloud is just
+                # as oversized otherwise. Global defaults only, same as the
+                # JPEG quality/dimension above - a one-shot capture doesn't
+                # go through _topic_limit_overrides.
+                max_points = self._resolve_pointcloud_max_points()
+                keep_intensity = self.get_parameter('pointcloud_keep_intensity').get_parameter_value().bool_value
+                keep_rgb = self.get_parameter('pointcloud_keep_rgb').get_parameter_value().bool_value
+                downsampled = self._downsample_pointcloud(payload_bytes, data, max_points, keep_intensity, keep_rgb, topic_name)
+                if downsampled is not None:
+                    payload_bytes, new_fields, new_point_step, out_points = downsampled
+                    data['fields'] = new_fields
+                    data['point_step'] = new_point_step
+                    data['width'] = out_points
+                    data['height'] = 1
+                    data['row_step'] = new_point_step * out_points
 
             marker = {'len': len(payload_bytes), 'signed': signed}
             if image_marker_extra is not None:
@@ -2154,25 +2224,51 @@ class WebBridge(Node):
             return
         self._topic_data_throttle[topic_name] = ts
 
-        data = message_to_ordereddict(msg)
+        # msg_type/signed only need topic_name and the pre-populated
+        # _topic_msg_types map (set at subscription time), so this is
+        # resolved before message_to_ordereddict runs below.
+        with self._topic_subs_lock:
+            msg_type = self._topic_msg_types.get(topic_name)
+        signed = BINARY_PAYLOAD_TYPES.get(msg_type)
 
         # For the byte-array-dominated types (see BINARY_PAYLOAD_TYPES), pull
         # the array out and send it as a raw binary WS frame instead of
         # leaving it for json.dumps to inflate into a comma-separated array
         # of ints. See BINARY_MARKER_KEY and the gateway's isBinary handler
         # for the other half of this.
-        with self._topic_subs_lock:
-            msg_type = self._topic_msg_types.get(topic_name)
-        signed = BINARY_PAYLOAD_TYPES.get(msg_type)
-        raw = data.get(BINARY_PAYLOAD_FIELD) if signed is not None else None
+        #
+        # The array is read directly off the live message object before
+        # message_to_ordereddict runs, and message_to_ordereddict itself
+        # runs on a shallow copy with that one field sliced empty
+        # (raw[0:0] - same array/list type as raw, so rosidl's property
+        # setter accepts it without a type mismatch) rather than on msg
+        # directly. Every other field (width, height, fields, point_step,
+        # ...) still converts normally from the copy. copy.copy(), not
+        # mutating msg directly, since rclpy owns that object beyond this
+        # callback. data[BINARY_PAYLOAD_FIELD] gets unconditionally
+        # overwritten with the marker dict below regardless of what's in it,
+        # so the sliced-empty copy is never sent anywhere.
+        raw = None
+        msg_for_dict = msg
+        if signed is not None:
+            raw = getattr(msg, BINARY_PAYLOAD_FIELD, None)
+            if raw is not None:
+                msg_for_dict = copy.copy(msg)
+                setattr(msg_for_dict, BINARY_PAYLOAD_FIELD, raw[0:0])
+
+        data = message_to_ordereddict(msg_for_dict)
+
         if raw is not None:
-            # message_to_ordereddict gives back a plain list of already
-            # correctly-signed Python ints (e.g. -1 for an OccupancyGrid
-            # "unknown" cell). `& 0xFF` takes each one to its two's-complement
-            # byte value regardless of signedness — the same bit pattern
-            # either way — which is exactly what bytes() needs and exactly
-            # what the gateway's Int8Array/Uint8Array reinterprets on the way
-            # back using the 'signed' flag below.
+            # raw is msg.data itself now (array.array/numpy/list depending on
+            # rclpy's config for this field) rather than message_to_ordereddict's
+            # own output - still yields correctly-signed Python ints on
+            # iteration either way (array.array('b',...) for OccupancyGrid's
+            # int8[] is signed at the container level, same as what
+            # message_to_ordereddict exposed). `& 0xFF` takes each one to its
+            # two's-complement byte value regardless of signedness — the same
+            # bit pattern either way — which is exactly what bytes() needs and
+            # exactly what the gateway's Int8Array/Uint8Array reinterprets on
+            # the way back using the 'signed' flag below.
             payload = bytes(b & 0xFF for b in raw)
 
             # Image: re-encode to JPEG before the budget check below, so the
@@ -2182,7 +2278,8 @@ class WebBridge(Node):
             # one this recognizes, or the buffer doesn't match the declared
             # dimensions. CompressedImage: already compressed by the camera
             # driver, nothing to re-encode, just marked the same way (see
-            # the elif below) for the gateway's benefit.
+            # the elif below) for the gateway's benefit. PointCloud2: trimmed
+            # to xyz(+intensity/rgb)/point-capped, see _downsample_pointcloud.
             image_marker_extra = None
             if msg_type == 'sensor_msgs/msg/Image':
                 quality = override.get('jpeg_quality')
@@ -2210,6 +2307,37 @@ class WebBridge(Node):
                 # doesn't carry them, they're implicit in the compressed
                 # bytes themselves.
                 image_marker_extra = {'format': data.get('format') or 'unknown'}
+            elif msg_type == 'sensor_msgs/msg/PointCloud2':
+                # Trim to xyz (+ intensity/rgb if configured) and cap the
+                # point count before the budget check below, same reasoning
+                # as Image's re-encode above - the cap is enforced against
+                # what's actually going out, not the untrimmed size this
+                # replaces. No marker changes here (no image_marker_extra) -
+                # the result is still a plain binary blob, just smaller;
+                # the gateway keeps reconstructing it as a JSON array of
+                # numbers exactly as it already does, unchanged.
+                max_points = self._resolve_pointcloud_max_points(override)
+                keep_intensity = override.get('pointcloud_keep_intensity')
+                if keep_intensity is None:
+                    keep_intensity = self.get_parameter('pointcloud_keep_intensity').get_parameter_value().bool_value
+                keep_rgb = override.get('pointcloud_keep_rgb')
+                if keep_rgb is None:
+                    keep_rgb = self.get_parameter('pointcloud_keep_rgb').get_parameter_value().bool_value
+                downsampled = self._downsample_pointcloud(payload, data, max_points, keep_intensity, keep_rgb, topic_name)
+                if downsampled is not None:
+                    payload, new_fields, new_point_step, out_points = downsampled
+                    # Metadata has to match the trimmed payload exactly -
+                    # fields/point_step/width describe the byte layout a
+                    # consumer would use to index into `data`, and row_step
+                    # is just point_step*width for an unorganized cloud
+                    # (height=1, which stride-subsampling already implies:
+                    # whatever 2D structure the original had is gone once
+                    # points are dropped non-contiguously).
+                    data['fields'] = new_fields
+                    data['point_step'] = new_point_step
+                    data['width'] = out_points
+                    data['height'] = 1
+                    data['row_step'] = new_point_step * out_points
 
             if self._topic_data_over_budget(topic_name, len(payload), ts, override):
                 return
@@ -2359,6 +2487,109 @@ class WebBridge(Node):
             return buf.getvalue(), img.width, img.height
         except Exception as e:
             self.get_logger().warning(f'[image] {topic_name}: JPEG re-encode failed: {e}')
+            return None
+
+    def _resolve_pointcloud_max_points(self, override: dict = None) -> int:
+        """override/global-parameter resolution, then clamped to
+        POINTCLOUD_MAX_POINTS_HARD_CEILING regardless of source - protects
+        the agent process itself (payload build cost, WS frame size) from an
+        extreme value, same class of thing as the client's own 400k decode
+        cap or the AI renderer's 200k cap, just one layer earlier. Not a
+        declare_parameter on purpose - a hard ceiling isn't meant to be
+        user-adjustable at all, unlike pointcloud_max_points itself.
+        """
+        max_points = override.get('pointcloud_max_points') if override else None
+        if max_points is None:
+            max_points = self.get_parameter('pointcloud_max_points').get_parameter_value().integer_value
+        return min(max_points, POINTCLOUD_MAX_POINTS_HARD_CEILING)
+
+    def _downsample_pointcloud(self, raw: bytes, data: dict, max_points: int, keep_intensity: bool, keep_rgb: bool, topic_name: str):
+        """Trims a PointCloud2's per-point byte layout down to xyz (plus
+        intensity/rgb if requested and actually present on this cloud), and
+        subsamples by uniform stride if there are more than max_points.
+
+        Pure byte-slicing, no numeric decoding. A point's fields are already
+        packed as fixed-width byte ranges (PointField name/offset/datatype/
+        count) - keeping a field just means copying its exact byte range
+        verbatim into the rebuilt buffer at a new offset. Endianness and
+        what a field's bytes actually mean are never touched, so this works
+        identically regardless of is_bigendian or the concrete numbers
+        involved - the same reasoning _on_topic_msg's `& 0xFF` byte
+        extraction already relies on elsewhere in this file.
+
+        Returns (new_data_bytes, new_fields, new_point_step, new_point_count)
+        on success, or None if x/y/z aren't all present, the buffer doesn't
+        match what width/height/point_step declare (a corrupt/partial
+        cloud), or the result would be empty. Never raises - a failure here
+        falls through to sending the original, untrimmed cloud, same
+        fallback behavior _reencode_image_jpeg's own None return gets.
+        """
+        try:
+            fields = data.get('fields') or []
+            point_step = data.get('point_step')
+            width = data.get('width') or 0
+            height = data.get('height') or 1
+            if not point_step or not width:
+                return None
+
+            by_name = {f.get('name'): f for f in fields if f.get('name')}
+            if not all(n in by_name for n in ('x', 'y', 'z')):
+                return None
+            keep_names = ['x', 'y', 'z']
+            if keep_intensity and 'intensity' in by_name:
+                keep_names.append('intensity')
+            if keep_rgb:
+                # Only one of these is ever present on a real cloud - rgb
+                # (packed float) is the more common convention, rgba the
+                # less common one some drivers use instead.
+                if 'rgb' in by_name:
+                    keep_names.append('rgb')
+                elif 'rgba' in by_name:
+                    keep_names.append('rgba')
+
+            kept = []
+            for name in keep_names:
+                f = by_name[name]
+                unit_size = POINTFIELD_DATATYPE_SIZES.get(f.get('datatype'))
+                offset = f.get('offset')
+                if unit_size is None or offset is None:
+                    return None
+                kept.append((name, offset, unit_size * max(1, f.get('count') or 1)))
+
+            total_points = width * height
+            if len(raw) < point_step * total_points:
+                return None
+
+            new_point_step = sum(size for _, _, size in kept)
+            if new_point_step <= 0:
+                return None
+
+            stride = max(1, math.ceil(total_points / max_points)) if max_points and max_points > 0 else 1
+            out = bytearray()
+            for i in range(0, total_points, stride):
+                base = i * point_step
+                for _, offset, size in kept:
+                    out += raw[base + offset: base + offset + size]
+
+            out_points = len(out) // new_point_step
+            if out_points == 0:
+                return None
+
+            new_fields = []
+            running_offset = 0
+            for name, _, size in kept:
+                orig = by_name[name]
+                new_fields.append({
+                    'name': name,
+                    'offset': running_offset,
+                    'datatype': orig.get('datatype'),
+                    'count': orig.get('count') or 1,
+                })
+                running_offset += size
+
+            return bytes(out), new_fields, new_point_step, out_points
+        except Exception as e:
+            self.get_logger().warning(f'[pointcloud] {topic_name}: downsample failed: {e}')
             return None
 
     def _publish_topic_rates(self):
@@ -3367,6 +3598,12 @@ class WebBridge(Node):
             self.set_parameters([Parameter('image_jpeg_quality', Parameter.Type.INTEGER, int(config['image_jpeg_quality']))])
         if not self._param_overrides and 'image_max_dimension' in config:
             self.set_parameters([Parameter('image_max_dimension', Parameter.Type.INTEGER, int(config['image_max_dimension']))])
+        if not self._param_overrides and 'pointcloud_max_points' in config:
+            self.set_parameters([Parameter('pointcloud_max_points', Parameter.Type.INTEGER, int(config['pointcloud_max_points']))])
+        if not self._param_overrides and 'pointcloud_keep_intensity' in config:
+            self.set_parameters([Parameter('pointcloud_keep_intensity', Parameter.Type.BOOL, bool(config['pointcloud_keep_intensity']))])
+        if not self._param_overrides and 'pointcloud_keep_rgb' in config:
+            self.set_parameters([Parameter('pointcloud_keep_rgb', Parameter.Type.BOOL, bool(config['pointcloud_keep_rgb']))])
 
         # topic_limits: per-topic {rate_hz, max_bytes_per_sec} overrides of
         # the two topic_data_* defaults above (see _topic_limit_overrides,
@@ -3404,6 +3641,9 @@ class WebBridge(Node):
             f'global_topic_data_max_msgs_per_sec={self.get_parameter("global_topic_data_max_msgs_per_sec").get_parameter_value().double_value:.0f}, '
             f'image_jpeg_quality={self.get_parameter("image_jpeg_quality").get_parameter_value().integer_value}, '
             f'image_max_dimension={self.get_parameter("image_max_dimension").get_parameter_value().integer_value}, '
+            f'pointcloud_max_points={self.get_parameter("pointcloud_max_points").get_parameter_value().integer_value}, '
+            f'pointcloud_keep_intensity={self.get_parameter("pointcloud_keep_intensity").get_parameter_value().bool_value}, '
+            f'pointcloud_keep_rgb={self.get_parameter("pointcloud_keep_rgb").get_parameter_value().bool_value}, '
             f'topic_limits={_topic_limits_snapshot}'
         )
 
@@ -3453,6 +3693,9 @@ class WebBridge(Node):
                 'global_topic_data_max_msgs_per_sec': self.get_parameter('global_topic_data_max_msgs_per_sec').get_parameter_value().double_value,
                 'image_jpeg_quality': self.get_parameter('image_jpeg_quality').get_parameter_value().integer_value,
                 'image_max_dimension': self.get_parameter('image_max_dimension').get_parameter_value().integer_value,
+                'pointcloud_max_points': self.get_parameter('pointcloud_max_points').get_parameter_value().integer_value,
+                'pointcloud_keep_intensity': self.get_parameter('pointcloud_keep_intensity').get_parameter_value().bool_value,
+                'pointcloud_keep_rgb': self.get_parameter('pointcloud_keep_rgb').get_parameter_value().bool_value,
                 'topic_limits': _topic_limits_snapshot,
             },
             'timestamp': time.time(),
