@@ -288,7 +288,7 @@ class WebBridge(Node):
         # 'pointcloud_keep_intensity'/'pointcloud_keep_rgb'). Trims to xyz
         # only and caps the point count by default to keep large point
         # clouds from consuming excess bandwidth/storage.
-        self.declare_parameter('pointcloud_max_points', 65000)
+        self.declare_parameter('pointcloud_max_points', 10000)
         self.declare_parameter('pointcloud_keep_intensity', False)
         self.declare_parameter('pointcloud_keep_rgb', False)
 
