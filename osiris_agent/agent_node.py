@@ -291,6 +291,12 @@ class WebBridge(Node):
         self.declare_parameter('pointcloud_max_points', 10000)
         self.declare_parameter('pointcloud_keep_intensity', False)
         self.declare_parameter('pointcloud_keep_rgb', False)
+        # PointCloud2-specific fallback for the Hz throttle below, used
+        # instead of the general topic_data_rate_hz default when a
+        # PointCloud2 topic has no per-topic rate_hz override - a large
+        # point cloud costs far more per message than what that general
+        # default was sized for.
+        self.declare_parameter('pointcloud_default_rate_hz', 1.0)
 
         base_url = os.environ.get('OSIRIS_WS_URL', 'wss://osiris-gateway.fly.dev')
         self.ws_url = f'{base_url}?robot=true&token={auth_token}'
@@ -2202,6 +2208,14 @@ class WebBridge(Node):
         with self._topic_limit_lock:
             override = self._topic_limit_overrides.get(topic_name, {})
 
+        # msg_type/signed only need topic_name and the pre-populated
+        # _topic_msg_types map (set at subscription time), so this is
+        # resolved up front - both the rate throttle below and the
+        # message-conversion skip further down need it.
+        with self._topic_subs_lock:
+            msg_type = self._topic_msg_types.get(topic_name)
+        signed = BINARY_PAYLOAD_TYPES.get(msg_type)
+
         # Cap how often a given topic's data actually gets forwarded — a fast
         # topic (odom, joint_states, ...) publishing at 30-50+ Hz is far past
         # what's perceptible in Watch/Plot, and every message costs a DB row
@@ -2213,23 +2227,25 @@ class WebBridge(Node):
         # — cheap local lookup, and lets a config change take effect without
         # a reconnect. Hz (not a raw interval) since that's the unit rate_hz
         # is already shown in everywhere else in the UI; 0 means uncapped.
+        #
+        # PointCloud2 falls back to pointcloud_default_rate_hz instead of the
+        # general topic_data_rate_hz when there's no per-topic override - a
+        # large point cloud costs far more per message than the general
+        # default was sized for.
         rate_hz = override.get('rate_hz')
+        rate_hz_source = 'per-topic override'
+        if rate_hz is None and msg_type == 'sensor_msgs/msg/PointCloud2':
+            rate_hz = self.get_parameter('pointcloud_default_rate_hz').get_parameter_value().double_value
+            rate_hz_source = 'pointcloud_default_rate_hz default'
         if rate_hz is None:
             rate_hz = self.get_parameter('topic_data_rate_hz').get_parameter_value().double_value
+            rate_hz_source = 'topic_data_rate_hz default'
         if rate_hz > 0 and ts - self._topic_data_throttle.get(topic_name, 0.0) < 1.0 / rate_hz:
             if ts - self._rate_throttle_drop_logged.get(topic_name, 0.0) >= 5.0:
                 self._rate_throttle_drop_logged[topic_name] = ts
-                source = 'per-topic override' if override.get('rate_hz') is not None else 'topic_data_rate_hz default'
-                self.get_logger().warning(f'[topic_data] {topic_name}: Hz-throttled to {rate_hz:.2f} Hz ({source})')
+                self.get_logger().warning(f'[topic_data] {topic_name}: Hz-throttled to {rate_hz:.2f} Hz ({rate_hz_source})')
             return
         self._topic_data_throttle[topic_name] = ts
-
-        # msg_type/signed only need topic_name and the pre-populated
-        # _topic_msg_types map (set at subscription time), so this is
-        # resolved before message_to_ordereddict runs below.
-        with self._topic_subs_lock:
-            msg_type = self._topic_msg_types.get(topic_name)
-        signed = BINARY_PAYLOAD_TYPES.get(msg_type)
 
         # For the byte-array-dominated types (see BINARY_PAYLOAD_TYPES), pull
         # the array out and send it as a raw binary WS frame instead of
@@ -3604,6 +3620,8 @@ class WebBridge(Node):
             self.set_parameters([Parameter('pointcloud_keep_intensity', Parameter.Type.BOOL, bool(config['pointcloud_keep_intensity']))])
         if not self._param_overrides and 'pointcloud_keep_rgb' in config:
             self.set_parameters([Parameter('pointcloud_keep_rgb', Parameter.Type.BOOL, bool(config['pointcloud_keep_rgb']))])
+        if not self._param_overrides and 'pointcloud_default_rate_hz' in config:
+            self.set_parameters([Parameter('pointcloud_default_rate_hz', Parameter.Type.DOUBLE, float(config['pointcloud_default_rate_hz']))])
 
         # topic_limits: per-topic {rate_hz, max_bytes_per_sec} overrides of
         # the two topic_data_* defaults above (see _topic_limit_overrides,
@@ -3644,6 +3662,7 @@ class WebBridge(Node):
             f'pointcloud_max_points={self.get_parameter("pointcloud_max_points").get_parameter_value().integer_value}, '
             f'pointcloud_keep_intensity={self.get_parameter("pointcloud_keep_intensity").get_parameter_value().bool_value}, '
             f'pointcloud_keep_rgb={self.get_parameter("pointcloud_keep_rgb").get_parameter_value().bool_value}, '
+            f'pointcloud_default_rate_hz={self.get_parameter("pointcloud_default_rate_hz").get_parameter_value().double_value:.1f}, '
             f'topic_limits={_topic_limits_snapshot}'
         )
 
@@ -3696,6 +3715,7 @@ class WebBridge(Node):
                 'pointcloud_max_points': self.get_parameter('pointcloud_max_points').get_parameter_value().integer_value,
                 'pointcloud_keep_intensity': self.get_parameter('pointcloud_keep_intensity').get_parameter_value().bool_value,
                 'pointcloud_keep_rgb': self.get_parameter('pointcloud_keep_rgb').get_parameter_value().bool_value,
+                'pointcloud_default_rate_hz': self.get_parameter('pointcloud_default_rate_hz').get_parameter_value().double_value,
                 'topic_limits': _topic_limits_snapshot,
             },
             'timestamp': time.time(),
